@@ -1,0 +1,162 @@
+//! FTS5 query sanitization and `SearchFilter` → SQL translation.
+
+use rusqlite::types::Value;
+
+use super::{SearchFilter, StatusFilter, status_str};
+
+/// Hard cap on terms in one FTS query — pasted-blob queries should not turn
+/// into thousand-term MATCH expressions.
+const MAX_TERMS: usize = 64;
+
+/// Turn arbitrary user text into an FTS5 MATCH expression that cannot be a
+/// syntax error.
+///
+/// Approach: **whitelist, don't escape.** Every run of alphanumeric/`_`
+/// characters becomes one double-quoted phrase term; everything else
+/// (parentheses, quotes, `:`, `^`, `-`, `+`, `NEAR/`, stray `*`) is dropped.
+/// A `*` immediately following a term is preserved as a prefix operator
+/// because that is the one piece of query syntax worth exposing. Because the
+/// terms only ever contain alphanumerics and `_`, no quote escaping is even
+/// reachable, so `a AND (`, `"unterminated`, `*`, `)))` all produce valid
+/// (possibly empty) expressions instead of an `fts5: syntax error`.
+///
+/// Bare uppercase `AND`/`OR`/`NOT`/`NEAR` are dropped rather than quoted: a
+/// user typing them means the operator, not the literal word, and FTS5's
+/// default for juxtaposed terms is already AND. Consequence: `OR` degrades to
+/// AND rather than erroring. Raw FTS5 syntax is deliberately not exposed at
+/// this layer; if an advanced mode is ever wanted it belongs behind an
+/// explicit opt-in in the daemon, not in the default path.
+///
+/// Returns an empty string when the input contains no usable terms; callers
+/// treat that as "no results" rather than running a MATCH.
+pub(crate) fn sanitize_fts_query(input: &str) -> String {
+    fn flush(current: &mut String, prefix: bool, terms: &mut Vec<String>) {
+        if current.is_empty() {
+            return;
+        }
+        let term = std::mem::take(current);
+        if !matches!(term.as_str(), "AND" | "OR" | "NOT" | "NEAR") && terms.len() < MAX_TERMS {
+            terms.push(if prefix {
+                format!("\"{term}\"*")
+            } else {
+                format!("\"{term}\"")
+            });
+        }
+    }
+
+    let mut terms: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    for c in input.chars() {
+        if c.is_alphanumeric() || c == '_' {
+            current.push(c);
+        } else {
+            let prefix = c == '*' && !current.is_empty();
+            flush(&mut current, prefix, &mut terms);
+        }
+    }
+    flush(&mut current, false, &mut terms);
+
+    terms.join(" ")
+}
+
+/// A `WHERE`-clause fragment plus its positional parameters, in order.
+pub(crate) struct FilterSql {
+    pub(crate) sql: String,
+    pub(crate) params: Vec<Value>,
+}
+
+/// Build the filter fragment for a query whose chunk table is aliased `c`.
+///
+/// Path prefixing uses `substr(path, 1, n) = prefix` rather than `LIKE`:
+/// `_` and `%` are ordinary characters in real paths, and `LIKE` would treat
+/// them as wildcards.
+pub(crate) fn filter_sql(filter: &SearchFilter) -> FilterSql {
+    let mut sql = String::new();
+    let mut params: Vec<Value> = Vec::new();
+
+    if let Some(project) = filter.project {
+        sql.push_str(" AND c.project_id = ?");
+        params.push(Value::Integer(project));
+    }
+    if let Some(prefix) = &filter.path_prefix {
+        sql.push_str(" AND substr(c.path, 1, ?) = ?");
+        params.push(Value::Integer(prefix.len() as i64));
+        params.push(Value::Text(prefix.clone()));
+    }
+    if let Some(language) = &filter.language {
+        sql.push_str(" AND c.language = ?");
+        params.push(Value::Text(language.clone()));
+    }
+    if let Some(min) = filter.min_authority {
+        sql.push_str(" AND c.authority_tier >= ?");
+        params.push(Value::Integer(i64::from(min)));
+    }
+    if let Some(statuses) = &filter.statuses {
+        // An explicitly empty allowlist means "nothing is acceptable".
+        if statuses.is_empty() {
+            sql.push_str(" AND 0");
+        } else {
+            let mut alts: Vec<String> = Vec::new();
+            if statuses.contains(&StatusFilter::Unclassified) {
+                alts.push("c.design_status IS NULL".to_string());
+            }
+            let named: Vec<&str> = statuses
+                .iter()
+                .filter_map(|s| match s {
+                    StatusFilter::Unclassified => None,
+                    StatusFilter::Status(st) => Some(status_str(*st)),
+                })
+                .collect();
+            if !named.is_empty() {
+                let placeholders = vec!["?"; named.len()].join(", ");
+                alts.push(format!("c.design_status IN ({placeholders})"));
+                for name in named {
+                    params.push(Value::Text(name.to_string()));
+                }
+            }
+            sql.push_str(&format!(" AND ({})", alts.join(" OR ")));
+        }
+    }
+
+    FilterSql { sql, params }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_keeps_identifier_terms() {
+        assert_eq!(sanitize_fts_query("content_hash"), "\"content_hash\"");
+        assert_eq!(
+            sanitize_fts_query("Board.Update"),
+            "\"Board\" \"Update\"".to_string()
+        );
+    }
+
+    #[test]
+    fn sanitize_preserves_prefix_star() {
+        assert_eq!(sanitize_fts_query("cont*"), "\"cont\"*");
+        // A bare star is not a term and must not become one.
+        assert_eq!(sanitize_fts_query("*"), "");
+    }
+
+    #[test]
+    fn sanitize_strips_operator_syntax() {
+        assert_eq!(sanitize_fts_query("a AND ("), "\"a\"");
+        assert_eq!(sanitize_fts_query("\"unterminated"), "\"unterminated\"");
+        assert_eq!(sanitize_fts_query("NEAR(a b, 3)"), "\"a\" \"b\" \"3\"");
+        assert_eq!(sanitize_fts_query(")))"), "");
+        assert_eq!(sanitize_fts_query("   "), "");
+    }
+
+    #[test]
+    fn sanitize_caps_term_count() {
+        let long = (0..200)
+            .map(|i| format!("t{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(sanitize_fts_query(&long).split(' ').count(), MAX_TERMS);
+    }
+}
