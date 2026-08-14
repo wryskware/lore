@@ -1,0 +1,10 @@
+[package]
+name = "lore-mcp"
+description = "Thin stdio MCP client proxying to the Lore daemon over loopback HTTP. Owns no index state."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+lore-core.workspace = true

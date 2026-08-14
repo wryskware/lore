@@ -1,0 +1,9 @@
+[package]
+name = "lore-core"
+description = "Shared types for the Lore daemon API — the contract between daemon, CLI, and thin MCP client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true

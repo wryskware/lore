@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = ["crates/lore-core", "crates/lore", "crates/lore-mcp"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+repository = "https://github.com/wryskware/lore"
+
+[workspace.dependencies]
+lore-core = { path = "crates/lore-core" }
+
+# Pins per design/7_Research/raw/E_rust-stack.md (parent-verified 2026-08-14).
+# Declared here even before first use so every crate inherits the same pin.
+anyhow = "1.0"
+axum = "0.8"
+camino = "1"
+clap = { version = "4.6", features = ["derive"] }
+notify = "8.2"
+notify-debouncer-full = "0.7"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-tls"] }
+rmcp = "3.1"
+rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite_migration = "2.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tree-sitter = "0.26"
+
+[profile.release]
+lto = "thin"
