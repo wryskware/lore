@@ -1,0 +1,31 @@
+---
+source: crates/lore/tests/chunk_windows.rs
+expression: render(&chunks)
+---
+code[function_item] big_fn#w0
+  lang=Some("rust") lines 1-46 bytes 0..3955 (3955 B)
+  first: /// A function with an unreasonable body.
+code[function_item] big_fn#w1
+  lang=Some("rust") lines 37-80 bytes 3070..6981 (3911 B)
+  first: let value_34 = 34 * 2; // filler line keeping the body well over the split threshold
+code[function_item] big_fn#w2
+  lang=Some("rust") lines 71-114 bytes 6096..10031 (3935 B)
+  first: let value_68 = 68 * 2; // filler line keeping the body well over the split threshold
+code[function_item] big_fn#w3
+  lang=Some("rust") lines 105-147 bytes 9126..13034 (3908 B)
+  first: let value_102 = 102 * 2; // filler line keeping the body well over the split threshold
+code[function_item] big_fn#w4
+  lang=Some("rust") lines 138-180 bytes 12129..16037 (3908 B)
+  first: let value_135 = 135 * 2; // filler line keeping the body well over the split threshold
+code[function_item] big_fn#w5
+  lang=Some("rust") lines 171-213 bytes 15132..19040 (3908 B)
+  first: let value_168 = 168 * 2; // filler line keeping the body well over the split threshold
+code[function_item] big_fn#w6
+  lang=Some("rust") lines 204-246 bytes 18135..22043 (3908 B)
+  first: let value_201 = 201 * 2; // filler line keeping the body well over the split threshold
+code[function_item] big_fn#w7
+  lang=Some("rust") lines 237-279 bytes 21138..25046 (3908 B)
+  first: let value_234 = 234 * 2; // filler line keeping the body well over the split threshold
+code[function_item] big_fn#w8
+  lang=Some("rust") lines 270-303 bytes 24141..27141 (3000 B)
+  first: let value_267 = 267 * 2; // filler line keeping the body well over the split threshold

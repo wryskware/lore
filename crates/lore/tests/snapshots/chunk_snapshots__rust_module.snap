@@ -1,0 +1,22 @@
+---
+source: crates/lore/tests/chunk_snapshots.rs
+expression: "render(& chunk_fixture(\"rust/index.rs\"))"
+---
+code[group] #s0
+  lang=Some("rust") lines 1-7 bytes 0..191 (191 B)
+  first: //! Toy index used as a chunker fixture.
+code[struct_item] Document
+  lang=Some("rust") lines 9-16 bytes 193..396 (203 B)
+  first: /// A document as stored by the toy index.
+code[struct_item] Index
+  lang=Some("rust") lines 18-24 bytes 398..585 (187 B)
+  first: /// In-memory inverted index over [`Document`] bodies.
+code[impl_item] Index
+  lang=Some("rust") lines 26-66 bytes 587..1695 (1108 B)
+  first: impl Index {
+code[group] Index#fmt::Display
+  lang=Some("rust") lines 68-78 bytes 1697..2038 (341 B)
+  first: impl fmt::Display for Index {
+code[mod_item] tests
+  lang=Some("rust") lines 80-93 bytes 2040..2334 (294 B)
+  first: #[cfg(test)]

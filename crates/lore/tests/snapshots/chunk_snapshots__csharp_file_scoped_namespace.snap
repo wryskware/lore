@@ -1,0 +1,19 @@
+---
+source: crates/lore/tests/chunk_snapshots.rs
+expression: "render(& chunk_fixture(\"csharp/Models.cs\"))"
+---
+code[statements] #s0
+  lang=Some("csharp") lines 1-3 bytes 0..66 (66 B)
+  first: using System;
+code[record_declaration] Lexomancy.Model.Tile
+  lang=Some("csharp") lines 7-13 bytes 96..378 (282 B)
+  first: /// <summary>A single letter tile.</summary>
+code[record_declaration] Lexomancy.Model.Word
+  lang=Some("csharp") lines 15-18 bytes 380..489 (109 B)
+  first: public record Word(string Text, IReadOnlyList<Tile> Tiles)
+code[class_declaration] Lexomancy.Model.Scorer
+  lang=Some("csharp") lines 20-42 bytes 491..1279 (788 B)
+  first: /// <summary>Scores words against a multiplier table.</summary>
+code[group] Lexomancy.Model.IScoreSink
+  lang=Some("csharp") lines 44-54 bytes 1281..1410 (129 B)
+  first: public interface IScoreSink

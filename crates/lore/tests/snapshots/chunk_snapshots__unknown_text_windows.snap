@@ -1,0 +1,13 @@
+---
+source: crates/lore/tests/chunk_snapshots.rs
+expression: "render(& chunk_fixture(\"text/indexer.log\"))"
+---
+window 0
+  lang=None lines 1-80 bytes 0..5995 (5995 B)
+  first: lore indexer trace — fixture for the unknown-text window chunker
+window 1
+  lang=None lines 71-150 bytes 5230..11385 (6155 B)
+  first: 2026-08-14T09:09:03Z INFO  indexer: scanned file 069 (chunks=7, bytes=9494)
+window 2
+  lang=None lines 141-188 bytes 10616..14311 (3695 B)
+  first: 2026-08-14T09:19:13Z INFO  indexer: scanned file 139 (chunks=5, bytes=19084)

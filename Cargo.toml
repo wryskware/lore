@@ -34,6 +34,14 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tree-sitter = "0.26"
+# Grammar pins (work package 3). All of these expose `LANGUAGE: LanguageFn`
+# via tree-sitter-language 0.1 and parse at ABI 14/15, which the 0.26 runtime
+# accepts; these are the newest releases published at pin time (2026-08-14).
+tree-sitter-c-sharp = "0.23.5"   # flagship target (D-0003)
+tree-sitter-rust = "0.24.2"
+tree-sitter-python = "0.25.0"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-typescript = "0.23.2" # provides both LANGUAGE_TYPESCRIPT and LANGUAGE_TSX
 
 [profile.release]
 lto = "thin"

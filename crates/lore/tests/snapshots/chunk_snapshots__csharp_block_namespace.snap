@@ -1,0 +1,25 @@
+---
+source: crates/lore/tests/chunk_snapshots.rs
+expression: "render(& chunk_fixture(\"csharp/BoardController.cs\"))"
+---
+code[statements] #s0
+  lang=Some("csharp") lines 1-6 bytes 0..125 (125 B)
+  first: // Copyright (c) Wryskware. MIT license.
+code[class_declaration] Lexomancy.Board.BoardController
+  lang=Some("csharp") lines 10-30 bytes 159..908 (749 B)
+  first: /// <summary>
+code[method_declaration] Lexomancy.Board.BoardController.Awake
+  lang=Some("csharp") lines 32-40 bytes 918..1142 (224 B)
+  first: private void Awake()
+code[method_declaration] Lexomancy.Board.BoardController.Update
+  lang=Some("csharp") lines 42-54 bytes 1152..1457 (305 B)
+  first: // Polled every frame; keep this allocation free.
+code[method_declaration] Lexomancy.Board.BoardController.TryPlace
+  lang=Some("csharp") lines 56-72 bytes 1467..2061 (594 B)
+  first: /// <summary>Places <paramref name="tile"/> at <paramref name="cell"/>.</summary>
+code[enum_declaration] Lexomancy.Board.BoardController.Phase
+  lang=Some("csharp") lines 74-79 bytes 2071..2170 (99 B)
+  first: private enum Phase
+code[class_declaration] Lexomancy.Board.BoardController.TileComparer
+  lang=Some("csharp") lines 81-87 bytes 2180..2393 (213 B)
+  first: private sealed class TileComparer : IComparer<Tile>

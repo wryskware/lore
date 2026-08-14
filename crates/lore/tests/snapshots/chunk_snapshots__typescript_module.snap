@@ -1,0 +1,13 @@
+---
+source: crates/lore/tests/chunk_snapshots.rs
+expression: "render(& chunk_fixture(\"typescript/store.ts\"))"
+---
+code[group] #s0
+  lang=Some("typescript") lines 1-15 bytes 0..284 (284 B)
+  first: /**
+code[class_declaration] StoreClient
+  lang=Some("typescript") lines 17-47 bytes 286..1201 (915 B)
+  first: /**
+code[group] summarize
+  lang=Some("typescript") lines 49-52 bytes 1203..1352 (149 B)
+  first: export const summarize = (hits: Hit[]): string =>

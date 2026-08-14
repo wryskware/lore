@@ -1,0 +1,22 @@
+---
+source: crates/lore/tests/chunk_snapshots.rs
+expression: "render(& chunk_fixture(\"python/retriever.py\"))"
+---
+code[group] #s0
+  lang=Some("python") lines 1-17 bytes 0..274 (274 B)
+  first: """Toy hybrid retriever used as a chunker fixture."""
+code[class_definition] Retriever
+  lang=Some("python") lines 20-26 bytes 277..507 (230 B)
+  first: class Retriever:
+code[function_definition] Retriever.feed
+  lang=Some("python") lines 28-31 bytes 513..717 (204 B)
+  first: def feed(self, lexical: list[int], vector: list[int]) -> None:
+code[function_definition] Retriever.fuse
+  lang=Some("python") lines 33-44 bytes 723..1350 (627 B)
+  first: def fuse(self) -> list[Hit]:
+code[function_definition] Retriever.normalize
+  lang=Some("python") lines 46-49 bytes 1356..1526 (170 B)
+  first: @staticmethod
+code[group] main
+  lang=Some("python") lines 52-60 bytes 1529..1714 (185 B)
+  first: def main() -> None:

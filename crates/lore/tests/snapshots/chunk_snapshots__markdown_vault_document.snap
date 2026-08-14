@@ -1,0 +1,28 @@
+---
+source: crates/lore/tests/chunk_snapshots.rs
+expression: "render(& chunk_fixture(\"markdown/retrieval.md\"))"
+---
+section []
+  lang=Some("markdown") lines 9-9 bytes 95..168 (73 B)
+  first: Preamble text that sits before any heading, citing D-0009 for benchmarks.
+  vault: status=Some(Leaning) refs=["D-0004", "D-0005"] body_refs=["D-0009"]
+section [Retrieval]
+  lang=Some("markdown") lines 11-14 bytes 170..300 (130 B)
+  first: # Retrieval
+  vault: status=Some(Leaning) refs=["D-0004", "D-0005"] body_refs=["D-0004"]
+section [Retrieval > Chunking > Code]
+  lang=Some("markdown") lines 18-26 bytes 315..494 (179 B)
+  first: ### Code
+  vault: status=Some(Leaning) refs=["D-0004", "D-0005"] body_refs=["D-0005"]
+section [Retrieval > Chunking > Markdown]
+  lang=Some("markdown") lines 28-30 bytes 496..565 (69 B)
+  first: ### Markdown
+  vault: status=Some(Leaning) refs=["D-0004", "D-0005"] body_refs=[]
+section [Retrieval > Ranking]
+  lang=Some("markdown") lines 32-34 bytes 567..640 (73 B)
+  first: ## Ranking
+  vault: status=Some(Leaning) refs=["D-0004", "D-0005"] body_refs=[]
+section [Open questions]
+  lang=Some("markdown") lines 36-39 bytes 642..774 (132 B)
+  first: # Open questions
+  vault: status=Some(Leaning) refs=["D-0004", "D-0005"] body_refs=["D-0004"]

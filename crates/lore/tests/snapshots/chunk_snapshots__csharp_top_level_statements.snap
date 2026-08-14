@@ -1,0 +1,10 @@
+---
+source: crates/lore/tests/chunk_snapshots.rs
+expression: "render(& chunk_fixture(\"csharp/Program.cs\"))"
+---
+code[statements] #s0
+  lang=Some("csharp") lines 1-13 bytes 0..360 (360 B)
+  first: using System;
+code[local_function_statement] Sum
+  lang=Some("csharp") lines 15-25 bytes 362..580 (218 B)
+  first: /// <summary>Helper declared after the top-level statements.</summary>
