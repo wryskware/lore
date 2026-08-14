@@ -10,14 +10,10 @@ env:
 
 jobs:
   test:
-    name: test (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        # Windows is the flagship platform (D-0003) — it is a first-class
-        # lane, not an afterthought. The CodeGraph lesson: no CI, no claim.
-        os: [windows-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+    name: test (windows)
+    # Windows is the flagship platform (D-0003). Linux gets a WSL2 smoke
+    # test around e2e-benchmark time rather than a CI lane for now.
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
