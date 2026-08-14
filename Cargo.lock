@@ -927,7 +927,11 @@ dependencies = [
 name = "lore-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "camino",
+ "dirs",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

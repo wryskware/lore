@@ -14,6 +14,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod discovery;
+
 /// API version negotiated on every request; bump on breaking changes.
 pub const API_VERSION: u32 = 1;
 

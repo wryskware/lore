@@ -13,34 +13,18 @@
 //! `LORE_DATA_DIR` overrides the whole directory — that is how tests (and a
 //! second, isolated daemon instance) get their own world.
 
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use camino::Utf8PathBuf;
 
-/// Environment override for the data directory.
-pub const DATA_DIR_ENV: &str = "LORE_DATA_DIR";
+/// Data-dir resolution lives in the contract crate so thin clients resolve
+/// the same directory without linking this crate; re-exported for the
+/// daemon's own call sites.
+pub use lore_core::discovery::{DATA_DIR_ENV, data_dir, resolve_data_dir};
 
 /// SQLite database file name within the data directory.
 pub const DB_FILE: &str = "lore.db";
-
-/// Data directory for this process, honoring [`DATA_DIR_ENV`].
-pub fn data_dir() -> Result<Utf8PathBuf> {
-    resolve_data_dir(std::env::var_os(DATA_DIR_ENV).as_deref())
-}
-
-/// Pure resolution so tests never have to mutate process environment
-/// (which is racy across parallel tests and unsafe in edition 2024).
-pub fn resolve_data_dir(override_value: Option<&OsStr>) -> Result<Utf8PathBuf> {
-    let raw: PathBuf = match override_value {
-        Some(value) if !value.is_empty() => PathBuf::from(value),
-        _ => dirs::data_local_dir()
-            .ok_or_else(|| anyhow!("no platform-local data directory available"))?
-            .join("lore"),
-    };
-    to_utf8(raw)
-}
 
 /// Canonicalize a user-supplied project root and hand back a path the store
 /// can hold forever.
@@ -160,19 +144,6 @@ mod tests {
             strip_verbatim(Utf8PathBuf::from(r"C:\repos\x")).as_str(),
             r"C:\repos\x"
         );
-    }
-
-    #[test]
-    fn data_dir_override_wins_and_empty_override_falls_back() {
-        let explicit = resolve_data_dir(Some(OsStr::new(r"C:\tmp\lore-test"))).unwrap();
-        assert_eq!(explicit.as_str(), r"C:\tmp\lore-test");
-
-        let fallback = resolve_data_dir(Some(OsStr::new(""))).unwrap();
-        assert!(
-            fallback.as_str().ends_with("lore"),
-            "platform default ends in the app folder: {fallback}"
-        );
-        assert_eq!(fallback, resolve_data_dir(None).unwrap());
     }
 
     #[test]

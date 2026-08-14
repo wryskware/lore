@@ -24,92 +24,29 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use camino::{Utf8Path, Utf8PathBuf};
-use serde::{Deserialize, Serialize};
+use camino::Utf8Path;
 
-/// File name within the data directory.
-pub const HANDSHAKE_FILE: &str = "daemon.json";
-
-/// How often the owning daemon refreshes `heartbeat_at`.
-pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
-
-/// A heartbeat older than this no longer proves liveness on its own; the
-/// port is probed before the record is declared stale. Three missed beats.
-pub const STALE_AFTER: Duration = Duration::from_secs(45);
+/// Read-side contract (record type, freshness rule, `read`) lives in
+/// `lore_core::discovery` so thin clients discover the daemon without
+/// linking this crate; re-exported here for the daemon's own call sites.
+pub use lore_core::discovery::{
+    HANDSHAKE_FILE, HEARTBEAT_INTERVAL, Handshake, STALE_AFTER, handshake_path as path, is_fresh,
+    read, unix_now,
+};
 
 /// How long the takeover probe waits for `/v1/status` to answer.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// The published record. Field set is deliberately small and stable: thin
-/// clients parse this with nothing but `serde_json`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Handshake {
-    pub pid: u32,
-    pub port: u16,
-    pub api_version: u32,
-    pub daemon_version: String,
-    /// Unix seconds at daemon start.
-    pub started_at: i64,
-    /// Unix seconds at the last heartbeat refresh.
-    pub heartbeat_at: i64,
-}
-
-impl Handshake {
-    /// A record for *this* process listening on `port`.
-    pub fn for_this_process(port: u16, now: i64) -> Self {
-        Self {
-            pid: std::process::id(),
-            port,
-            api_version: lore_core::API_VERSION,
-            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-            started_at: now,
-            heartbeat_at: now,
-        }
+/// A record for *this* process listening on `port`.
+pub fn for_this_process(port: u16, now: i64) -> Handshake {
+    Handshake {
+        pid: std::process::id(),
+        port,
+        api_version: lore_core::API_VERSION,
+        daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+        started_at: now,
+        heartbeat_at: now,
     }
-
-    /// Base URL of the versioned API, e.g. `http://127.0.0.1:53412/v1`.
-    pub fn base_url(&self) -> String {
-        format!("http://127.0.0.1:{}/v1", self.port)
-    }
-}
-
-pub fn path(data_dir: &Utf8Path) -> Utf8PathBuf {
-    data_dir.join(HANDSHAKE_FILE)
-}
-
-/// Unix seconds now. Pre-1970 clocks are not a scenario worth modelling.
-pub fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or_default()
-}
-
-/// Read the handshake record, if the daemon has ever published one here.
-///
-/// `Ok(None)` means "no file". A corrupt file is an `Err` — clients deserve
-/// to know the difference, and [`preflight`] treats it as stale.
-pub fn read(data_dir: &Utf8Path) -> Result<Option<Handshake>> {
-    let file = path(data_dir);
-    match std::fs::read_to_string(&file) {
-        Ok(text) => {
-            let parsed =
-                serde_json::from_str(&text).with_context(|| format!("parsing handshake {file}"))?;
-            Ok(Some(parsed))
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err).with_context(|| format!("reading handshake {file}")),
-    }
-}
-
-/// Is this heartbeat recent enough to believe on its own?
-///
-/// Pure over `(record, now)` so the policy is testable without sleeping.
-/// A heartbeat in the future (clock adjustment, DST-naive clock, VM resume)
-/// counts as fresh: refusing to start is the safe direction when the answer
-/// is "we cannot tell".
-pub fn is_fresh(handshake: &Handshake, now: i64) -> bool {
-    now - handshake.heartbeat_at < STALE_AFTER.as_secs() as i64
 }
 
 /// Atomically publish `handshake`.

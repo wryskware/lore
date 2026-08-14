@@ -110,7 +110,7 @@ pub async fn run(options: DaemonOptions) -> Result<()> {
         .context("binding loopback listener")?;
     let port = listener.local_addr()?.port();
 
-    let record = Handshake::for_this_process(port, handshake::unix_now());
+    let record = handshake::for_this_process(port, handshake::unix_now());
     handshake::write(&data_dir, &record)?;
     tracing::info!(
         pid = record.pid,
