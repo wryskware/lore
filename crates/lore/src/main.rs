@@ -35,22 +35,23 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Foreground daemon. Logs go to stderr so stdout stays free for anything a
+/// future `--json` mode wants to print, and so `lore daemon 2> lore.log`
+/// works the way an operator expects.
 fn daemon() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "lore=info".into()),
         )
         .init();
 
+    let data_dir = lore::daemon::data_dir()?;
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(async {
-            tracing::info!(
-                api_version = lore_core::API_VERSION,
-                "lore daemon starting (M1 slice not yet implemented)"
-            );
-            anyhow::bail!("not implemented yet: daemon")
-        })
+        .block_on(lore::daemon::run(lore::daemon::DaemonOptions::new(
+            data_dir,
+        )))
 }

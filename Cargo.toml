@@ -18,9 +18,21 @@ axum = "0.8"
 blake3 = "1"
 camino = { version = "1", features = ["serde1"] }
 clap = { version = "4.6", features = ["derive"] }
+# Platform data directory (`%LOCALAPPDATA%\lore` on Windows). Tiny, no
+# transitive weight; the alternative is hand-rolling KNOWNFOLDERID lookups.
+dirs = "6"
+# ripgrep's walker: gitignore semantics (including nested and parent
+# `.gitignore` files) for free, which the indexer needs to match what a
+# developer expects to be searchable.
+ignore = "0.4"
 notify = "8.2"
 notify-debouncer-full = "0.7"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-tls"] }
+# No TLS feature on purpose. Every reqwest caller in Lore talks to loopback
+# (the daemon's own API, D-0007) or to a local embedding server (D-0003:
+# local-only, no cloud providers), so http suffices — and reqwest's `rustls`
+# feature drags in aws-lc-sys, which needs NASM+cmake to build on Windows MSVC.
+# Re-enabling TLS later is a one-line feature change.
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 rmcp = "3.1"
 rusqlite = { version = "0.40", features = ["bundled"] }
 rusqlite_migration = "2.6"
@@ -29,8 +41,15 @@ serde_json = "1"
 thiserror = "2"
 tempfile = "3"
 insta = "1"
-tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+# `net` added for axum's TcpListener; `fs` deliberately not enabled — file IO
+# happens on the blocking pool alongside the (blocking) store.
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+# Config file parsing (`config.toml`, design 3.1 §embedding provider config).
+toml = "1"
+# Dev-only: `ServiceExt::oneshot` drives the axum Router in tests without
+# binding a real port.
+tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tree-sitter = "0.26"
