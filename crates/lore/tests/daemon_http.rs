@@ -13,6 +13,7 @@ use lore::daemon::http::{AppState, router};
 use lore::daemon::index::full_scan;
 use lore::daemon::queue::IndexQueue;
 use lore::daemon::watch::{self, WatchCommand, WatchReceiver};
+use lore::embed::Embedder;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -33,6 +34,9 @@ fn harness() -> Harness {
         queue: queue.clone(),
         watch: watch_tx,
         config: Arc::new(Config::default()),
+        // No embedding endpoint: this file covers the lexical-only daemon.
+        // Hybrid ranking and health transitions live in `embed_search.rs`.
+        embeddings: Embedder::disabled(),
         data_dir: fixture.data_dir.clone(),
     };
     Harness {
@@ -232,7 +236,10 @@ async fn search_returns_ranked_lexical_results_with_provenance() {
 
     let (status, body) = post(&h.router, "/v1/search", json!({ "query": "daemon owns" })).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["lexical_only"], true, "vectors do not participate yet");
+    assert_eq!(
+        body["lexical_only"], true,
+        "no endpoint configured ⇒ visible degradation (D-0007)"
+    );
 
     let results = body["results"].as_array().unwrap();
     assert!(!results.is_empty(), "expected a hit: {body}");

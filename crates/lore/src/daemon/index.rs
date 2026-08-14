@@ -21,9 +21,11 @@
 //! free rather than merely fast.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 use camino::{Utf8Path, Utf8PathBuf};
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::chunk::{FileChunks, SkipReason, chunk_file};
@@ -41,6 +43,22 @@ pub struct IndexContext {
     /// into the indexer.
     pub data_dir: Utf8PathBuf,
     pub cancel: CancellationToken,
+    /// Pulsed at the end of every completed pass so the embed worker starts
+    /// on new chunks immediately instead of at its next idle tick. Nothing
+    /// depends on anyone listening — a lexical-only daemon simply has no
+    /// subscriber.
+    pub embed_notify: Arc<Notify>,
+}
+
+impl IndexContext {
+    pub fn new(store: StoreHandle, data_dir: Utf8PathBuf, cancel: CancellationToken) -> Self {
+        Self {
+            store,
+            data_dir,
+            cancel,
+            embed_notify: Arc::new(Notify::new()),
+        }
+    }
 }
 
 /// What one pass did. Logged verbatim; also the assertion surface for tests.
@@ -369,6 +387,14 @@ fn finish(
         duration_ms = started.elapsed().as_millis() as u64,
         "index pass complete"
     );
+
+    // Wake the embed worker. `notify_one` rather than `notify_waiters` on
+    // purpose: it stores a permit, so a pulse that lands while the worker is
+    // mid-batch still wakes it afterwards instead of being dropped. Pulsed on
+    // every completed pass, not only on passes that wrote chunks — a pass
+    // that merely *kept* chunks can still have left work (vectors discarded
+    // by a fingerprint reset), and an unnecessary pulse costs one no-op query.
+    ctx.embed_notify.notify_one();
 }
 
 fn log_store_error(project: &Project, rel: &Utf8Path, err: &StoreError) {

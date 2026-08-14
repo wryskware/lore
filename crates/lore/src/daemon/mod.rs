@@ -5,8 +5,9 @@
 //!            │                                                              │
 //!  ctrl-c ──▶│  http (axum, 127.0.0.1:0)  ──┐                               │
 //!            │  heartbeat (daemon.json)     ├──▶ StoreHandle (Mutex<Store>) │
-//!            │  watcher pump ──▶ IndexQueue ─┘         on spawn_blocking    │
-//!            │  indexer      ◀──────────────┘                               │
+//!            │  watcher pump ──▶ IndexQueue ─┤         on spawn_blocking    │
+//!            │  indexer      ◀──────────────┤                               │
+//!            │  embed worker ◀── Notify ────┘                               │
 //!            └──────────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -40,6 +41,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::config::Config;
+use crate::embed::Embedder;
 use crate::store::Project;
 
 pub use handshake::Handshake;
@@ -126,12 +128,16 @@ pub async fn run(options: DaemonOptions) -> Result<()> {
     let queue = queue::IndexQueue::new();
     let (watch_tx, watch_rx) = watch::channel();
 
-    let ctx = index::IndexContext {
-        store: store.clone(),
-        data_dir: data_dir.clone(),
-        cancel: cancel.clone(),
-    };
+    let ctx = index::IndexContext::new(store.clone(), data_dir.clone(), cancel.clone());
+    let embed_notify = ctx.embed_notify.clone();
     tracker.spawn(index::run(ctx, queue.clone()));
+
+    // Embeddings are optional (D-0007): with no endpoint configured there is
+    // simply no worker, and `Embedder` reports Unconfigured forever.
+    let embeddings = Embedder::new(&config.embeddings);
+    if let Some(worker) = embeddings.worker(store.clone(), embed_notify, cancel.clone()) {
+        tracker.spawn(worker.run());
+    }
 
     {
         let queue = queue.clone();
@@ -151,6 +157,7 @@ pub async fn run(options: DaemonOptions) -> Result<()> {
         queue: queue.clone(),
         watch: watch_tx.clone(),
         config,
+        embeddings,
         data_dir: data_dir.clone(),
     };
     let router = http::router(state);

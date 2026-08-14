@@ -59,11 +59,11 @@ impl Fixture {
     }
 
     pub fn context(&self) -> IndexContext {
-        IndexContext {
-            store: self.store.clone(),
-            data_dir: self.data_dir.clone(),
-            cancel: self.cancel.clone(),
-        }
+        IndexContext::new(
+            self.store.clone(),
+            self.data_dir.clone(),
+            self.cancel.clone(),
+        )
     }
 
     /// Create (or overwrite) a project file, creating parent directories.

@@ -35,6 +35,7 @@ use lore_core::{
 };
 
 use crate::config::Config;
+use crate::embed::Embedder;
 use crate::store::Project;
 
 use super::queue::IndexQueue;
@@ -52,6 +53,9 @@ pub struct AppState {
     pub queue: IndexQueue,
     pub watch: WatchSender,
     pub config: Arc<Config>,
+    /// Live embedding capability and health. Shared with the embed worker,
+    /// which is the thing that actually probes the endpoint.
+    pub embeddings: Embedder,
     pub data_dir: Utf8PathBuf,
 }
 
@@ -172,7 +176,10 @@ async fn status(State(state): State<AppState>) -> ApiResult<DaemonStatus> {
                 embedded_chunks: p.embedded_chunks,
             })
             .collect(),
-        embeddings: state.config.embedding_status(),
+        // Live probe result, not a guess derived from the config file: the
+        // whole point of D-0007 is that a user can see *why* results are
+        // lexical-only.
+        embeddings: state.embeddings.status(),
     }))
 }
 
@@ -261,9 +268,14 @@ async fn search_route(
     State(state): State<AppState>,
     ApiJson(request): ApiJson<SearchRequest>,
 ) -> ApiResult<lore_core::SearchResponse> {
+    // Embedding the query is network I/O, so it happens *before* the store
+    // lock is taken — never while holding it. `None` simply means this
+    // request runs lexical-only (D-0007); it is never an error.
+    let query_vector = state.embeddings.embed_query(&request.query).await;
+
     let outcome = state
         .store
-        .with(move |store| search::execute(store, &request))
+        .with(move |store| search::execute(store, &request, query_vector.as_deref()))
         .await
         .map_err(|err| ApiErr::internal("search", err))?;
     match outcome {

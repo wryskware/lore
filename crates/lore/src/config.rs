@@ -20,6 +20,14 @@ pub const CONFIG_FILE: &str = "config.toml";
 /// Batch size used by the embedding pipeline when the file says nothing.
 pub const DEFAULT_BATCH_MAX_ITEMS: usize = 64;
 
+/// Model id sent (and fingerprinted) when the file names no model.
+///
+/// `llama-server` ignores the field entirely, so requiring it would block the
+/// simplest valid configuration — `endpoint` and nothing else. The literal is
+/// still part of the fingerprint, so switching to a named model later is a
+/// visible change that forces a re-embed rather than silent vector mixing.
+pub const DEFAULT_MODEL_ID: &str = "default";
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -39,6 +47,10 @@ pub struct EmbeddingsConfig {
     pub query_prefix: String,
     pub document_prefix: String,
     pub batch_max_items: usize,
+    /// Sent as `Authorization: Bearer …`. Local servers usually ignore it,
+    /// but some (llama-server started with `--api-key`) demand *something*.
+    /// Absent ⇒ no header at all.
+    pub api_key: Option<String>,
 }
 
 impl Default for EmbeddingsConfig {
@@ -50,6 +62,17 @@ impl Default for EmbeddingsConfig {
             query_prefix: String::new(),
             document_prefix: String::new(),
             batch_max_items: DEFAULT_BATCH_MAX_ITEMS,
+            api_key: None,
+        }
+    }
+}
+
+impl EmbeddingsConfig {
+    /// The model id actually used on the wire and in the fingerprint.
+    pub fn model_id(&self) -> &str {
+        match self.model.as_deref() {
+            Some(model) if !model.trim().is_empty() => model,
+            _ => DEFAULT_MODEL_ID,
         }
     }
 }
@@ -71,19 +94,21 @@ impl Config {
         Ok(toml::from_str(text)?)
     }
 
-    /// What `GET /v1/status` should report about embeddings.
+    /// The embedding status implied by configuration *alone*, before anything
+    /// has talked to the endpoint.
     ///
-    /// This work package ships no embedding client, so a *configured*
-    /// endpoint is reported as [`lore_core::EmbeddingStatus::Unreachable`]
-    /// with an explicit reason rather than `Ready`: vectors genuinely do not
-    /// participate in ranking yet, and D-0007 requires that degradation be
-    /// visible. The embeddings package replaces this with a real probe.
+    /// A configured endpoint starts as [`lore_core::EmbeddingStatus::Unreachable`]
+    /// rather than `Ready`: until the first probe succeeds, vectors genuinely
+    /// do not participate in ranking, and D-0007 requires that degradation be
+    /// visible rather than assumed away. [`crate::embed::Embedder`] takes this
+    /// as its initial state and replaces it with live probe results.
     pub fn embedding_status(&self) -> lore_core::EmbeddingStatus {
         match &self.embeddings.endpoint {
             None => lore_core::EmbeddingStatus::Unconfigured,
             Some(endpoint) => lore_core::EmbeddingStatus::Unreachable {
                 endpoint: endpoint.clone(),
-                error: "embedding client not implemented yet; search is lexical-only".to_string(),
+                error: "endpoint not probed yet; search is lexical-only until it answers"
+                    .to_string(),
             },
         }
     }

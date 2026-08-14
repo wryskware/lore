@@ -6,10 +6,12 @@
 //! - [`chunk`] — file → chunks (Markdown heading-tree, tree-sitter code, text windows).
 //! - [`store`] — SQLite SearchStore: metadata + FTS5 + vectors, one transaction domain.
 //! - [`config`] — optional `config.toml` in the data directory.
+//! - [`embed`] — local embedding client, health and the backfill worker.
 //! - [`daemon`] — lifecycle, HTTP API, watcher and indexing.
 
 pub mod chunk;
 pub mod config;
 pub mod daemon;
+pub mod embed;
 pub mod store;
 pub mod types;
