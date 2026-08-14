@@ -25,6 +25,18 @@ pub use common::{
 
 use crate::types::Chunk;
 
+/// Bump whenever chunking policy changes in a way that should re-chunk
+/// unchanged files. The indexer mixes this into its per-file content hash,
+/// so a version bump invalidates the hash short-circuit and the next scan
+/// re-chunks (and prunes newly-skipped) files whose bytes never moved.
+pub const CHUNK_FORMAT_VERSION: u32 = 2;
+
+/// A single line longer than this marks a file as machine text (minified
+/// bundles, ML vocab dumps, serialized blobs). Dogfooding on the Lexomancy
+/// repo showed one giant one-line `tokenizer.json` outranking real code on
+/// every multi-word query — such files are token noise, not context.
+pub const MAX_TEXT_LINE_BYTES: usize = 4096;
+
 /// Why a file produced no chunks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
@@ -34,6 +46,9 @@ pub enum SkipReason {
     Binary,
     /// Not valid UTF-8.
     InvalidUtf8,
+    /// A single line exceeds [`MAX_TEXT_LINE_BYTES`] in a file that would be
+    /// window-chunked — minified/generated machine text, not human context.
+    MachineText,
 }
 
 /// Result of chunking one file.
@@ -87,10 +102,23 @@ pub fn chunk_file(rel_path: &Utf8Path, content: &[u8]) -> FileChunks {
         if let Some(chunks) = code::chunk_code(&spec, &path, src) {
             return FileChunks::Chunked(chunks);
         }
-        // Grammar refused the file: degrade to windows rather than lose it.
+        // Grammar refused the file: degrade to windows rather than lose it —
+        // unless it degrades because it is machine text (minified bundles).
+        if is_machine_text(src) {
+            return FileChunks::Skipped(SkipReason::MachineText);
+        }
         return FileChunks::Chunked(text::chunk_text(&path, src, Some(spec.tag)));
     }
+    if is_machine_text(src) {
+        return FileChunks::Skipped(SkipReason::MachineText);
+    }
     FileChunks::Chunked(text::chunk_text(&path, src, None))
+}
+
+/// Only window-chunked paths get this guard: code that parses and Markdown
+/// keep their own structure even with the odd long line (tables, data URIs).
+fn is_machine_text(src: &str) -> bool {
+    src.lines().any(|line| line.len() > MAX_TEXT_LINE_BYTES)
 }
 
 /// Internal parser key for an extension (`tsx` selects the TSX grammar; the
@@ -130,6 +158,27 @@ mod tests {
         );
         let invalid = chunk_file(Utf8Path::new("a.txt"), &[0xf0, 0x28, 0x8c, 0x28]);
         assert_eq!(invalid.skip_reason(), Some(SkipReason::InvalidUtf8));
+    }
+
+    #[test]
+    fn machine_text_is_skipped_only_on_window_paths() {
+        // One giant line in a window-chunked file (the Lexomancy
+        // tokenizer.json case) is skipped...
+        let vocab = format!("{{\"vocab\":{}}}", "\"word\",".repeat(2000));
+        assert!(vocab.len() > MAX_TEXT_LINE_BYTES);
+        assert_eq!(
+            chunk_file(Utf8Path::new("tokenizer.json"), vocab.as_bytes()).skip_reason(),
+            Some(SkipReason::MachineText)
+        );
+        // ...but the same line inside Markdown or parseable code is kept:
+        // those paths have real structure and the guard must not fire.
+        let md = format!("# Title\n\n{vocab}\n");
+        assert!(!chunks("data.md", &md).is_empty());
+        let rust = format!(
+            "const V: &str = \"{}\";\n",
+            "x".repeat(MAX_TEXT_LINE_BYTES + 1)
+        );
+        assert!(!chunks("data.rs", &rust).is_empty());
     }
 
     #[test]

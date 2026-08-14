@@ -223,7 +223,13 @@ fn index_one(ctx: &IndexContext, project: &Project, rel: &Utf8Path, summary: &mu
         }
     };
 
-    let hash = blake3::hash(&content).to_hex().to_string();
+    // The format version rides in the stored hash so a chunking-policy bump
+    // invalidates the short-circuit below and unchanged bytes re-chunk.
+    let hash = format!(
+        "v{}-{}",
+        crate::chunk::CHUNK_FORMAT_VERSION,
+        blake3::hash(&content).to_hex()
+    );
     let known = ctx.store.blocking(|store| store.file_hash(project.id, rel));
     match known {
         Ok(Some(previous)) if previous == hash => {
