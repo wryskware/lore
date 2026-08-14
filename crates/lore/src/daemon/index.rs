@@ -28,7 +28,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::chunk::{FileChunks, SkipReason, chunk_file};
+use crate::chunk::{FileChunks, chunk_file};
 use crate::store::{FileWrite, Project, StoreError};
 
 use super::queue::{IndexQueue, ProjectWork};
@@ -270,14 +270,13 @@ fn index_one(ctx: &IndexContext, project: &Project, rel: &Utf8Path, summary: &mu
         FileChunks::Skipped(reason) => {
             summary.skipped += 1;
             tracing::debug!(project = %project.name, path = %rel, ?reason, "skipped file");
-            // A file that *became* unindexable (source replaced by a binary
-            // blob, or grown past the size cap) must lose its stale chunks.
-            if matches!(
-                reason,
-                SkipReason::Binary | SkipReason::TooLarge | SkipReason::InvalidUtf8
-            ) {
-                remove_one(ctx, project, rel, summary);
-            }
+            // A file that *became* unindexable — whatever the reason — must
+            // lose its stale chunks. This deliberately does not enumerate
+            // `SkipReason` variants: an earlier enumerated list silently
+            // exempted the later-added `MachineText`, leaving a pruned-policy
+            // file searchable forever (caught dogfooding on Lexomancy).
+            // `remove_one` is a no-op for files that were never indexed.
+            remove_one(ctx, project, rel, summary);
         }
     }
 }
