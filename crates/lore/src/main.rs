@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
 
+mod cli;
+
 #[derive(Parser)]
 #[command(
     name = "lore",
@@ -20,18 +22,26 @@ enum Command {
     /// Trigger (re)indexing of a registered project.
     Index { project: Option<String> },
     /// Show daemon and index status.
-    Status,
+    Status {
+        /// Print the daemon's raw JSON response instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search the index — the same surface agents get over MCP.
+    Search(cli::SearchArgs),
 }
 
+/// Client subcommands return `Err` with a message that already tells the user
+/// what to do about it, and `main`'s `Result` turns that into `Error: …` on
+/// stderr plus a non-zero exit — which is the whole contract a script needs.
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    match cli.command {
+    let args = Cli::parse();
+    match args.command {
         Command::Daemon => daemon(),
-        Command::Add { path } => anyhow::bail!("not implemented yet: add {path}"),
-        Command::Index { project } => {
-            anyhow::bail!("not implemented yet: index {project:?}")
-        }
-        Command::Status => anyhow::bail!("not implemented yet: status"),
+        Command::Add { path } => cli::run(cli::add(path)),
+        Command::Index { project } => cli::run(cli::index(project)),
+        Command::Status { json } => cli::run(cli::status(json)),
+        Command::Search(search) => cli::run(cli::search(search)),
     }
 }
 

@@ -1,0 +1,9 @@
+---
+source: crates/lore-mcp/tests/mcp_golden.rs
+expression: rendered
+---
+lore daemon 0.1.0  api v1  generation 42
+embeddings: UNREACHABLE - http://127.0.0.1:11434 (connection refused); search is lexical-only until it answers
+projects (2):
+  lexomancy  files 812  chunks 9134  embedded 0/9134 (0%)  C:\repos\Lexomancy
+  lore       files 96  chunks 1204  embedded 1204/1204 (100%)  C:\Users\wrysk\wryskware\lore

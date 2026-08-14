@@ -33,7 +33,13 @@ notify-debouncer-full = "0.7"
 # feature drags in aws-lc-sys, which needs NASM+cmake to build on Windows MSVC.
 # Re-enabling TLS later is a one-line feature change.
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
-rmcp = "3.1"
+# Server side only, and only the stdio transport (D-0007: `lore-mcp` is a thin
+# stdio proxy). `macros` gives `#[tool]`/`#[tool_router]`/`#[tool_handler]`;
+# `server` transitively enables `schemars`, which rmcp re-exports — so tool
+# parameter structs derive `rmcp::schemars::JsonSchema` with no separate pin.
+# Default features dropped: `base64` is only needed for image/audio content.
+# (`client` is added as a dev-dependency in lore-mcp for the golden harness.)
+rmcp = { version = "3.1", default-features = false, features = ["server", "macros", "transport-io"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 rusqlite_migration = "2.6"
 serde = { version = "1", features = ["derive"] }

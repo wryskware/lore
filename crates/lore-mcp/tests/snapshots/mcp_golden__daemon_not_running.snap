@@ -1,0 +1,6 @@
+---
+source: crates/lore-mcp/tests/mcp_golden.rs
+expression: redacted
+---
+TOOL ERROR
+the lore daemon is not running (no daemon handshake at <DATA_DIR>/daemon.json). Ask the user to start it with `lore daemon`, then retry.

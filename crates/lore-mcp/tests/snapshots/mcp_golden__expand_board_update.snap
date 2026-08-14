@@ -1,0 +1,13 @@
+---
+source: crates/lore-mcp/tests/mcp_golden.rs
+expression: rendered
+---
+lexomancy  Assets/Scripts/Board.cs:118-126  (file has 412 lines)
+    private bool _dirty;
+
+    void Update()
+    {
+        if (!_dirty) return;
+        Rebuild();
+        _dirty = false;
+    }

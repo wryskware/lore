@@ -1,0 +1,118 @@
+---
+source: crates/lore-mcp/tests/mcp_golden.rs
+expression: rendered
+---
+{
+  "instructions": "Lore indexes this machine's code projects and design vaults locally. Search it before answering questions about this codebase or about past design decisions, and prefer sources marked `decided` over prose that merely sounds confident. Registering projects and forcing a reindex are deliberately not available here: ask the user to run `lore add <path>` or `lore index`.",
+  "tools": [
+    {
+      "description": "Read a search hit in full, plus surrounding context lines. This is the 'now actually read it' step: search returns truncated excerpts, so do not quote or edit code from a search result without expanding it first.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "chunk_id": {
+            "description": "chunk_id from the search result you want to read.",
+            "type": "string"
+          },
+          "context_lines": {
+            "description": "Extra lines of context on each side of the chunk. The daemon applies a default and a ceiling.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project": {
+            "description": "Project name exactly as it appeared in the search result.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project",
+          "chunk_id"
+        ],
+        "type": "object"
+      },
+      "name": "expand"
+    },
+    {
+      "description": "Hybrid lexical+semantic search over the code projects and design vaults indexed on this machine. Each hit carries provenance (file, line span, symbol path for code, heading path for Markdown) and vault authority (decided / leaning / exploration / deprecated) with the decision IDs it cites - prefer `decided` sources when documents disagree. Excerpts are truncated; call `expand` with a hit's project and chunk_id to read it.",
+      "inputSchema": {
+        "$defs": {
+          "StatusFilter": {
+            "description": "How settled a design document is. `decided` is settled canon; `leaning` and\n`exploration` record thinking that is not binding; `deprecated` has been\nsuperseded; `unclassified` means the document declares no status at all.",
+            "enum": [
+              "exploration",
+              "leaning",
+              "decided",
+              "deprecated",
+              "unclassified"
+            ],
+            "type": "string"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "language": {
+            "description": "Lowercase language tag filter (\"csharp\", \"rust\", \"markdown\").",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "description": "Maximum results. The daemon clamps this to a sane ceiling.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "path_prefix": {
+            "description": "Project-relative path prefix filter, forward slashes (e.g. \"design/\").",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project": {
+            "description": "Restrict to one registered project, by name or id. Omit to search everything indexed on this machine.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "query": {
+            "description": "What to look for. Natural language or literal identifiers both work; the query is matched lexically and semantically.",
+            "type": "string"
+          },
+          "status": {
+            "description": "Keep only chunks carrying one of these vault authority levels. Omit for no filter.",
+            "items": {
+              "$ref": "#/$defs/StatusFilter"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "search"
+    },
+    {
+      "description": "Index health: daemon version, index generation, every registered project with its file/chunk/embedding coverage, and the embedding endpoint's state. Check this when search comes back empty, stale, or lexical-only - an unconfigured or unreachable embedding endpoint silently costs you every semantic match.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object"
+      },
+      "name": "status"
+    }
+  ]
+}
