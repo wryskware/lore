@@ -7,8 +7,19 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+blake3.workspace = true
+camino.workspace = true
 clap.workspace = true
 lore-core.workspace = true
+rusqlite.workspace = true
+rusqlite_migration.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+tempfile.workspace = true
