@@ -12,8 +12,11 @@
 //! ```
 //!
 //! Startup order is not arbitrary:
-//! 1. `preflight` — refuse to start if another daemon owns this data dir.
-//! 2. open the store — fail before publishing a port nobody can use.
+//! 1. `ownership::acquire` — the kernel-held lock that makes this process
+//!    the one owner of the data dir; every other step assumes it.
+//! 2. open the store — fail before publishing a port nobody can use. The
+//!    lock rides inside the [`StoreHandle`], so it outlives every task and
+//!    closure that can still write, however shutdown goes.
 //! 3. bind `127.0.0.1:0` — the OS assigns the port.
 //! 4. publish `daemon.json` — only now is the daemon discoverable, and by
 //!    then everything it advertises actually works.
@@ -24,6 +27,7 @@ pub mod expand;
 pub mod handshake;
 pub mod http;
 pub mod index;
+pub mod ownership;
 pub mod paths;
 pub mod queue;
 pub mod search;
@@ -103,9 +107,18 @@ pub async fn run(options: DaemonOptions) -> Result<()> {
     std::fs::create_dir_all(&data_dir).with_context(|| format!("creating data dir {data_dir}"))?;
 
     let config = Arc::new(Config::load(&data_dir)?);
-    handshake::preflight(&data_dir).await?;
+    let owner = ownership::acquire(&data_dir)?;
+    // Holding the lock proves any existing record's writer is gone (or
+    // exited without withdrawing it); it is ours to replace.
+    if let Ok(Some(stale)) = handshake::read(&data_dir) {
+        tracing::warn!(
+            stale_pid = stale.pid,
+            stale_port = stale.port,
+            "replacing a previous run's discovery record"
+        );
+    }
 
-    let store = StoreHandle::open(data_dir.join(paths::DB_FILE))?;
+    let store = StoreHandle::open(data_dir.join(paths::DB_FILE))?.with_owner(owner);
 
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -201,14 +214,17 @@ pub async fn run(options: DaemonOptions) -> Result<()> {
         .await
         .is_err()
     {
+        // Safe to give up on: any straggler that can still write carries the
+        // ownership lock inside its StoreHandle, so no successor can open
+        // the store until it actually stops.
         tracing::warn!(
             grace_secs = SHUTDOWN_GRACE.as_secs(),
             "shutdown deadline passed with tasks still running; exiting anyway"
         );
     }
 
-    // Only ours to withdraw. If a takeover happened while we were hung past
-    // the stale window, the file now belongs to the live daemon.
+    // Withdrawing only unpublishes discovery; ownership ends when the last
+    // StoreHandle drops. Only our own record is ours to remove.
     match handshake::remove_if_owned_by(&data_dir, record.pid) {
         Ok(true) => tracing::info!("handshake withdrawn"),
         Ok(false) => tracing::warn!("handshake file is no longer ours; leaving it in place"),

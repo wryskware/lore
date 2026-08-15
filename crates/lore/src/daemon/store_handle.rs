@@ -29,11 +29,19 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
+use super::ownership::OwnershipGuard;
 use crate::store::Store;
 
 #[derive(Clone)]
 pub struct StoreHandle {
     inner: Arc<Mutex<Store>>,
+    /// The process-lifetime ownership lock (D-0003), when this handle is the
+    /// daemon's. It rides with every clone — including one captured by a
+    /// blocking closure a shutdown timeout left behind — so the lock cannot
+    /// be released while any code that can still write the store exists.
+    /// `None` in unit-test fixtures that own their temp dir outright.
+    /// Never read — being dropped last is its entire job.
+    _owner: Option<Arc<OwnershipGuard>>,
 }
 
 impl std::fmt::Debug for StoreHandle {
@@ -53,7 +61,15 @@ impl StoreHandle {
     pub fn new(store: Store) -> Self {
         Self {
             inner: Arc::new(Mutex::new(store)),
+            _owner: None,
         }
+    }
+
+    /// Attach the daemon's ownership lock so it lives exactly as long as the
+    /// last handle that can reach the store.
+    pub fn with_owner(mut self, owner: OwnershipGuard) -> Self {
+        self._owner = Some(Arc::new(owner));
+        self
     }
 
     /// Run `f` against the store on the current (blocking) thread.

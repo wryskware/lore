@@ -1,12 +1,14 @@
-//! Single-instance handshake: freshness policy, atomic publication, and the
-//! two ways a second daemon can be refused.
+//! Discovery handshake: freshness policy, atomic publication, withdrawal,
+//! and the probe clients use to double-check a stale record. Admission lives
+//! in `daemon_ownership.rs` — this file is about being *found*, not about
+//! being *exclusive*.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use camino::Utf8Path;
 use lore::daemon::handshake::{
-    self, Handshake, STALE_AFTER, is_fresh, preflight, read, remove_if_owned_by, write,
+    self, Handshake, STALE_AFTER, is_fresh, read, remove_if_owned_by, write,
 };
 use tempfile::TempDir;
 
@@ -56,8 +58,10 @@ fn freshness_boundary_is_exactly_the_stale_window() {
 
 #[test]
 fn a_heartbeat_from_the_future_counts_as_fresh() {
-    // Clock adjustment or VM resume. "Cannot tell" must resolve to "do not
-    // start a second owner", never to "take over".
+    // Clock adjustment or VM resume. For a *client* deciding whether to
+    // trust the record, "cannot tell" resolves to "trust it and try the
+    // port". Admission is unaffected either way: the ownership lock, not
+    // this timestamp, decides who may start.
     let beat = record(1, 1, 2_000_000);
     assert!(is_fresh(&beat, 1_000_000));
 }
@@ -165,60 +169,12 @@ fn withdrawal_only_touches_our_own_record() {
 }
 
 // ---------------------------------------------------------------------------
-// Startup gate
+// The probe — how a client tells "stale record, daemon alive" from "stale
+// record, port recycled by a stranger".
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_clean_data_dir_starts() {
-    let dir = tempfile::tempdir().unwrap();
-    preflight(data_dir(&dir))
-        .await
-        .expect("nothing to conflict");
-}
-
-#[tokio::test]
-async fn a_fresh_heartbeat_refuses_startup_without_touching_the_network() {
-    let dir = tempfile::tempdir().unwrap();
-    let data = data_dir(&dir);
-    // Port 1 is not listening; a fresh heartbeat must be believed anyway, so
-    // this also proves the fresh path never probes.
-    write(data, &record(4242, 1, handshake::unix_now())).unwrap();
-
-    let err = preflight(data).await.expect_err("must refuse");
-    let message = format!("{err}");
-    assert!(message.contains("already running"), "{message}");
-    assert!(message.contains("4242"), "names the pid: {message}");
-}
-
-#[tokio::test]
-async fn a_stale_record_from_a_dead_daemon_is_taken_over() {
-    let dir = tempfile::tempdir().unwrap();
-    let data = data_dir(&dir);
-    let stale = handshake::unix_now() - STALE_AFTER.as_secs() as i64 - 60;
-    // pid 999_999 is not a live process, and nothing answers on the port.
-    write(data, &record(999_999, dead_port(), stale)).unwrap();
-
-    preflight(data).await.expect("stale record must not block");
-}
-
-#[tokio::test]
-async fn a_corrupt_record_is_taken_over() {
-    let dir = tempfile::tempdir().unwrap();
-    let data = data_dir(&dir);
-    std::fs::write(data.join("daemon.json"), "{not json").unwrap();
-    preflight(data)
-        .await
-        .expect("corrupt record must not block");
-}
-
-/// The hard case: heartbeat says the daemon died, but it is actually alive
-/// and serving (its heartbeat task was starved, the machine slept, …).
-/// Starting a second owner of the index here is exactly what D-0003 forbids.
-#[tokio::test]
-async fn a_stale_heartbeat_still_loses_to_a_daemon_that_answers() {
-    let dir = tempfile::tempdir().unwrap();
-    let data = data_dir(&dir);
-
+async fn probe_believes_a_real_lore_status_body() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let router = axum::Router::new().route(
@@ -235,24 +191,12 @@ async fn a_stale_heartbeat_still_loses_to_a_daemon_that_answers() {
     );
     let server = tokio::spawn(async move { axum::serve(listener, router).await });
 
-    let stale = handshake::unix_now() - STALE_AFTER.as_secs() as i64 - 60;
-    write(data, &record(4242, port, stale)).unwrap();
-
-    let err = preflight(data).await.expect_err("a live daemon wins");
-    let message = format!("{err}");
-    assert!(message.contains("already running"), "{message}");
-    assert!(message.contains("still answers"), "{message}");
-
+    assert!(handshake::probe(port).await);
     server.abort();
 }
 
-/// …and the mirror image: something else squatting on the recycled port must
-/// not be able to veto startup forever.
 #[tokio::test]
-async fn a_stale_port_recycled_by_a_stranger_does_not_block_takeover() {
-    let dir = tempfile::tempdir().unwrap();
-    let data = data_dir(&dir);
-
+async fn probe_rejects_a_stranger_squatting_on_a_recycled_port() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let router = axum::Router::new().route(
@@ -261,12 +205,7 @@ async fn a_stale_port_recycled_by_a_stranger_does_not_block_takeover() {
     );
     let server = tokio::spawn(async move { axum::serve(listener, router).await });
 
-    let stale = handshake::unix_now() - STALE_AFTER.as_secs() as i64 - 60;
-    write(data, &record(4242, port, stale)).unwrap();
-
-    preflight(data)
-        .await
-        .expect("a non-lore responder is not proof of life");
-
+    assert!(!handshake::probe(port).await, "a 200 is not enough");
+    assert!(!handshake::probe(dead_port()).await, "nor is a dead port");
     server.abort();
 }

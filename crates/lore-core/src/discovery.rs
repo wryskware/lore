@@ -4,8 +4,8 @@
 //! The daemon (in the `lore` crate) *writes* the handshake; thin clients
 //! (`lore-mcp`, CLI subcommands) only ever *read* it — so the record type,
 //! the freshness rule, and "where is the data dir" live here in the contract
-//! crate. Write-side machinery (atomic publish, takeover preflight, probe)
-//! stays daemon-side.
+//! crate. Write-side machinery (atomic publish, the ownership lock that
+//! actually enforces single-instance, the probe) stays daemon-side.
 
 use std::ffi::OsStr;
 use std::path::PathBuf;
@@ -24,8 +24,8 @@ pub const HANDSHAKE_FILE: &str = "daemon.json";
 /// How often the owning daemon refreshes `heartbeat_at`.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
-/// A heartbeat older than this no longer proves liveness on its own; the
-/// daemon probes the port before declaring the record stale. Three missed
+/// A heartbeat older than this no longer proves liveness on its own; a
+/// client should probe the port before believing the record. Three missed
 /// beats.
 pub const STALE_AFTER: Duration = Duration::from_secs(45);
 
@@ -82,7 +82,8 @@ pub fn unix_now() -> i64 {
 /// Read the handshake record, if the daemon has ever published one here.
 ///
 /// `Ok(None)` means "no file". A corrupt file is an `Err` — clients deserve
-/// to know the difference (the daemon's preflight treats it as stale).
+/// to know the difference. (The daemon itself doesn't care: admission is the
+/// ownership lock, and this record is only discovery.)
 pub fn read(data_dir: &Utf8Path) -> Result<Option<Handshake>> {
     let file = handshake_path(data_dir);
     match std::fs::read_to_string(&file) {

@@ -5,7 +5,7 @@ members = ["crates/lore-core", "crates/lore", "crates/lore-mcp"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 repository = "https://github.com/wryskware/lore"
 
 [workspace.dependencies]

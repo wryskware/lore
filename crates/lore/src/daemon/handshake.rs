@@ -1,29 +1,27 @@
-//! Single-instance handshake — `<data-dir>/daemon.json` (D-0007, CodeGraph
+//! Discovery handshake — `<data-dir>/daemon.json` (D-0007, CodeGraph
 //! pattern).
 //!
-//! The file is simultaneously three things:
+//! The file is two things:
 //!
-//! 1. **A mutual-exclusion token.** Exactly one process may own the index
-//!    (D-0003); a second `lore daemon` must refuse to start rather than race.
-//! 2. **A liveness claim.** `heartbeat_at` is refreshed every
-//!    [`HEARTBEAT_INTERVAL`]; older than [`STALE_AFTER`] and the claim is not
-//!    believed on its own.
-//! 3. **A discovery record.** Clients (CLI, `lore-mcp`) read it to find the
+//! 1. **A discovery record.** Clients (CLI, `lore-mcp`) read it to find the
 //!    ephemeral port — [`read`] is the shared helper they call.
+//! 2. **A liveness claim.** `heartbeat_at` is refreshed every
+//!    [`HEARTBEAT_INTERVAL`]; older than [`STALE_AFTER`] and a client should
+//!    not believe the record without probing the port.
+//!
+//! It is deliberately *not* the mutual-exclusion mechanism. A file that
+//! anything can delete, corrupt, or mistime cannot prove exclusivity: that
+//! job belongs to [`super::ownership`], whose held OS lock is released by
+//! the kernel on process death and by nothing else. Admission never reads
+//! this file except to name the incumbent in an error message.
 //!
 //! Writes are atomic (temp file in the same directory + rename over the
 //! target), so a client can never observe a half-written record: readers see
 //! either the previous complete file or the new complete file.
-//!
-//! Deliberately *not* an OS lock file: a crashed daemon must not leave the
-//! machine unable to start a new one, and Windows lock semantics on a crashed
-//! process are exactly the CCE failure this design avoids. Liveness is proven
-//! by a fresh heartbeat or by the port actually answering, never by the mere
-//! existence of a file.
 
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use camino::Utf8Path;
 
 /// Read-side contract (record type, freshness rule, `read`) lives in
@@ -56,9 +54,9 @@ pub fn for_this_process(port: u16, now: i64) -> Handshake {
 /// `MOVEFILE_REPLACE_EXISTING` on Windows, so the replace is a single
 /// metadata operation and never leaves the target truncated.
 ///
-/// The temp name carries the pid so two racing daemons cannot clobber each
-/// other's scratch file (they will still fight over the target, which is what
-/// [`preflight`] is for).
+/// The temp name carries the pid so two processes cannot clobber each
+/// other's scratch file. Two *daemons* never race the target: only the
+/// [`super::ownership`] lock holder publishes here.
 pub fn write(data_dir: &Utf8Path, handshake: &Handshake) -> Result<()> {
     let target = path(data_dir);
     let temp = data_dir.join(format!("{HANDSHAKE_FILE}.{}.tmp", std::process::id()));
@@ -89,50 +87,6 @@ pub fn remove_if_owned_by(data_dir: &Utf8Path, pid: u32) -> Result<bool> {
         // as stale anyway.
         Err(_) => Ok(false),
     }
-}
-
-/// Startup gate. `Ok(())` means this process may take ownership.
-///
-/// Order matters: the cheap local check (fresh heartbeat) comes first so the
-/// common "daemon is already running" case costs one file read and no
-/// network. Only an *old* heartbeat gets a probe, and only a probe that gets
-/// a well-formed `/v1/status` back counts as proof of life — a stale port can
-/// have been recycled by an unrelated process.
-pub async fn preflight(data_dir: &Utf8Path) -> Result<()> {
-    let existing = match read(data_dir) {
-        Ok(Some(existing)) => existing,
-        Ok(None) => return Ok(()),
-        Err(err) => {
-            tracing::warn!(error = %err, "unreadable handshake file; treating as stale");
-            return Ok(());
-        }
-    };
-
-    let age = unix_now() - existing.heartbeat_at;
-    if is_fresh(&existing, unix_now()) {
-        bail!(
-            "daemon already running (pid {}, port {}); heartbeat is {age}s old",
-            existing.pid,
-            existing.port
-        );
-    }
-
-    if probe(existing.port).await {
-        bail!(
-            "daemon already running (pid {}, port {}); heartbeat is {age}s stale but \
-             /v1/status still answers",
-            existing.pid,
-            existing.port
-        );
-    }
-
-    tracing::warn!(
-        stale_pid = existing.pid,
-        stale_port = existing.port,
-        heartbeat_age_secs = age,
-        "taking over stale handshake"
-    );
-    Ok(())
 }
 
 /// Does a *Lore daemon* answer on this loopback port?
