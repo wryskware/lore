@@ -571,6 +571,91 @@ async fn registering_a_duplicate_display_name_is_refused_with_a_remedy() {
     assert_eq!(body["key"], "other", "the key survives re-registration");
 }
 
+/// Precedence, stated as a conflict rather than as an absence: both fields are
+/// present, both name a *real* project, and they disagree. The key has to win,
+/// or the field is decorative — an agent replaying a stale `project` string
+/// alongside a fresh key would silently query the wrong source.
+#[tokio::test]
+async fn a_valid_but_mismatched_display_name_loses_to_the_project_key() {
+    let h = harness();
+    h.fixture
+        .write("notes.md", "# Heading\n\nA line about ranking.\n");
+    full_scan(&h.fixture.context(), &h.fixture.project);
+
+    // A second, genuinely registered project that does not contain the chunk.
+    let other = tempfile::tempdir().unwrap();
+    let (status, body) = post(
+        &h.router,
+        "/v1/projects",
+        json!({ "root": other.path().to_string_lossy(), "name": "decoy" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+
+    let (_, search) = post(&h.router, "/v1/search", json!({ "query": "ranking" })).await;
+    let hit = &search["results"][0];
+    let chunk_id = hit["chunk_id"].as_str().unwrap().to_string();
+    assert_eq!(hit["project_key"], "demo", "{search:#}");
+
+    let (status, body) = post(
+        &h.router,
+        "/v1/expand",
+        json!({ "project": "decoy", "project_key": "demo", "chunk_id": chunk_id }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the key resolved, not the name: {body:#}"
+    );
+    assert_eq!(body["path"], "notes.md");
+
+    // And the reverse: the name is right, the key is wrong, so it fails —
+    // proving the key is consulted first rather than merely as a fallback.
+    let (status, _) = post(
+        &h.router,
+        "/v1/expand",
+        json!({ "project": "demo", "project_key": "decoy", "chunk_id": chunk_id }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// The `status` surface of the authority policy, on the wire (design note 1d).
+/// The store-level counting is covered in `daemon_authority.rs`; what this adds
+/// is that the count and the paths actually reach a client, since every
+/// renderer downstream is driven from these two fields.
+#[tokio::test]
+async fn status_reports_refused_authority_declarations_over_the_wire() {
+    let h = harness();
+    h.fixture.write(
+        "design/0_Canon/DECISIONS.md",
+        "# Ledger\n\n## D-0001 — Live\n\n- **Status:** Accepted\n",
+    );
+    h.fixture.write(
+        "design/honest.md",
+        "---\ndesign_status: decided\ndecision_refs: [D-0001]\n---\n\n# Honest\n\nBody.\n",
+    );
+    h.fixture.write(
+        "design/overclaim.md",
+        "---\ndesign_status: decided\n---\n\n# Overclaim\n\nBody.\n",
+    );
+    full_scan(&h.fixture.context(), &h.fixture.project);
+
+    let (status, body) = get(&h.router, "/v1/status").await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    let project = &body["projects"][0];
+    assert_eq!(project["authority_violations"], 1, "{body:#}");
+    assert_eq!(
+        project["authority_violation_paths"],
+        json!(["design/overclaim.md"]),
+        "{body:#}"
+    );
+    // The provenance fields ride along on the same row.
+    assert_eq!(project["key"], "demo");
+    assert_eq!(project["kind"], "repo");
+}
+
 /// Registration is the only thing that writes the registry outside startup, so
 /// it must republish immediately — otherwise the project is indexed now and
 /// gone after the next restart.
