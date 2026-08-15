@@ -25,7 +25,6 @@ use std::collections::{HashMap, HashSet};
 
 use lore_core::{SearchRequest, SearchResponse, SearchResult};
 
-use crate::embed::text::{WINDOW_MARKER, is_discriminator, strip_discriminators};
 use crate::store::{ProjectId, SearchFilter, SearchHit, StatusFilter, Store};
 use crate::types::{Chunk, ChunkKind, DesignStatus, authority_tier};
 
@@ -211,24 +210,35 @@ fn fuse(lists: Vec<Vec<SearchHit>>, limit: usize) -> Vec<SearchHit> {
             .then_with(|| a.1.chunk.id.0.cmp(&b.1.chunk.id.0))
     });
 
-    let mut kept: HashSet<(ProjectId, camino::Utf8PathBuf, String)> = HashSet::new();
+    // Window collapse. The chunker splits an oversized symbol or section into
+    // overlapping windows, so a query matching the overlap hits several of
+    // them; they are one place in one file, the best-scoring one represents
+    // them, and the rest are noise the caller would have to deduplicate.
+    //
+    // The gate is *positive membership of one generated family*, never the
+    // shape of an anchor. Everything without a family stays a distinct result
+    // even when anchors collide: two C# overloads share `Parser.Parse`, two
+    // sibling `## Notes` sections share their heading path, and two
+    // independently windowed overloads both spell `#w0`/`#w1` while being
+    // different code. Rows written before `CHUNK_FORMAT_VERSION` 4 carry no
+    // family and therefore never collapse - the safe direction, showing a
+    // duplicate window rather than hiding a result, until the re-chunk pass
+    // reaches them.
+    let mut kept: HashSet<(ProjectId, camino::Utf8PathBuf, u32)> = HashSet::new();
     let mut out = Vec::with_capacity(limit.min(scored.len()));
     for (score, candidate) in scored {
         if out.len() >= limit {
             break;
         }
-        let key = (
-            candidate.project,
-            candidate.chunk.path.clone(),
-            collapse_anchor(&candidate.chunk),
-        );
-        // Window collapse: the chunker splits an oversized symbol or section
-        // into overlapping `#w0/#w1/…` windows, so a query matching the
-        // overlap hits several of them. They are one place in one file; the
-        // best-scoring window represents them and the rest are noise the
-        // caller would have to deduplicate itself.
-        if !kept.insert(key) {
-            continue;
+        if let Some(window) = candidate.chunk.kind.window_family() {
+            let key = (
+                candidate.project,
+                candidate.chunk.path.clone(),
+                window.family,
+            );
+            if !kept.insert(key) {
+                continue;
+            }
         }
         out.push(SearchHit {
             project: candidate.project,
@@ -237,30 +247,6 @@ fn fuse(lists: Vec<Vec<SearchHit>>, limit: usize) -> Vec<SearchHit> {
         });
     }
     out
-}
-
-/// Identity of a chunk's *location*, ignoring which oversize window it is.
-///
-/// Only `#w` is stripped. `#s<n>` distinguishes genuinely different runs of
-/// unnamed statements and `#d<n>` distinguishes real duplicate spans; folding
-/// either would hide results rather than deduplicate them. Text-window chunks
-/// (`ChunkKind::Window`) keep their ordinal for the same reason — consecutive
-/// windows of a log file are different content, not one split symbol.
-fn collapse_anchor(chunk: &Chunk) -> String {
-    match &chunk.kind {
-        ChunkKind::Code { symbol_path, .. } => {
-            format!("code:{}", strip_discriminators(symbol_path, &WINDOW_MARKER))
-        }
-        ChunkKind::Section { heading_path, .. } => {
-            let titles: Vec<&str> = heading_path
-                .iter()
-                .filter(|title| !is_discriminator(title, &WINDOW_MARKER))
-                .map(String::as_str)
-                .collect();
-            format!("md:{}", titles.join(" > "))
-        }
-        ChunkKind::Window { index } => format!("win:{index}"),
-    }
 }
 
 /// The 3.1 vault-status modifier.
@@ -369,7 +355,7 @@ fn status_label(status: DesignStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Chunk, ChunkId, VaultMeta};
+    use crate::types::{Chunk, ChunkId, VaultMeta, WindowFamily};
     use camino::Utf8PathBuf;
 
     /// `id` is what ties a chunk together across the two ranked lists, so the
@@ -496,43 +482,50 @@ mod tests {
         );
     }
 
+    /// One window of a family, as the chunker emits it: the `#w<n>` suffix
+    /// *and* the metadata that says the suffix is bookkeeping.
+    fn window(family: u32, index: u32) -> Option<WindowFamily> {
+        Some(WindowFamily { family, index })
+    }
+
     #[test]
     fn overlapping_windows_of_one_span_collapse_to_the_best_one() {
-        let code = |suffix: &str| ChunkKind::Code {
+        let code = |suffix: &str, window| ChunkKind::Code {
             symbol_kind: "method_declaration".into(),
             symbol_path: format!("Board.Update{suffix}"),
-            window: None,
+            window,
         };
         // Both windows of `Board.Update` match; only the better one survives.
         let lexical = vec![
-            hit("w0", "Board.cs", code("#w0"), None),
-            hit("w1", "Board.cs", code("#w1"), None),
-            hit("other", "Board.cs", code("Other"), None),
+            hit("w0", "Board.cs", code("#w0", window(0, 0)), None),
+            hit("w1", "Board.cs", code("#w1", window(0, 1)), None),
+            hit("other", "Board.cs", code("Other", None), None),
         ];
         let fused = fuse(vec![lexical, Vec::new()], 10);
         assert_eq!(ids(&fused), ["w0", "other"]);
 
-        // Same anchor in a *different file* is a different place.
+        // Same anchor *and* same family ordinal in a different file is a
+        // different place: the key is per file, and families are per file too.
         let cross_file = vec![
-            hit("a", "Board.cs", code("#w0"), None),
-            hit("b", "Other.cs", code("#w0"), None),
+            hit("a", "Board.cs", code("#w0", window(0, 0)), None),
+            hit("b", "Other.cs", code("#w0", window(0, 0)), None),
         ];
         assert_eq!(ids(&fuse(vec![cross_file], 10)).len(), 2);
     }
 
     #[test]
-    fn section_windows_collapse_but_distinct_headings_do_not() {
-        let windowed = |suffix: Option<&str>| ChunkKind::Section {
+    fn section_windows_collapse_but_equal_anchors_do_not() {
+        let windowed = |suffix: Option<&str>, window| ChunkKind::Section {
             heading_path: match suffix {
                 Some(s) => vec!["Ranking".into(), s.to_string()],
                 None => vec!["Ranking".into()],
             },
-            window: None,
+            window,
         };
         let hits = vec![
-            hit("s0", "3.1.md", windowed(Some("#w0")), None),
-            hit("s1", "3.1.md", windowed(Some("#w1")), None),
-            hit("whole", "3.1.md", windowed(None), None),
+            hit("s0", "3.1.md", windowed(Some("#w0"), window(0, 0)), None),
+            hit("s1", "3.1.md", windowed(Some("#w1"), window(0, 1)), None),
+            hit("whole", "3.1.md", windowed(None, None), None),
             hit(
                 "dup",
                 "3.1.md",
@@ -543,8 +536,26 @@ mod tests {
                 None,
             ),
         ];
-        // s0/s1/whole are one location; `#d1` is a real duplicate span.
-        assert_eq!(ids(&fuse(vec![hits], 10)), ["s0", "dup"]);
+        // Only s0/s1 are two views of one span. `whole` is an unsplit section
+        // that merely shares the base heading path — a sibling `## Ranking`,
+        // as far as ranking can tell — and `#d1` is a real duplicate span;
+        // folding either would delete content the caller asked for.
+        assert_eq!(ids(&fuse(vec![hits], 10)), ["s0", "whole", "dup"]);
+    }
+
+    /// A heading a human typed as `#w0` is content, not bookkeeping: without
+    /// the family it is never folded away, whatever it is spelled.
+    #[test]
+    fn a_user_authored_window_shaped_heading_is_not_bookkeeping() {
+        let heading = |title: &str| ChunkKind::Section {
+            heading_path: vec!["Escapes".into(), title.into()],
+            window: None,
+        };
+        let hits = vec![
+            hit("a", "notes.md", heading("#w0"), None),
+            hit("b", "notes.md", heading("#w1"), None),
+        ];
+        assert_eq!(ids(&fuse(vec![hits], 10)), ["a", "b"]);
     }
 
     #[test]
