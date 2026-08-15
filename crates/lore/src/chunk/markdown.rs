@@ -5,8 +5,9 @@
 //!   frontmatter is *unclassified*, i.e. `design_status: None`.
 //! * A heading's chunk runs from its own line to the next heading of any
 //!   level. For a leaf that is the whole section; for a heading with
-//!   subheadings that is its intro text, which is emitted only when it is
-//!   substantial enough to be worth a vector on its own.
+//!   subheadings that is its intro text, which earns its own chunk only when
+//!   it is substantial enough to be worth a vector — a shorter intro is
+//!   folded into the first chunk below it rather than dropped.
 //! * Text before the first heading is a chunk with an empty `heading_path`.
 //! * The frontmatter block itself is never a chunk, and one leading UTF-8 BOM
 //!   in front of it is tolerated.
@@ -36,6 +37,10 @@ pub(crate) fn chunk_markdown(path: &Utf8PathBuf, src: &str) -> Vec<Chunk> {
     emitter.push(body_start, first, Tpl::Section { heading_path: &[] });
 
     let mut stack: Vec<(u8, String)> = Vec::new();
+    // Byte offset of an intro too short for its own chunk, waiting to be
+    // folded into the first chunk emitted below it. A size heuristic decides
+    // where prose lives, never whether it is indexed at all.
+    let mut carried: Option<usize> = None;
     for (i, heading) in headings.iter().enumerate() {
         while stack.last().is_some_and(|(lvl, _)| *lvl >= heading.level) {
             stack.pop();
@@ -50,14 +55,22 @@ pub(crate) fn chunk_markdown(path: &Utf8PathBuf, src: &str) -> Vec<Chunk> {
 
         let has_children = next.is_some_and(|n| n.level > heading.level);
         let intro = trim_span(src, heading.body_start, end).map_or(0, |(s, e)| e - s);
+        let start = carried.unwrap_or(heading.start);
         if !has_children || intro >= MIN_SECTION_INTRO_BYTES {
             emitter.push(
-                heading.start,
+                start,
                 end,
                 Tpl::Section {
                     heading_path: &path,
                 },
             );
+            carried = None;
+        } else if carried.is_none() {
+            // Hand the intro to the first child; the span from here to that
+            // child's end is contiguous, so the merged chunk is still an
+            // exact file slice. An empty intro trims back to the child's own
+            // start, leaving those chunks byte-for-byte unchanged.
+            carried = Some(heading.body_start);
         }
         stack.push((heading.level, heading.title.clone()));
     }

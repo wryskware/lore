@@ -29,7 +29,7 @@ use crate::types::Chunk;
 /// unchanged files. The indexer mixes this into its per-file content hash,
 /// so a version bump invalidates the hash short-circuit and the next scan
 /// re-chunks (and prunes newly-skipped) files whose bytes never moved.
-pub const CHUNK_FORMAT_VERSION: u32 = 2;
+pub const CHUNK_FORMAT_VERSION: u32 = 3;
 
 /// A single line longer than this marks a file as machine text (minified
 /// bundles, ML vocab dumps, serialized blobs). Dogfooding on the Lexomancy
@@ -265,6 +265,33 @@ mod tests {
             &src[out[0].byte_start as usize..out[0].byte_end as usize],
             out[0].text
         );
+    }
+
+    /// A rule short enough to fit in one sentence is exactly the kind of
+    /// prose that must stay searchable: the intro-size heuristic decides
+    /// which chunk holds it, never whether it is indexed at all.
+    #[test]
+    fn a_short_container_intro_is_folded_into_the_first_child() {
+        let src = "# Safety\n\nNever upload.\n\n## Details\n\nLocal-only, bound to loopback.\n";
+        let out = chunks("safety.md", src);
+        assert!(
+            out.iter().any(|c| c.text.contains("Never upload.")),
+            "short intro dropped: {:?}",
+            out.iter().map(|c| c.text.as_str()).collect::<Vec<_>>()
+        );
+        for chunk in &out {
+            let slice = &src[chunk.byte_start as usize..chunk.byte_end as usize];
+            assert_eq!(slice, chunk.text, "span is not the file slice");
+        }
+
+        // An intro past the threshold still earns its own chunk, and an
+        // empty one still leaves the child's span untouched.
+        let long = "# Safety\n\nNever upload anything to a remote service, ever.\n\n## Details\n\nLocal-only.\n";
+        assert_eq!(chunks("long.md", long).len(), 2);
+        let empty = "# Safety\n\n## Details\n\nLocal-only.\n";
+        let out = chunks("empty-intro.md", empty);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].text.starts_with("## Details"));
     }
 
     #[test]
