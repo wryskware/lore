@@ -14,6 +14,29 @@
 //! that changes meaning with every corpus. RRF ignores magnitudes entirely and
 //! fuses *ranks*, which is why it is the standard answer and what 3.1 asks for.
 //!
+//! # Candidate depth is proved, not guessed
+//!
+//! Fusing ranks means a chunk both arms merely *like* can outscore a chunk one
+//! arm loves: agreement at rank 51 in both lists (`2/111`) beats a rank-1
+//! singleton (`1/61`). A fixed 50-per-arm pull therefore does not truncate the
+//! tail of the ranking, it silently omits results that belong at the top of
+//! it. Collapse makes the same pull underfill pages: one oversized symbol's
+//! windows can occupy the whole pool and leave a page of one.
+//!
+//! So acquisition loops. Each round fetches both arms at the current depth and
+//! re-runs fusion, authority and collapse *from scratch*, then asks whether
+//! anything outside the page could still get in (see [`page_is_final`]). It
+//! stops when the answer is provably no, when both arms are exhausted, or at
+//! [`MAX_CANDIDATES`]. Depth itself is nearly free in this store — the vector
+//! arm is an O(n) scan whose cost does not depend on `k`, and FTS5 scores
+//! every matching posting regardless of `LIMIT` — so what a round costs is
+//! one more scan, and the ladder is kept short for that reason.
+//!
+//! On the ordinary corpus this settles in one round: both arms run out of
+//! matching rows inside the first 50, which makes the ranking exact rather
+//! than merely unbeatable. Read [`MAX_CANDIDATES`] for what happens when they
+//! do not, and for the one thing this still does not promise.
+//!
 //! # Degradation is a first-class path
 //!
 //! `lexical_only` means exactly "vectors did not participate in *this*
@@ -39,13 +62,42 @@ pub const MAX_LIMIT: u32 = 100;
 /// context window on one tool call.
 pub const EXCERPT_MAX_CHARS: usize = 2000;
 
-/// Candidates pulled from the lexical arm before fusion. Deeper than the
-/// default page on purpose: a chunk the vector arm loves is worth surfacing
-/// even if BM25 put it at 40, and that only works if BM25 was asked for 50.
+/// Depth of the *first* lexical fetch. Deeper than the default page on
+/// purpose: a chunk the vector arm loves is worth surfacing even if BM25 put
+/// it at 40, and that only works if BM25 was asked for 50. Later rounds grow
+/// from here — this is a floor, not a ceiling.
 pub const LEXICAL_CANDIDATES: usize = 50;
 
-/// Candidates pulled from the vector arm before fusion.
+/// Depth of the first vector fetch. See [`LEXICAL_CANDIDATES`].
 pub const VECTOR_CANDIDATES: usize = 50;
+
+/// Per-arm depth multiplier between acquisition rounds.
+///
+/// A *round*, not a row, is the unit of cost here: the vector arm is a full
+/// scan whose price does not depend on the depth requested, so four rounds of
+/// 50 cost roughly four times one round of 200. The ladder is therefore short
+/// and steep — 50 → 200 → 800 → [`MAX_CANDIDATES`], four rounds at worst —
+/// rather than the gentler doubling that would pay for six scans to reach the
+/// same place.
+pub const CANDIDATE_GROWTH: usize = 4;
+
+/// Hard ceiling on per-arm candidate depth, and the one approximation left in
+/// ranking.
+///
+/// **This cap is load-bearing, not a safety valve.** Proving a page final
+/// means bounding the candidate *just* below the cutoff, and with RRF damping
+/// `K` the gap between consecutive ranks near rank `r` is about
+/// `1/(K + r)²`, so a real proof for a 20-result page over a dense corpus
+/// needs depth on the order of `(K + 20)² = 6400` — measured, not estimated.
+/// Any query whose arms are both still open at 1000 therefore stops here.
+///
+/// What the loop buys is nonetheless real, and is what the two reported
+/// failures asked for: cross-arm agreement anywhere in the first 1000 now
+/// wins the page it deserves (rank 51 was the reported case), and collapse can
+/// no longer strand a page at one result while eligible chunks sit below the
+/// pool. What remains approximate is only the tail beyond 1000, and hitting
+/// the cap is logged so it is visible rather than assumed.
+pub const MAX_CANDIDATES: usize = 1000;
 
 /// RRF damping constant. 60 is the value from the original Cormack et al.
 /// result and the de-facto default everywhere since; it makes the top of each
@@ -121,35 +173,110 @@ pub fn execute(
 
     let limit = request.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
 
-    // Ask each arm for a candidate pool at least as deep as the page the
-    // caller wants; otherwise `limit = 100` would silently top out at 50.
-    let lexical = store.lexical_search(&request.query, &filter, limit.max(LEXICAL_CANDIDATES))?;
+    // Candidate acquisition is a loop, not one fixed pull (see the module
+    // header). Both arms are always asked for the same depth, because the stop
+    // condition is stated in terms of a single `depth`. The floor keeps a
+    // large page from being served out of a shallower pool than itself
+    // (`limit = 100` must not top out at 50); the cap governs the other end.
+    let mut depth = limit.clamp(LEXICAL_CANDIDATES.max(VECTOR_CANDIDATES), MAX_CANDIDATES);
 
-    // A vector-arm failure degrades this request instead of failing it: the
-    // usual cause is a fingerprint that moved under a live query (dimension
-    // mismatch), which the worker is already fixing by re-embedding.
-    let vector = match query_vector {
-        Some(query_vector) => {
-            match store.vector_search(query_vector, &filter, limit.max(VECTOR_CANDIDATES)) {
+    let (fusion, lexical_only) = loop {
+        let lexical = store.lexical_search(&request.query, &filter, depth)?;
+
+        // A vector-arm failure degrades this request instead of failing it:
+        // the usual cause is a fingerprint that moved under a live query
+        // (dimension mismatch), which the worker is already fixing by
+        // re-embedding.
+        let vector = match query_vector {
+            Some(query_vector) => match store.vector_search(query_vector, &filter, depth) {
                 Ok(hits) => hits,
                 Err(err) => {
                     tracing::debug!(error = %err, "vector arm failed; falling back to lexical-only");
                     Vec::new()
                 }
-            }
+            },
+            None => Vec::new(),
+        };
+
+        // An arm that returned fewer rows than it was asked for has nothing
+        // left to give, and neither has one that never ran (no query vector,
+        // a vector error, a query that sanitized to nothing). "Open" arms are
+        // the only ones a deeper round could hear from.
+        let open = u32::from(lexical.len() >= depth) | (u32::from(vector.len() >= depth) << 1);
+
+        // Honest by construction: an embedded query over a corpus with no
+        // vectors in the filtered scope contributed nothing, and says so.
+        let lexical_only = vector.is_empty();
+        let fusion = fuse_detailed(vec![lexical, vector], limit);
+
+        if open == 0 {
+            // Both arms are fully enumerated: this ranking is exact, not an
+            // approximation. Short pages here are genuinely short.
+            break (fusion, lexical_only);
         }
-        None => Vec::new(),
+        if page_is_final(&fusion, depth, open) {
+            break (fusion, lexical_only);
+        }
+        if depth >= MAX_CANDIDATES {
+            tracing::debug!(
+                depth,
+                limit,
+                query = %request.query,
+                "candidate cap reached; this page is the best of the fetched pool, not proven best"
+            );
+            break (fusion, lexical_only);
+        }
+        // `.max(depth + 1)` makes growth strictly monotonic, so the cap above
+        // is always reached and the loop always terminates.
+        depth = depth
+            .saturating_mul(CANDIDATE_GROWTH)
+            .max(depth + 1)
+            .min(MAX_CANDIDATES);
     };
 
-    // Honest by construction: an embedded query over a corpus with no vectors
-    // in the filtered scope contributed nothing, and says so.
-    let lexical_only = vector.is_empty();
-    let hits = fuse(vec![lexical, vector], limit);
-
-    let results = hits.into_iter().map(|hit| to_result(&names, hit)).collect();
+    let results = fusion
+        .page
+        .into_iter()
+        .map(|hit| to_result(&names, hit))
+        .collect();
     Ok(SearchResponse {
         results,
         lexical_only,
+    })
+}
+
+/// Can anything we have not placed on the page still reach it?
+///
+/// A candidate absent from an arm that returned a *full* `depth` rows sits at
+/// rank ≥ `depth + 1` there, so that arm can contribute at most
+/// `1 / (RRF_K + depth + 1)` to it. Bounding every reachable candidate by
+///
+/// ```text
+/// max_score(c) = authority_max(c) · (rrf_seen(c) + missing_open_arms(c) · 1/(RRF_K + depth + 1))
+/// ```
+///
+/// and comparing against the page's own minimum turns "50 per arm looked like
+/// enough" into a proof. A candidate no arm has shown us yet is the same
+/// formula with `rrf_seen = 0` and the most generous authority there is.
+///
+/// The comparison is `>=`, not `>`: equal scores break on chunk id, so a
+/// candidate that merely *ties* the cutoff can still take the slot.
+fn page_is_final(fusion: &Fusion, depth: usize, open: u32) -> bool {
+    // A short page is never final while any arm might still have rows: the
+    // missing results may be exactly the ones collapse took out of it.
+    let Some(cutoff) = fusion.cutoff else {
+        return false;
+    };
+    let arm_ceiling = 1.0 / (RRF_K + depth as f64 + 1.0);
+
+    // The unseen case: a chunk in no list yet could enter every open arm at
+    // once, at the best rank still available in each, and be `decided`.
+    if AUTHORITY_DECIDED * f64::from(open.count_ones()) * arm_ceiling >= cutoff {
+        return false;
+    }
+    fusion.outside.iter().all(|c| {
+        let missing = f64::from((open & !c.seen).count_ones());
+        c.authority * (c.rrf + missing * arm_ceiling) < cutoff
     })
 }
 
@@ -159,6 +286,31 @@ struct Candidate {
     chunk: Chunk,
     /// Σ over the lists this chunk appears in.
     rrf: f64,
+    /// Bit `i` set = this chunk appeared in `lists[i]`. Which arms are still
+    /// *missing* a candidate is what bounds how much better it could get.
+    seen: u32,
+}
+
+/// One fused page, plus what acquisition needs to know about everything that
+/// did not make it onto the page.
+struct Fusion {
+    page: Vec<SearchHit>,
+    /// Score of the last result on a *full* page — the bar a newcomer has to
+    /// clear. `None` when the page is short, which is never final while any
+    /// arm still has rows.
+    cutoff: Option<f64>,
+    outside: Vec<Outside>,
+}
+
+/// A candidate that could still displace something, reduced to the three
+/// numbers that bound it. Deliberately holds no chunk: acquisition may build
+/// this for a thousand rows per round.
+struct Outside {
+    /// Σ 1/(RRF_K + rank) over the arms that have already shown it.
+    rrf: f64,
+    authority: f64,
+    /// Same bitmask as [`Candidate::seen`].
+    seen: u32,
 }
 
 /// Reciprocal Rank Fusion + vault authority + window collapse.
@@ -171,35 +323,51 @@ struct Candidate {
 /// cannot tell which arms ran, so the score must not change meaning with the
 /// endpoint's health, and 3.1's authority modifier is a property of ranking
 /// rather than of hybridity.
+///
+/// Production goes through [`fuse_detailed`], which is this plus the numbers
+/// acquisition needs; this shape is what the ranking tests assert against.
+#[cfg(test)]
 fn fuse(lists: Vec<Vec<SearchHit>>, limit: usize) -> Vec<SearchHit> {
+    fuse_detailed(lists, limit).page
+}
+
+/// [`fuse`], keeping the bookkeeping acquisition needs to decide whether to
+/// go deeper. Recomputed from scratch every round — nothing here is patched
+/// incrementally, so a deeper fetch cannot leave a stale ordering behind.
+fn fuse_detailed(lists: Vec<Vec<SearchHit>>, limit: usize) -> Fusion {
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut seen: HashMap<(ProjectId, String), usize> = HashMap::new();
 
-    for list in lists {
+    for (list_index, list) in lists.into_iter().enumerate() {
+        let arm = 1u32 << list_index;
         for (rank, hit) in list.into_iter().enumerate() {
             let contribution = 1.0 / (RRF_K + (rank + 1) as f64);
             let key = (hit.project, hit.chunk.id.0.clone());
             match seen.get(&key) {
-                Some(&index) => candidates[index].rrf += contribution,
+                Some(&index) => {
+                    candidates[index].rrf += contribution;
+                    candidates[index].seen |= arm;
+                }
                 None => {
                     seen.insert(key, candidates.len());
                     candidates.push(Candidate {
                         project: hit.project,
                         chunk: hit.chunk,
                         rrf: contribution,
+                        seen: arm,
                     });
                 }
             }
         }
     }
 
-    let mut scored: Vec<(f64, Candidate)> = candidates
+    // (score, authority, candidate) — authority is kept because the bound on
+    // an off-page candidate needs it separately from the product.
+    let mut scored: Vec<(f64, f64, Candidate)> = candidates
         .into_iter()
         .map(|candidate| {
-            (
-                candidate.rrf * authority_weight(&candidate.chunk),
-                candidate,
-            )
+            let authority = authority_weight(&candidate.chunk);
+            (candidate.rrf * authority, authority, candidate)
         })
         .collect();
     // Chunk id breaks ties so identical scores rank identically across runs;
@@ -207,7 +375,7 @@ fn fuse(lists: Vec<Vec<SearchHit>>, limit: usize) -> Vec<SearchHit> {
     scored.sort_by(|a, b| {
         b.0.partial_cmp(&a.0)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.1.chunk.id.0.cmp(&b.1.chunk.id.0))
+            .then_with(|| a.2.chunk.id.0.cmp(&b.2.chunk.id.0))
     });
 
     // Window collapse. The chunker splits an oversized symbol or section into
@@ -226,27 +394,54 @@ fn fuse(lists: Vec<Vec<SearchHit>>, limit: usize) -> Vec<SearchHit> {
     // reaches them.
     let mut kept: HashSet<(ProjectId, camino::Utf8PathBuf, u32)> = HashSet::new();
     let mut out = Vec::with_capacity(limit.min(scored.len()));
-    for (score, candidate) in scored {
-        if out.len() >= limit {
-            break;
-        }
-        if let Some(window) = candidate.chunk.kind.window_family() {
-            let key = (
+    let mut outside: Vec<Outside> = Vec::new();
+    let mut cutoff = f64::INFINITY;
+    for (score, authority, candidate) in scored {
+        let family = candidate.chunk.kind.window_family().map(|window| {
+            (
                 candidate.project,
                 candidate.chunk.path.clone(),
                 window.family,
-            );
-            if !kept.insert(key) {
+            )
+        });
+        if out.len() < limit {
+            if let Some(key) = family
+                && !kept.insert(key)
+            {
                 continue;
             }
+            cutoff = score;
+            out.push(SearchHit {
+                project: candidate.project,
+                chunk: candidate.chunk,
+                score: score as f32,
+            });
+            continue;
         }
-        out.push(SearchHit {
-            project: candidate.project,
-            chunk: candidate.chunk,
-            score: score as f32,
+        // Everything below the page is a reason to fetch deeper — with one
+        // exception. A window whose family already holds a slot cannot add a
+        // result no matter how much its score grows: at best it overtakes its
+        // own family's representative, which swaps *which window* of one span
+        // is shown and leaves the page the same size, the same set of places,
+        // and its minimum no lower. (Which window represents a split span is
+        // therefore decided at the depth reached, not proven — a deliberate,
+        // bounded approximation.) Members of a family that is entirely off the
+        // page get no such exemption: that family can still climb into it, so
+        // every one of its members is bounded here.
+        if family.is_some_and(|key| kept.contains(&key)) {
+            continue;
+        }
+        outside.push(Outside {
+            rrf: candidate.rrf,
+            authority,
+            seen: candidate.seen,
         });
     }
-    out
+    Fusion {
+        cutoff: (out.len() >= limit).then_some(cutoff),
+        page: out,
+        outside,
+    }
 }
 
 /// The 3.1 vault-status modifier.
