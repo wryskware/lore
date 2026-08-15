@@ -1,11 +1,86 @@
+---
+design_status: exploration
+last_reviewed: 2026-08-14
+---
+
 # Adversarial Review Briefs — M1 (2026-08-14)
 
-Four independent review sessions for an external frontier model (GPT/Codex)
-with local repo access. Run them in order (each is self-contained, but later
-sessions may assume earlier findings are already filed). Paste the **shared
-preamble** plus **one session brief** per session.
+Four staged review sessions for an external frontier model (GPT/Codex)
+with local repo access. Run them in order. Later sessions should read prior
+reports, but each session brief still carries enough context to stand alone.
+Paste the **shared preamble** plus **one session brief** per session.
+
+The briefs are threat models and attention guides, not contracts or exhaustive
+checklists. Reviewers should use their own judgment about what constitutes an
+adequate review, rebalance effort when the code points somewhere more important,
+and include useful "could be nicer" observations separately from formal defects.
 
 Scratch/process doc — not design canon.
+
+---
+
+## Progress
+
+- **Session 1 complete:**
+  `design/9_Scratch/2026-08-14_adversarial-review-session-1.md`
+- **Session 2 complete:**
+  `design/9_Scratch/2026-08-14_adversarial-review-session-2.md`
+- **Session 3 complete:**
+  `design/9_Scratch/2026-08-14_adversarial-review-session-3.md`
+- **Next:** Session 4 — test-suite quality audit.
+- Before starting a later session, read all existing
+  `design/9_Scratch/2026-08-14_adversarial-review-session-*.md` reports. Do not
+  repeat an identical finding; extend it with a distinct failure mode, stronger
+  evidence, a correction, or a session-specific consequence.
+
+### Handoff notes for Session 4
+
+- Session 2 confirmed eight findings: shutdown can withdraw ownership while
+  uncancellable work survives; deletion/corruption of `daemon.json` permits a
+  live-incumbent takeover; overlapping project roots update only one project;
+  lowest-project-ID scheduling can starve later projects; the watcher event
+  channel is unbounded ahead of `IndexQueue`; failed watch arming is neither
+  retried nor surfaced; backward clock steps can extend the known restart delay
+  arbitrarily; and an older query-embed failure can overwrite a newer Ready
+  health observation for up to the 60-second worker tick. Use the report's
+  exact scenarios and interleavings for de-duplication.
+- Session 3 confirmed eight findings: window collapse also suppresses distinct
+  C# overloads and repeated Markdown headings; 5,000 poisoned low-rowid chunks
+  hide every later embedding candidate and falsely end the drain; `expand` can
+  return unrelated current lines after a file shifts; the fixed 50-candidate
+  pools can omit the mathematically best RRF result and underfill after window
+  collapse; a UTF-8 BOM disables vault frontmatter parsing; path-prefix SQL uses
+  UTF-8 byte length where SQLite counts characters and remains case-sensitive
+  on Windows; Markdown parent introductions below 24 bytes are dropped; and the
+  worker/store vector-validity mismatch can wedge a batch while health remains
+  Ready. Use the report's exact inputs and consequences for de-duplication.
+- Session 3's poison-window lead was confirmed, not merely suspected. The
+  smallest decisive boundary test is more than 5,000 missing rows with the
+  oldest 5,000 in the poison set; `drain` must not report `Idle` while an
+  unpoisoned later row exists. Do not substitute a small poison test — the
+  existing one-row test passes and misses the `MAX_FETCH` cap interaction.
+- The highest-value Session 3 mutations/tests for Session 4 are: remove the
+  `#w` predicate from collapse (it is effectively absent today) and challenge
+  overload/repeated-heading preservation; move a file's indexed text down while
+  keeping the old line number valid before `expand`; put one shared candidate
+  at rank 51 in both arms; prefix a CRLF vault fixture with a UTF-8 BOM; filter
+  `données/parser.cs` by `données/` and a Windows path by alternate casing;
+  place a sub-24-byte rule before a child heading; and return a finite vector
+  whose norm is nonzero but at most `f32::EPSILON`.
+- Do not turn Session 2's long store-lock observations into missing correctness
+  tests without a distinct invariant. Session 3 found no transaction/FTS
+  partial-commit failure: the existing insert/update/delete/file-removal FTS5
+  integrity test is meaningful coverage. Likewise, direct spot checks of three
+  real Lexomancy C# files found exact spans and only expected `#w` overlap; test
+  quality should distinguish these covered properties from the untested
+  collapse semantics downstream.
+- Session 4 should treat all Session 1–3 findings as missing-test evidence. In
+  particular, the existing future-heartbeat test deliberately pins the
+  clock-rollback outage rather than challenging it, the existing poison test
+  proves only one rejected chunk does not block a tiny backlog, and the existing
+  `expand` tests cover stable files plus deletion but not a shifted live file.
+  The independently counted suite total remained **217 green tests** after
+  Session 3; recount because later reports or fixes may change it.
 
 ---
 
@@ -18,9 +93,13 @@ competent authors under time pressure and that the interesting bugs are in
 the seams between components, in Windows-specific behavior, and in the
 failure paths nobody exercises daily.
 
-**Repo:** `C:\Users\perag\wryskware\lore` (git; review target is commit
-`3e791d2` = HEAD of `main`; the M1 implementation is the range
-`46bedff..HEAD`, ~14k lines of Rust across three crates).
+**Repo:** `C:\Users\perag\wryskware\lore`. The M1 implementation baseline is
+commit `3e791d2`; its implementation range is `46bedff..3e791d2`, ~14k lines
+of Rust across three crates. Do not assume `3e791d2` is still `HEAD`: later
+commits may add briefs, reports, or fixes. Start with `git status`, recent log,
+and `git diff 3e791d2..HEAD`. Review the current implementation when source has
+moved, and state the actual target in the report. Preserve unrelated and
+uncommitted work.
 
 **Workspace layout:**
 - `crates/lore-core` — wire contract: HTTP API types + daemon discovery
@@ -34,9 +113,10 @@ failure paths nobody exercises daily.
 - `crates/lore-mcp` — thin MCP stdio proxy (rmcp 3.1) exposing
   `search`/`expand`/`status`; proxies to the daemon over loopback HTTP.
 
-**Toolchain:** Rust edition 2024, MSRV 1.88. CI = `cargo fmt --check`,
+**Toolchain baseline:** Rust edition 2024, MSRV 1.88. CI = `cargo fmt --check`,
 `cargo clippy --workspace --all-targets -- -D warnings`, tests, on Windows
-MSVC only (deliberate). 216 tests currently green.
+MSVC only (deliberate). The M1 baseline had 216 green tests; recount and report
+the current total rather than treating that number as permanent.
 
 **Binding constraints (treat violations as findings, cite the ID):** the
 design vault (`design/`) has an authority model — only `design/0_Canon/DECISIONS.md`
@@ -61,26 +141,47 @@ frontmatter states its modality. The load-bearing decisions:
 1. Every finding: `file:line`, a **concrete failure scenario** (inputs/state
    → wrong behavior), severity (critical / major / minor), and confidence.
    If you cannot construct a failure scenario, it is not a finding — it may
-   be listed separately as a "smell" in one line.
+   be listed separately as a smell, debt, hardening idea, or "could be nicer"
+   observation. Those observations may be explained when the reasoning is
+   useful; they are not restricted to one line.
 2. **Verify against the code, not against comments or this brief.** Module
    docs make strong claims; your job includes checking whether the code
    actually delivers them.
-3. Windows is the primary platform. Path casing, `\\?\` verbatim prefixes,
+3. **Use judgment; do not mechanically exhaust the checklist.** The named
+   attack surfaces identify likely seams, not the boundary of the review. Follow
+   stronger evidence outside them, skip sterile prompts, and prefer a smaller
+   set of well-proven findings over shallow coverage. Report an important defect
+   discovered outside the nominal session scope rather than saving it for later.
+4. Windows is the primary platform. Path casing, `\\?\` verbatim prefixes,
    CRLF, file locking/sharing, ephemeral-port exhaustion, and
    `ReadDirectoryChangesW` overflow are all in scope.
-4. **Known issues — do not re-report:** GitHub issues #1–#9 on
+5. **Known issues — do not re-report:** GitHub issues #1–#9 on
    wryskware/lore. Highlights: multi-word lexical queries fail on FTS5 AND
    semantics (#4); query-embed timeout vs model cold-load health flap (#5);
    HTTP 400 wrapping transient transport errors poisons batches (#6);
    64-hex chunk_id token cost over MCP (#7); 45s restart window after hard
    kill, no `lore stop` (#8); cosmetics/config grab-bag incl. `bin`
    hard-exclude, RRF-vs-authority tuning, fingerprint dims:0 (#9).
-5. Out of scope: style nits clippy doesn't catch, dependency swaps (the
-   SQLite→Tantivy+arroy seam is a *deliberate* deferred decision, D-0004/1.1),
-   feature suggestions, and anything that amounts to "rewrite it my way".
-6. Deliverable: a single Markdown report — findings ranked most-severe
-   first, then smells (one line each), then (if asked in the session brief)
-   the session-specific deliverables. No preamble, no restating the code.
+   If repository access permits, read the live issues because this summary is
+   lossy. Also read prior session reports and apply the same no-duplication rule.
+6. Do not spend primary review time on style nits, speculative dependency
+   swaps, or "rewrite it my way." The SQLite→Tantivy+arroy implementation is a
+   deliberately deferred choice. It is still valid to report a seam that makes
+   that deferred choice materially harder, or a grounded feature/hardening idea
+   in the separate observations section.
+7. Deliverable: write one self-contained Markdown report at
+   `design/9_Scratch/2026-08-14_adversarial-review-session-N.md`. Give it
+   `design_status: exploration` frontmatter so its D-number citations cannot be
+   mistaken for canon. Rank formal findings most-severe first, then include
+   smells/debts/improvements, then the session-specific deliverable. A concise
+   scope/target note is welcome; do not pad the report with a code summary.
+8. Run tests, probes, or small reproductions when they materially improve
+   confidence; reading alone is acceptable when the failure follows directly
+   from the code. Record meaningful verification and distinguish observed
+   behavior from reasoned interleavings.
+9. Report only. Do not fix production code, push commits, open issues, or
+   silently clean the working tree. Creating the requested report is the only
+   expected repository edit.
 
 ---
 
@@ -129,6 +230,11 @@ architectural debts, each with the cheap-now fix.
 
 **Objective:** break the daemon. Races, deadlocks, lost wakeups, shutdown
 hangs, double-owners, watcher storms, and Windows-specific failure modes.
+
+**Prior overlap:** Session 1 confirmed that two simultaneous starters can both
+pass the check-then-publish handshake admission and become index owners. Do not
+restate that exact race as new. Look for distinct takeover/liveness variants,
+consequences, or evidence that changes its severity or proposed remedy.
 
 Focus files: `crates/lore/src/daemon/**` (especially `mod.rs`,
 `store_handle.rs`, `index.rs`, `queue.rs`, `watch.rs`, `handshake.rs`),
@@ -226,7 +332,9 @@ Claims to falsify:
    types, expression-bodied members, generics with constraints) and verify
    spans are exact, headers don't double-index member bodies, and the
    container-header rule ("stops where the first substantial member
-   starts") holds. Same, briefly, for Markdown: setext headings are known
+   starts") holds. Use an accessible Unity repo when available; otherwise
+   construct focused adversarial files and say so. Same, briefly, for
+   Markdown: setext headings are known
    unsupported; look for *other* silent losses (HTML blocks, footnotes,
    frontmatter edge cases like `---` inside code fences at file start).
 8. **Expand:** disk read of the *current* file vs stored chunk spans — a
@@ -244,13 +352,17 @@ Session deliverable (extra): a table of every silent data-loss path found
 
 ## Session 4 — Test-suite quality audit
 
-**Objective:** answer "are these 216 tests good, or slop?" with evidence.
+**Objective:** answer "are these tests good, or slop?" with evidence. The M1
+baseline count was 216; use the current count in the report.
 The suite was written by the same class of model that wrote the code —
 the known failure mode is tests that **confirm the author's understanding**
 rather than challenge the implementation.
 
 Scope: every test target (`crates/lore` lib unit tests, `crates/lore/tests/*`,
 `crates/lore-mcp` unit + `tests/mcp_golden.rs`, `crates/lore-core` unit).
+Read the prior session reports too: each confirmed defect is evidence about a
+missing or misleading test, and the audit should identify the precise test that
+would have caught it.
 
 Method — for each of the ~10 core invariants below, apply a **mutation
 lens**: propose 2–3 specific, subtle code mutations (off-by-one, inverted
@@ -296,7 +408,7 @@ implementer (name, arrange/act/assert sketch, which invariant it guards).
 
 ## After the sessions
 
-Reports come back to the orchestrating agent (Claude) for triage: each
-finding gets verified against the code before anything is filed or fixed.
-Do not push commits, do not open issues, do not "fix while you're there" —
-report only.
+Reports go to the user/orchestrating agent for triage. Each finding is verified
+against the code and de-duplicated against the tracker before anything is filed
+or fixed. Review sessions do not push commits, open issues, or "fix while
+you're there" — report only.
