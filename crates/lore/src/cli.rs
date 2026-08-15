@@ -27,7 +27,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use lore_core::discovery;
 use lore_core::{
     DaemonStatus, EmbeddingStatus, ExpandResponse, IndexRequest, IndexResponse, ProjectInfo,
-    RegisterProjectRequest, SearchRequest, SearchResponse, SearchResult,
+    RegisterProjectRequest, SearchRequest, SearchResponse, SearchResult, WatchState,
 };
 use serde::Serialize;
 
@@ -386,16 +386,29 @@ fn render_status(status: &DaemonStatus) -> String {
         let pad = width - project.name.chars().count();
         let _ = writeln!(
             out,
-            "  {name}{blank}  files {files}  chunks {chunks}  embedded {embedded}  {root}",
+            "  {name}{blank}  files {files}  chunks {chunks}  embedded {embedded}  {root}{watch}",
             name = project.name,
             blank = " ".repeat(pad),
             files = project.files,
             chunks = project.chunks,
             embedded = coverage(project.embedded_chunks, project.chunks),
             root = project.root,
+            watch = watch_note(project.watch),
         );
     }
     out
+}
+
+/// Silent when the watch is armed — the common case should not add noise —
+/// and loud when it is not, because the failure is otherwise invisible: the
+/// index simply stops keeping up.
+fn watch_note(state: WatchState) -> &'static str {
+    match state {
+        // `Unknown` means an older daemon that cannot report; saying nothing
+        // is more honest than claiming either state.
+        WatchState::Armed | WatchState::Unknown => "",
+        WatchState::Retrying => "  WATCH RETRYING - not indexing live; use `lore index`",
+    }
 }
 
 fn coverage(embedded: u64, chunks: u64) -> String {
