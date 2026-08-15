@@ -16,7 +16,9 @@
 //! - `chunk_id` always present and always spelled out, because `expand`
 //!   requires it and an agent that has to guess will guess wrong.
 
-use lore_core::{DaemonStatus, EmbeddingStatus, ExpandResponse, SearchResponse, SearchResult};
+use lore_core::{
+    DaemonStatus, EmbeddingStatus, ExpandResponse, SearchResponse, SearchResult, WatchState,
+};
 use std::fmt::Write as _;
 
 /// Degradation must be visible, never silent (D-0007).
@@ -153,16 +155,29 @@ pub fn status(status: &DaemonStatus) -> String {
         let pad = width - project.name.chars().count();
         let _ = writeln!(
             out,
-            "  {name}{blank}  files {files}  chunks {chunks}  embedded {embedded}  {root}",
+            "  {name}{blank}  files {files}  chunks {chunks}  embedded {embedded}  {root}{watch}",
             name = project.name,
             blank = " ".repeat(pad),
             files = project.files,
             chunks = project.chunks,
             embedded = coverage(project.embedded_chunks, project.chunks),
             root = project.root,
+            watch = watch_note(project.watch),
         );
     }
     out
+}
+
+/// Silent when the watch is armed, loud when it is not: an agent that cannot
+/// tell "this index is live" from "this index froze an hour ago" will trust
+/// stale results.
+fn watch_note(state: WatchState) -> &'static str {
+    match state {
+        // `Unknown` means a daemon too old to report; saying nothing is more
+        // honest than claiming either state.
+        WatchState::Armed | WatchState::Unknown => "",
+        WatchState::Retrying => "  WATCH RETRYING - edits are not being indexed live",
+    }
 }
 
 /// `embedded 812/9134 (8%)` — the ratio matters more than either number: it is
@@ -364,6 +379,7 @@ mod tests {
                     files: 812,
                     chunks: 9134,
                     embedded_chunks: 0,
+                    watch: WatchState::Armed,
                 },
                 ProjectStatus {
                     id: 2,
@@ -372,12 +388,39 @@ mod tests {
                     files: 96,
                     chunks: 1204,
                     embedded_chunks: 1204,
+                    watch: WatchState::Armed,
                 },
             ],
             embeddings: EmbeddingStatus::Unconfigured,
         });
         assert!(rendered.contains("  lexomancy  files 812  chunks 9134  embedded 0/9134 (0%)"));
         assert!(rendered.contains("  lore       files 96  chunks 1204  embedded 1204/1204 (100%)"));
+    }
+
+    /// A frozen watch is the failure an agent cannot infer from results: the
+    /// index simply stops changing. It must be on the line, and an armed one
+    /// must not add noise.
+    #[test]
+    fn a_project_whose_watch_is_not_armed_says_so() {
+        let mut status_body = DaemonStatus {
+            api_version: 1,
+            daemon_version: "0.1.0".into(),
+            generation: 3,
+            projects: vec![ProjectStatus {
+                id: 1,
+                name: "lore".into(),
+                root: r"C:\repos\lore".into(),
+                files: 96,
+                chunks: 1204,
+                embedded_chunks: 1204,
+                watch: WatchState::Armed,
+            }],
+            embeddings: EmbeddingStatus::Unconfigured,
+        };
+        assert!(!status(&status_body).contains("WATCH RETRYING"));
+
+        status_body.projects[0].watch = WatchState::Retrying;
+        assert!(status(&status_body).contains("WATCH RETRYING"));
     }
 
     #[test]

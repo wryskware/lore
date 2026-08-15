@@ -152,12 +152,16 @@ pub async fn run(options: DaemonOptions) -> Result<()> {
         tracker.spawn(worker.run());
     }
 
+    // Watcher coverage is shared with `/v1/status`: a project whose watch
+    // cannot be armed is degraded, not broken, and must say so.
+    let watch_status = watch::WatchStatus::new();
     {
         let queue = queue.clone();
         let data_dir = data_dir.clone();
         let cancel = cancel.clone();
+        let status = watch_status.clone();
         tracker.spawn(async move {
-            if let Err(err) = watch::run(watch_rx, queue, data_dir, cancel).await {
+            if let Err(err) = watch::run(watch_rx, queue, data_dir, status, cancel).await {
                 tracing::error!(error = %err, "watcher could not start; no live reindexing");
             }
         });
@@ -169,6 +173,7 @@ pub async fn run(options: DaemonOptions) -> Result<()> {
         store: store.clone(),
         queue: queue.clone(),
         watch: watch_tx.clone(),
+        watch_status,
         config,
         embeddings,
         data_dir: data_dir.clone(),

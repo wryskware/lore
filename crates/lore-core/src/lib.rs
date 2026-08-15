@@ -50,6 +50,30 @@ pub struct ProjectStatus {
     pub chunks: u64,
     /// Chunks with a stored vector under the current fingerprint.
     pub embedded_chunks: u64,
+    /// Live filesystem-watch coverage. Added after 0.1.0, so it is optional
+    /// on the wire: a daemon that predates it simply reports nothing and the
+    /// client sees [`WatchState::Unknown`].
+    #[serde(default)]
+    pub watch: WatchState,
+}
+
+/// Whether a project's edits are being indexed live.
+///
+/// A watch that is not armed is not a hard failure — an explicit reindex
+/// still works — but it is a silent one unless it is reported, which is the
+/// same reasoning that puts [`EmbeddingStatus`] on this surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchState {
+    /// A recursive watch is armed; edits reach the index without a reindex.
+    Armed,
+    /// The watch is not armed (the initial arm failed, or the platform
+    /// invalidated it) and the daemon is retrying with backoff. Until it
+    /// succeeds, changes are only seen on an explicit index.
+    Retrying,
+    /// This daemon does not report watcher coverage.
+    #[default]
+    Unknown,
 }
 
 /// State of the external embedding endpoint (D-0007: absence degrades to

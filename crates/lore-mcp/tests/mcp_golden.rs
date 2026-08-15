@@ -17,6 +17,7 @@ use axum::{Json, Router};
 use camino::Utf8PathBuf;
 use lore_core::{
     DaemonStatus, EmbeddingStatus, ExpandResponse, ProjectStatus, SearchResponse, SearchResult,
+    WatchState,
 };
 use lore_mcp::{Endpoint, LoreServer};
 use rmcp::ServiceExt;
@@ -114,6 +115,7 @@ fn canned_status() -> DaemonStatus {
                 files: 812,
                 chunks: 9134,
                 embedded_chunks: 0,
+                watch: WatchState::Armed,
             },
             ProjectStatus {
                 id: 2,
@@ -122,6 +124,7 @@ fn canned_status() -> DaemonStatus {
                 files: 96,
                 chunks: 1204,
                 embedded_chunks: 1204,
+                watch: WatchState::Armed,
             },
         ],
         embeddings: EmbeddingStatus::Unreachable {
