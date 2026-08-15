@@ -44,7 +44,7 @@ use crate::config::EmbeddingsConfig;
 use crate::daemon::store_handle::StoreHandle;
 
 pub use client::{EmbedClient, EmbedError, EmbedSettings, RetryPolicy};
-pub use health::Health;
+pub use health::{Health, Ticket};
 pub use worker::{EmbedWorker, fingerprint};
 
 /// Ceiling on embedding a *query*. Search is interactive: three seconds is
@@ -141,14 +141,14 @@ impl Embedder {
         let Some(client) = &self.client else {
             return false;
         };
+        let ticket = self.health.ticket();
         match client.probe().await {
             Ok(_) => {
-                self.health.set_ready(client.endpoint(), client.model());
+                ticket.set_ready(client.endpoint(), client.model());
                 true
             }
             Err(err) => {
-                self.health
-                    .set_unreachable(client.endpoint(), err.to_string());
+                ticket.set_unreachable(client.endpoint(), err.to_string());
                 false
             }
         }
@@ -159,19 +159,22 @@ impl Embedder {
     ///
     /// A failure here also demotes health, so a server that died between the
     /// last probe and this request costs one slow search rather than one slow
-    /// search per query until the worker notices.
+    /// search per query until the worker notices. The demotion goes through a
+    /// ticket taken before the request: this is the slowest health writer in
+    /// the daemon, and a three-second-old verdict must not overwrite a probe
+    /// that has since said the endpoint is back.
     pub async fn embed_query(&self, query: &str) -> Option<Vec<f32>> {
         let client = self.client.as_ref()?;
         if !self.health.is_ready() || query.trim().is_empty() {
             return None;
         }
         let text = text::query_text(query, &client.settings().query_prefix);
+        let ticket = self.health.ticket();
         match tokio::time::timeout(QUERY_EMBED_TIMEOUT, client.embed(&[text])).await {
             Ok(Ok(vectors)) => vectors.into_iter().next(),
             Ok(Err(err)) => {
                 tracing::debug!(error = %err, "query embedding failed; this search is lexical-only");
-                self.health
-                    .set_unreachable(client.endpoint(), err.to_string());
+                ticket.set_unreachable(client.endpoint(), err.to_string());
                 None
             }
             Err(_) => {
@@ -179,7 +182,7 @@ impl Embedder {
                     timeout_ms = QUERY_EMBED_TIMEOUT.as_millis() as u64,
                     "query embedding timed out; this search is lexical-only"
                 );
-                self.health.set_unreachable(
+                ticket.set_unreachable(
                     client.endpoint(),
                     format!(
                         "query embedding timed out after {}ms",

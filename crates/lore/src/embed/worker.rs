@@ -153,9 +153,13 @@ impl EmbedWorker {
                 }
             }
 
-            // A pass that ended on an endpoint problem goes straight back to
-            // the probe/backoff arm instead of idling for a full tick.
-            if self.drain().await == Drained::Interrupted && !self.health.is_ready() {
+            // Any pass that leaves health non-ready goes straight back to the
+            // probe/backoff arm instead of idling for a full tick — including
+            // an `Idle` one, because health can be demoted by a *query* while
+            // the worker has nothing to do, and D-0007 degradation that
+            // outlives the outage by a tick is a lie in `/v1/status`.
+            self.drain().await;
+            if !self.health.is_ready() {
                 continue;
             }
 
@@ -170,6 +174,7 @@ impl EmbedWorker {
 
     /// Probe the endpoint and publish the result. Returns readiness.
     pub async fn probe(&self) -> bool {
+        let ticket = self.health.ticket();
         match self.client.probe().await {
             Ok(dims) => {
                 tracing::debug!(
@@ -177,13 +182,11 @@ impl EmbedWorker {
                     endpoint = self.client.endpoint(),
                     "embedding probe ok"
                 );
-                self.health
-                    .set_ready(self.client.endpoint(), self.client.model());
+                ticket.set_ready(self.client.endpoint(), self.client.model());
                 true
             }
             Err(err) => {
-                self.health
-                    .set_unreachable(self.client.endpoint(), err.to_string());
+                ticket.set_unreachable(self.client.endpoint(), err.to_string());
                 false
             }
         }
@@ -241,6 +244,9 @@ impl EmbedWorker {
                 .map(|candidate| text::document_text(&candidate.chunk, &prefix))
                 .collect();
 
+            // Claimed before the request, so a batch that took seconds to fail
+            // cannot demote health a later probe has already restored.
+            let ticket = self.health.ticket();
             let embedded = tokio::select! {
                 () = self.cancel.cancelled() => return Drained::Interrupted,
                 result = self.client.embed(&texts) => result,
@@ -260,14 +266,12 @@ impl EmbedWorker {
                         "endpoint rejected a batch outright; those chunks stay unembedded"
                     );
                     self.poison(&batch);
-                    self.health
-                        .set_unreachable(self.client.endpoint(), err.to_string());
+                    ticket.set_unreachable(self.client.endpoint(), err.to_string());
                     return Drained::Interrupted;
                 }
                 Err(err) => {
                     tracing::warn!(error = %err, chunks = batch.len(), "embedding batch failed; will retry later");
-                    self.health
-                        .set_unreachable(self.client.endpoint(), err.to_string());
+                    ticket.set_unreachable(self.client.endpoint(), err.to_string());
                     return Drained::Interrupted;
                 }
             }
