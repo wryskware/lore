@@ -57,6 +57,31 @@ first pass, cut to T1/T2/T4 (the most retrieval-sensitive) = 36 runs.
 - Never point a task at bulk data: Unity YAML/`Library`, `node_modules`,
   `dist*`, `analysis/tracks`, archives are out of scope for every task.
 
+## Pinning and isolation
+
+- Every run happens in a **fresh worktree of a pinned commit**, never the
+  live checkout. Provisional pins (re-pin at answer-key freeze):
+  - lore: `39da7c25c1`
+  - latent-music-terrarium: `3b1eacd56f`
+  - Lexomancy design vault (`design/` is its own repo): `d5e0d53310`
+- **Lexomancy code is currently unversioned.** The outer `.git` is an empty
+  directory and the inner Unity project's git history was archived to a
+  tarball on 2026-07-24; only `design/` and `tools/` are real repos. Until
+  Wrysk decides whether to re-init git there, runs use a **frozen snapshot
+  copy** of `Lexomancy/Assets/Scripts` + the csproj files, one fresh copy
+  per implementation run.
+
+## Environment constraints
+
+- **No Unity editor.** Lexomancy tasks are read/trace/audit plus at most
+  compile-and-test; headless preferred. Prerequisite: verify which test
+  assemblies (EncounterKernel, BattleKernel, Axioms) actually run without
+  the editor (`dotnet test` vs Unity batchmode). If BattleKernel tests need
+  the editor, swap T5 to an EncounterKernel-scoped change.
+- **No browser.** qwen/opencode has no Chrome access (and codex runs won't
+  get it either, for parity). No task may require visual verification or a
+  running web app; terrarium grading is headless tests + CLI output only.
+
 ## Run protocol
 
 - Same task prompt verbatim for every cell; prompts name the repo root and
@@ -68,9 +93,11 @@ first pass, cut to T1/T2/T4 (the most retrieval-sensitive) = 36 runs.
   absent from config entirely, not merely unused.
 - Order runs retrieval-off first per model/repo so index warm-up can't leak
   hints via daemon logs open in a terminal, etc. (paranoia is cheap here).
-- Answer keys are established by Wrysk + Fable *before* any run, from the
-  scout reports and direct inspection; keys live in this doc's companion
-  (`2026-08-15_e2e-round-1-answer-key.md`, not shown to models).
+- Answer keys are established by Wrysk + Fable *before* any run; keys live
+  in this doc's companion (`2026-08-15_e2e-round-1-answer-key.md`, not shown
+  to models). First-pass keys came from haiku-tier scouts; a luna-high
+  verify-or-refute re-scout of both non-lore repos runs before the freeze,
+  and anything neither scout tier verified gets parent-checked directly.
 
 ## Task archetypes
 
