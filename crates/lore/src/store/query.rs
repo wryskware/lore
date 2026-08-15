@@ -110,9 +110,28 @@ pub(crate) fn filter_sql(filter: &SearchFilter) -> FilterSql {
         sql.push_str(" AND c.language = ?");
         params.push(Value::Text(language.clone()));
     }
+    // Effective, not declared: `min_authority` is a ranking-side floor, and a
+    // caller asking to skip low-authority material means the authority Lore
+    // actually assigns, not the one a document claims for itself.
     if let Some(min) = filter.min_authority {
-        sql.push_str(" AND c.authority_tier >= ?");
+        sql.push_str(" AND c.effective_tier >= ?");
         params.push(Value::Integer(i64::from(min)));
+    }
+    if let Some(kinds) = &filter.source_kinds {
+        // Source kind lives on the project row, not the chunk: chunks would
+        // have to be rewritten when a source is reclassified, and a subquery
+        // over a table with a handful of rows costs nothing.
+        if kinds.is_empty() {
+            sql.push_str(" AND 0");
+        } else {
+            let placeholders = vec!["?"; kinds.len()].join(", ");
+            sql.push_str(&format!(
+                " AND c.project_id IN (SELECT id FROM projects WHERE kind IN ({placeholders}))"
+            ));
+            for kind in kinds {
+                params.push(Value::Text(kind.as_str().to_string()));
+            }
+        }
     }
     if let Some(statuses) = &filter.statuses {
         // An explicitly empty allowlist means "nothing is acceptable".

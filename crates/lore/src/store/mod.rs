@@ -33,7 +33,7 @@ mod schema;
 /// predicate the write path uses (see [`vector::is_usable`]).
 pub(crate) mod vector;
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -42,7 +42,10 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Chunk, ChunkId, ChunkKind, DesignStatus, VaultMeta, authority_tier};
+use crate::authority::{Authority, Declared, Demotion};
+use crate::types::{
+    Chunk, ChunkId, ChunkKind, DesignStatus, SourceKind, VaultMeta, authority_tier,
+};
 
 use query::{filter_sql, sanitize_fts_query};
 use vector::{Scored, TopK};
@@ -56,10 +59,20 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 /// the only writer, but CLI/read tooling may attach to the same file.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Chunk columns, in the order [`row_to_chunk`] expects. `c` is the chunks
-/// table alias in every query that uses this.
+/// Chunk columns, in the order [`row_to_chunk`] and [`row_to_authority`]
+/// expect. `c` is the chunks table alias in every query that uses this.
 const CHUNK_COLS: &str = "c.project_id, c.chunk_id, c.path, c.kind, c.language, \
-     c.byte_start, c.byte_end, c.line_start, c.line_end, c.text, c.vault";
+     c.byte_start, c.byte_end, c.line_start, c.line_end, c.text, c.vault, \
+     c.effective_tier, c.demotion";
+
+/// Number of columns [`CHUNK_COLS`] selects, so callers that append their own
+/// (a score, a rowid) index past it instead of hard-coding a number that
+/// silently rots when a column is added.
+const CHUNK_COL_COUNT: usize = 13;
+
+/// How many offending file paths [`Store::status`] lists per project. Enough
+/// to fix them, few enough that a status call stays a status call.
+pub const MAX_VIOLATION_PATHS: usize = 5;
 
 /// BM25 field weights: `text`, `path`, `anchor`.
 ///
@@ -93,12 +106,18 @@ pub enum StoreError {
     Corrupt(String),
 }
 
-/// A registered project root.
+/// A registered source: a repo root today, a session corpus at M3.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
+    /// Internal row id. Non-authoritative and never on the wire — [`Self::key`]
+    /// is the stable public handle (S1#3).
     pub id: ProjectId,
     pub root: Utf8PathBuf,
     pub name: String,
+    /// Stable opaque key, assigned once at registration (see
+    /// [`crate::registry`]). Never recomputed, unchanged by a rename.
+    pub key: String,
+    pub kind: SourceKind,
 }
 
 /// A file's indexing state, for change detection and orphan pruning.
@@ -108,6 +127,10 @@ pub struct FileRecord {
     pub content_hash: String,
     /// Unix seconds at last successful index.
     pub indexed_at: i64,
+    /// Source-declared timestamp (a session's write time), as opposed to when
+    /// Lore happened to index it. `None` for every repo file in v1; the M3
+    /// recency term reads it.
+    pub source_ts: Option<i64>,
 }
 
 /// What [`Store::replace_file_chunks`] actually did — useful for logs and for
@@ -120,6 +143,11 @@ pub struct FileWrite {
     pub kept: usize,
     /// Chunk ids that were present and are no longer produced.
     pub deleted: usize,
+    /// The effective authority stamped on every chunk of this file. Returned
+    /// (rather than merely written) so the indexer can log a violation with
+    /// the project and path in scope — the store knows the verdict, only the
+    /// caller knows the context (D-0007: degradation is never silent).
+    pub authority: Authority,
 }
 
 /// `design_status` filter atom. `Unclassified` matches chunks with no
@@ -142,11 +170,18 @@ pub struct SearchFilter {
     pub path_prefix: Option<String>,
     /// Exact language tag as stored on the chunk ("csharp", "markdown", …).
     pub language: Option<String>,
-    /// Allowed `design_status` values.
+    /// Allowed **declared** `design_status` values. Declared on purpose: a
+    /// caller asking for `decided` material is asking what documents say about
+    /// themselves, which is a different question from how they rank.
     pub statuses: Option<Vec<StatusFilter>>,
-    /// Minimum [`crate::types::authority_tier`] — e.g. `Some(1)` drops
-    /// `deprecated` material without enumerating every other status.
+    /// Minimum **effective** authority tier (see [`crate::authority`]) — e.g.
+    /// `Some(1)` drops `deprecated` and `9_Scratch` material without
+    /// enumerating every other status.
     pub min_authority: Option<u8>,
+    /// Allowed source kinds. `None` = every kind, which is the only thing v1
+    /// can produce; `recall` at M3 is this filter set to `[Session]`, with no
+    /// path convention leaking through the store API.
+    pub source_kinds: Option<Vec<SourceKind>>,
 }
 
 impl SearchFilter {
@@ -167,6 +202,9 @@ impl SearchFilter {
 pub struct SearchHit {
     pub project: ProjectId,
     pub chunk: Chunk,
+    /// Effective authority as stored — the ranking multiplier's input, and the
+    /// source of the result's `effective_authority` / `authority_note`.
+    pub authority: Authority,
     pub score: f32,
 }
 
@@ -218,9 +256,19 @@ pub struct ProjectStatus {
     pub project: ProjectId,
     pub root: Utf8PathBuf,
     pub name: String,
+    pub key: String,
+    pub kind: SourceKind,
     pub files: u64,
     pub chunks: u64,
     pub embedded_chunks: u64,
+    /// Files whose authority declaration does not hold up — today, files
+    /// declaring `decided` without citing an active decision. Reported for the
+    /// same reason watcher and embedding degradation are: a silent demotion is
+    /// a document the author believes is canon and Lore quietly does not.
+    pub authority_violations: u64,
+    /// The first [`MAX_VIOLATION_PATHS`] offending paths, so the report is
+    /// actionable without being a file dump.
+    pub authority_violation_paths: Vec<Utf8PathBuf>,
 }
 
 /// The SQLite-backed SearchStore.
@@ -262,32 +310,225 @@ impl Store {
 
     // ---- projects ---------------------------------------------------------
 
-    /// Register a project root, or update the display name of an existing
-    /// one. Idempotent on `root`; the caller is responsible for handing in an
+    /// Register a repo root, or update the display name of an existing one.
+    /// Idempotent on `root`; the caller is responsible for handing in an
     /// already-canonicalized path.
+    ///
+    /// A new row gets a freshly allocated [`Project::key`], so the table is
+    /// never left in a keyless state even when nothing consulted the manifest
+    /// (unit tests, a direct store user).
     pub fn register_project(&mut self, root: &Utf8Path, name: &str) -> Result<ProjectId> {
-        let id = self.conn.query_row(
-            "INSERT INTO projects (root, name) VALUES (?, ?)
-             ON CONFLICT(root) DO UPDATE SET name = excluded.name
-             RETURNING id",
-            params![root.as_str(), name],
-            |r| r.get(0),
-        )?;
+        self.upsert_project(root, name, None, SourceKind::Repo)
+    }
+
+    /// Register or update a source with full control over its identity.
+    ///
+    /// `key: None` keeps the existing key (a rename must not change it) and
+    /// allocates one only when the row is new or predates keys. Passing a key
+    /// explicitly is how [`crate::registry`] makes the manifest authoritative.
+    pub fn upsert_project(
+        &mut self,
+        root: &Utf8Path,
+        name: &str,
+        key: Option<&str>,
+        kind: SourceKind,
+    ) -> Result<ProjectId> {
+        let tx = self.conn.transaction()?;
+        let existing: Option<(ProjectId, Option<String>)> = tx
+            .query_row(
+                "SELECT id, key FROM projects WHERE root = ?",
+                params![root.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+
+        let key = match key {
+            Some(key) => key.to_string(),
+            None => match existing.as_ref().and_then(|(_, key)| key.clone()) {
+                Some(key) => key,
+                None => {
+                    let mut taken: HashSet<String> = HashSet::new();
+                    let mut stmt = tx.prepare("SELECT key FROM projects WHERE key IS NOT NULL")?;
+                    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                    for row in rows {
+                        taken.insert(row?);
+                    }
+                    crate::registry::allocate_key(name, &taken)
+                }
+            },
+        };
+
+        let id = match existing {
+            Some((id, _)) => {
+                tx.execute(
+                    "UPDATE projects SET name = ?, key = ?, kind = ? WHERE id = ?",
+                    params![name, key, kind.as_str(), id],
+                )?;
+                id
+            }
+            None => tx.query_row(
+                "INSERT INTO projects (root, name, key, kind) VALUES (?, ?, ?, ?) RETURNING id",
+                params![root.as_str(), name, key, kind.as_str()],
+                |r| r.get(0),
+            )?,
+        };
+        tx.commit()?;
         Ok(id)
+    }
+
+    /// Forget a source entirely: its chunks, FTS rows, vectors, file records
+    /// and parsed decision set go with it. Returns whether it was known.
+    ///
+    /// Chunks are deleted explicitly rather than through the project FK
+    /// cascade so the FTS sync triggers fire on a plain `DELETE`, which is the
+    /// same discipline [`Self::remove_file`] follows.
+    pub fn remove_project(&mut self, project: ProjectId) -> Result<bool> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM chunks WHERE project_id = ?", params![project])?;
+        tx.execute("DELETE FROM files WHERE project_id = ?", params![project])?;
+        tx.execute(
+            "DELETE FROM project_decisions WHERE project_id = ?",
+            params![project],
+        )?;
+        let removed = tx.execute("DELETE FROM projects WHERE id = ?", params![project])?;
+        tx.commit()?;
+        Ok(removed > 0)
     }
 
     pub fn list_projects(&self) -> Result<Vec<Project>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, root, name FROM projects ORDER BY id")?;
+            .prepare("SELECT id, root, name, key, kind FROM projects ORDER BY id")?;
         let rows = stmt.query_map([], |r| {
             Ok(Project {
                 id: r.get(0)?,
                 root: Utf8PathBuf::from(r.get::<_, String>(1)?),
                 name: r.get(2)?,
+                key: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                kind: read_kind(r.get::<_, Option<String>>(4)?.as_deref()),
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    // ---- authority --------------------------------------------------------
+
+    /// The project's active decision set, as last parsed from its ledger.
+    pub fn active_decisions(&self, project: ProjectId) -> Result<BTreeSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT decision_id FROM project_decisions WHERE project_id = ?")?;
+        let rows = stmt.query_map(params![project], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Replace the project's active decision set. Returns whether it changed —
+    /// which is exactly the signal that every effective tier in the project
+    /// may now be wrong and a recompute is owed.
+    pub fn set_active_decisions(
+        &mut self,
+        project: ProjectId,
+        decisions: &BTreeSet<String>,
+    ) -> Result<bool> {
+        let current = self.active_decisions(project)?;
+        if &current == decisions {
+            return Ok(false);
+        }
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM project_decisions WHERE project_id = ?",
+            params![project],
+        )?;
+        {
+            let mut ins = tx
+                .prepare("INSERT INTO project_decisions (project_id, decision_id) VALUES (?, ?)")?;
+            for decision in decisions {
+                ins.execute(params![project, decision])?;
+            }
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Re-derive every chunk's effective tier from persisted state.
+    ///
+    /// This is the whole payoff of computing authority *from* stored columns:
+    /// a ledger edit, or a policy change, costs one pass over the metadata —
+    /// no re-read, no re-chunk, no re-embed, and every [`ChunkId`] and the
+    /// `CHUNK_FORMAT_VERSION` stay exactly where they were. The FTS sync
+    /// trigger only fires on `text`/`path`/`anchor`, so the index does not
+    /// churn either.
+    ///
+    /// Work is per *file*, not per chunk: declared status, frontmatter refs
+    /// and path are file-level, so one verdict is stamped on the whole file.
+    /// Rows whose verdict is unchanged are not written at all, which makes a
+    /// steady-state startup backfill a read-only scan.
+    pub fn recompute_effective_authority(&mut self, project: ProjectId) -> Result<Recompute> {
+        let context = self.authority_context(project)?;
+        let paths: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT DISTINCT path FROM chunks WHERE project_id = ?")?;
+            let rows = stmt.query_map(params![project], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+
+        let mut summary = Recompute::default();
+        let tx = self.conn.transaction()?;
+        {
+            let mut declared =
+                tx.prepare("SELECT vault FROM chunks WHERE project_id = ? AND path = ? LIMIT 1")?;
+            let mut update = tx.prepare(
+                "UPDATE chunks SET effective_tier = ?, demotion = ?
+                 WHERE project_id = ? AND path = ?
+                   AND (effective_tier <> ? OR demotion IS NOT ?)",
+            )?;
+            for path in &paths {
+                summary.files += 1;
+                let row: Option<Option<String>> = declared
+                    .query_row(params![project, path], |r| r.get::<_, Option<String>>(0))
+                    .optional()?;
+                let Some(vault_json) = row else { continue };
+                let vault: Option<VaultMeta> = vault_json
+                    .map(|json| serde_json::from_str::<VaultMeta>(&json))
+                    .transpose()?;
+                let authority = context.verdict(Utf8Path::new(path), vault.as_ref());
+                let changed = update.execute(params![
+                    authority.tier,
+                    authority.demotion.map(Demotion::code),
+                    project,
+                    path,
+                    authority.tier,
+                    authority.demotion.map(Demotion::code),
+                ])?;
+                if changed > 0 {
+                    summary.files_changed += 1;
+                    summary.chunks_changed += changed;
+                }
+                if authority.is_violation() {
+                    summary.violations += 1;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(summary)
+    }
+
+    /// Everything the effective-tier policy needs that is not on the chunk
+    /// row: the project's active decisions and its source kind.
+    fn authority_context(&self, project: ProjectId) -> Result<AuthorityContext> {
+        let kind: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT kind FROM projects WHERE id = ?",
+                params![project],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(AuthorityContext {
+            active: self.active_decisions(project)?,
+            kind: read_kind(kind.as_deref()),
+        })
     }
 
     // ---- files ------------------------------------------------------------
@@ -308,16 +549,36 @@ impl Store {
     /// disk between index passes.
     pub fn list_files(&self, project: ProjectId) -> Result<Vec<FileRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT path, content_hash, indexed_at FROM files WHERE project_id = ? ORDER BY path",
+            "SELECT path, content_hash, indexed_at, source_ts FROM files
+             WHERE project_id = ? ORDER BY path",
         )?;
         let rows = stmt.query_map(params![project], |r| {
             Ok(FileRecord {
                 path: Utf8PathBuf::from(r.get::<_, String>(0)?),
                 content_hash: r.get(1)?,
                 indexed_at: r.get(2)?,
+                source_ts: r.get(3)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Record the source-declared timestamp of a file (a session's write
+    /// time). Separate from [`Self::replace_file_chunks`] because the source
+    /// knows it and the chunker never will; unused in v1, where every file
+    /// comes from a repo and `indexed_at` is the only honest timestamp.
+    /// Returns whether the file was known.
+    pub fn set_file_source_ts(
+        &mut self,
+        project: ProjectId,
+        path: &Utf8Path,
+        source_ts: Option<i64>,
+    ) -> Result<bool> {
+        let updated = self.conn.execute(
+            "UPDATE files SET source_ts = ? WHERE project_id = ? AND path = ?",
+            params![source_ts, project, path.as_str()],
+        )?;
+        Ok(updated > 0)
     }
 
     /// Replace a file's chunk set in one transaction.
@@ -347,6 +608,13 @@ impl Store {
                 });
             }
         }
+
+        // One verdict for the whole file: declared status, frontmatter refs
+        // and path are all file-level, and every chunk carries a clone of the
+        // same `VaultMeta` frontmatter (only `body_decision_refs` differ, and
+        // those deliberately carry no weight any more).
+        let context = self.authority_context(project)?;
+        let authority = context.verdict(path, chunks.first().and_then(|c| c.vault.as_ref()));
 
         let tx = self.conn.transaction()?;
 
@@ -381,8 +649,8 @@ impl Store {
                 "INSERT INTO chunks (
                      project_id, chunk_id, path, anchor, kind, language,
                      byte_start, byte_end, line_start, line_end, text, vault,
-                     design_status, authority_tier)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     design_status, authority_tier, effective_tier, demotion)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(project_id, chunk_id) DO UPDATE SET
                      kind = excluded.kind,
                      language = excluded.language,
@@ -392,7 +660,9 @@ impl Store {
                      line_end = excluded.line_end,
                      vault = excluded.vault,
                      design_status = excluded.design_status,
-                     authority_tier = excluded.authority_tier",
+                     authority_tier = excluded.authority_tier,
+                     effective_tier = excluded.effective_tier,
+                     demotion = excluded.demotion",
             )?;
             for c in chunks {
                 let status = c.vault.as_ref().and_then(|v| v.design_status);
@@ -411,6 +681,8 @@ impl Store {
                     c.vault.as_ref().map(serde_json::to_string).transpose()?,
                     status.map(status_str),
                     authority_tier(status),
+                    authority.tier,
+                    authority.demotion.map(Demotion::code),
                 ])?;
                 if existing.contains(c.id.0.as_str()) {
                     stats.kept += 1;
@@ -421,6 +693,7 @@ impl Store {
         }
 
         tx.commit()?;
+        stats.authority = authority;
         Ok(stats)
     }
 
@@ -465,23 +738,51 @@ impl Store {
 
     pub fn status(&self) -> Result<Status> {
         let mut stmt = self.conn.prepare(
-            "SELECT p.id, p.root, p.name,
+            "SELECT p.id, p.root, p.name, p.key, p.kind,
                     (SELECT COUNT(*) FROM files f WHERE f.project_id = p.id),
                     (SELECT COUNT(*) FROM chunks c WHERE c.project_id = p.id),
-                    (SELECT COUNT(*) FROM embeddings e WHERE e.project_id = p.id)
+                    (SELECT COUNT(*) FROM embeddings e WHERE e.project_id = p.id),
+                    (SELECT COUNT(DISTINCT c.path) FROM chunks c
+                       WHERE c.project_id = p.id AND c.demotion = ?)
              FROM projects p ORDER BY p.id",
         )?;
-        let rows = stmt.query_map([], |r| {
+        let violation = Demotion::UncitedDecided.code();
+        let rows = stmt.query_map(params![violation], |r| {
             Ok(ProjectStatus {
                 project: r.get(0)?,
                 root: Utf8PathBuf::from(r.get::<_, String>(1)?),
                 name: r.get(2)?,
-                files: r.get::<_, i64>(3)? as u64,
-                chunks: r.get::<_, i64>(4)? as u64,
-                embedded_chunks: r.get::<_, i64>(5)? as u64,
+                key: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                kind: read_kind(r.get::<_, Option<String>>(4)?.as_deref()),
+                files: r.get::<_, i64>(5)? as u64,
+                chunks: r.get::<_, i64>(6)? as u64,
+                embedded_chunks: r.get::<_, i64>(7)? as u64,
+                authority_violations: r.get::<_, i64>(8)? as u64,
+                authority_violation_paths: Vec::new(),
             })
         })?;
-        let projects = rows.collect::<std::result::Result<_, _>>()?;
+        let mut projects: Vec<ProjectStatus> = rows.collect::<std::result::Result<_, _>>()?;
+
+        // Paths are a second, cheap query rather than a correlated subquery:
+        // only projects that actually have violations pay for it, and the
+        // partial `chunks_demoted` index answers it directly.
+        let mut offenders = self.conn.prepare(
+            "SELECT DISTINCT path FROM chunks
+             WHERE project_id = ? AND demotion = ? ORDER BY path LIMIT ?",
+        )?;
+        for project in &mut projects {
+            if project.authority_violations == 0 {
+                continue;
+            }
+            let rows = offenders.query_map(
+                params![project.project, violation, MAX_VIOLATION_PATHS as i64],
+                |r| r.get::<_, String>(0),
+            )?;
+            project.authority_violation_paths = rows
+                .map(|path| path.map(Utf8PathBuf::from))
+                .collect::<std::result::Result<_, _>>()?;
+        }
+
         Ok(Status {
             generation: self.generation()?,
             projects,
@@ -527,7 +828,8 @@ impl Store {
             hits.push(SearchHit {
                 project: row.get(0)?,
                 chunk: row_to_chunk(row)?,
-                score: row.get::<_, f64>(11)? as f32,
+                authority: row_to_authority(row)?,
+                score: row.get::<_, f64>(CHUNK_COL_COUNT)? as f32,
             });
         }
         Ok(hits)
@@ -585,6 +887,7 @@ impl Store {
                 hits.push(SearchHit {
                     project: row.get(0)?,
                     chunk: row_to_chunk(row)?,
+                    authority: row_to_authority(row)?,
                     score,
                 });
             }
@@ -647,7 +950,7 @@ impl Store {
         while let Some(row) = rows.next()? {
             out.push(EmbedCandidate {
                 project: row.get(0)?,
-                rowid: row.get(11)?,
+                rowid: row.get(CHUNK_COL_COUNT)?,
                 chunk: row_to_chunk(row)?,
             });
         }
@@ -722,6 +1025,48 @@ impl Store {
     }
 }
 
+/// What [`Store::recompute_effective_authority`] did. `chunks_changed` being
+/// zero on a steady-state pass is the assertion that recompute is cheap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Recompute {
+    pub files: usize,
+    pub files_changed: usize,
+    pub chunks_changed: usize,
+    /// Files declaring `decided` without citing an active decision.
+    pub violations: usize,
+}
+
+/// The per-project inputs to the effective-tier policy that do not live on a
+/// chunk row. Read once per store call and reused for every file in it.
+struct AuthorityContext {
+    active: BTreeSet<String>,
+    kind: SourceKind,
+}
+
+impl AuthorityContext {
+    /// One file's verdict. `vault` is the file's frontmatter metadata (`None`
+    /// for code and other non-vault files, which declare nothing and are
+    /// therefore neutral unless a path or source ceiling applies).
+    fn verdict(&self, path: &Utf8Path, vault: Option<&VaultMeta>) -> Authority {
+        crate::authority::effective(
+            path,
+            Declared {
+                status: vault.and_then(|v| v.design_status),
+                decision_refs: vault.map_or(&[], |v| v.decision_refs.as_slice()),
+            },
+            &self.active,
+            self.kind,
+        )
+    }
+}
+
+/// An unrecognized `projects.kind` reads back as `repo` rather than failing.
+/// The vocabulary is expected to grow (`issue`), and a daemon downgrade must
+/// degrade to "treat it as an ordinary source", never to an unopenable store.
+fn read_kind(kind: Option<&str>) -> SourceKind {
+    kind.and_then(SourceKind::parse).unwrap_or_default()
+}
+
 /// Canonical on-disk spelling of a [`DesignStatus`]. Exhaustive match so a new
 /// variant in `types` is a compile error here rather than a silent NULL.
 pub(crate) fn status_str(status: DesignStatus) -> &'static str {
@@ -752,6 +1097,21 @@ fn row_to_chunk(row: &Row<'_>) -> Result<Chunk> {
         line_end: row.get(8)?,
         text: row.get(9)?,
         vault,
+    })
+}
+
+/// Map the effective-authority tail of a [`CHUNK_COLS`] row.
+///
+/// An unknown demotion code is dropped rather than rejected: the tier is the
+/// load-bearing value, the note is explanation, and a store written by a newer
+/// daemon must not make search fail.
+fn row_to_authority(row: &Row<'_>) -> Result<Authority> {
+    Ok(Authority {
+        tier: row.get(11)?,
+        demotion: row
+            .get::<_, Option<String>>(12)?
+            .as_deref()
+            .and_then(Demotion::from_code),
     })
 }
 
@@ -801,7 +1161,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 1, "one migration applied");
+        assert_eq!(version, 2, "every shipped migration applied");
     }
 
     /// The external-content FTS5 table can drift from its content table if a
