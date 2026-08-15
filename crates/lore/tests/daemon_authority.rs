@@ -10,8 +10,8 @@ mod daemon_support;
 
 use daemon_support::Fixture;
 use lore::daemon::index::{full_scan, index_paths};
-use lore::store::{NewEmbedding, SearchFilter};
-use lore::types::ChunkId;
+use lore::store::{NewEmbedding, SearchFilter, StatusFilter};
+use lore::types::{ChunkId, DesignStatus};
 use std::collections::BTreeSet;
 
 const LEDGER: &str = "design/0_Canon/DECISIONS.md";
@@ -366,4 +366,249 @@ fn min_authority_filters_on_the_effective_tier() {
         !paths.iter().any(|path| path.contains("9_Scratch")),
         "{paths:?}"
     );
+}
+
+/// Paths for a search restricted to one file, by declared status.
+fn paths_for(fixture: &Fixture, filter: SearchFilter, term: &str) -> Vec<String> {
+    let term = term.to_string();
+    let mut paths: Vec<String> = fixture
+        .store
+        .blocking(move |store| store.lexical_search(&term, &filter, 50))
+        .expect("search")
+        .into_iter()
+        .map(|hit| hit.chunk.path.into_string())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// The two filters answer two different questions and must not be conflated:
+/// `min_authority` asks what Lore ranks a document as, `status` asks what the
+/// document says about itself. A demoted `decided` file has to fall out of the
+/// first and stay in the second — otherwise there is no way to *find* the
+/// documents whose declarations were refused, which is exactly the audit an
+/// author needs after `lore status` tells them there are some.
+#[test]
+fn min_authority_reads_the_effective_tier_while_status_still_reads_the_declaration() {
+    let fixture = Fixture::new("authority");
+    fixture.write(LEDGER, ledger_body());
+    // Declares `decided`, cites a decision that exists but was superseded.
+    fixture.write(
+        "design/refused.md",
+        doc("decided", "decision_refs: [D-0002]\n", "Shared body"),
+    );
+    fixture.write(
+        "design/honored.md",
+        doc("decided", "decision_refs: [D-0001]\n", "Shared body"),
+    );
+    full_scan(&fixture.context(), &fixture.project);
+
+    let by_authority = paths_for(
+        &fixture,
+        SearchFilter {
+            project: Some(fixture.project.id),
+            min_authority: Some(3),
+            ..SearchFilter::default()
+        },
+        "shared",
+    );
+    assert_eq!(
+        by_authority,
+        ["design/honored.md"],
+        "min_authority=3 admits validated canon only"
+    );
+
+    let by_status = paths_for(
+        &fixture,
+        SearchFilter {
+            project: Some(fixture.project.id),
+            statuses: Some(vec![StatusFilter::Status(DesignStatus::Decided)]),
+            ..SearchFilter::default()
+        },
+        "shared",
+    );
+    assert_eq!(
+        by_status,
+        ["design/honored.md", "design/refused.md"],
+        "the refused document still declares `decided` and must stay findable"
+    );
+
+    // The two are composable, and composing them is the audit query: "what
+    // claims canon but is not ranked as canon?".
+    let refused_only = paths_for(
+        &fixture,
+        SearchFilter {
+            project: Some(fixture.project.id),
+            statuses: Some(vec![StatusFilter::Status(DesignStatus::Decided)]),
+            min_authority: Some(0),
+            ..SearchFilter::default()
+        },
+        "shared",
+    );
+    assert_eq!(refused_only, ["design/honored.md", "design/refused.md"]);
+}
+
+/// The ordering the daemon cannot control: documents are indexed first and the
+/// ledger arrives later (a vault under construction, or a `git pull` the
+/// watcher delivers as two batches). The pass that indexes the ledger owns
+/// promoting everything that was waiting on it — otherwise a whole vault stays
+/// demoted until someone forces a full rescan.
+#[test]
+fn a_ledger_that_appears_after_its_documents_promotes_them_on_that_pass() {
+    let fixture = Fixture::new("authority");
+    fixture.write(
+        "design/1.1.md",
+        doc("decided", "decision_refs: [D-0001]\n", "Body of one"),
+    );
+    full_scan(&fixture.context(), &fixture.project);
+    assert!(active(&fixture).is_empty(), "there is no ledger yet");
+    assert_eq!(
+        tiers(&fixture, "design/1.1.md", "Heading"),
+        [1],
+        "a citation with no ledger to validate it is not validated"
+    );
+
+    // The ledger arrives on its own, as its own watcher batch.
+    fixture.write(LEDGER, ledger_body());
+    let batch: BTreeSet<camino::Utf8PathBuf> =
+        [camino::Utf8PathBuf::from(LEDGER)].into_iter().collect();
+    let summary = index_paths(&fixture.context(), &fixture.project, &batch);
+
+    assert_eq!(
+        active(&fixture)
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["D-0001", "D-0004"]
+    );
+    assert_eq!(
+        tiers(&fixture, "design/1.1.md", "Heading"),
+        [3],
+        "the pass that indexed the ledger must promote what was waiting on it"
+    );
+    assert!(summary.authority_recomputed > 0, "{summary:?}");
+    assert_eq!(tiers(&fixture, LEDGER, "Status"), [3], "and pin itself");
+}
+
+/// Supersession is how an append-only ledger retires canon, so it is also how
+/// a document silently stops being backed by one. The citing document is not
+/// edited and its declaration is untouched — only what Lore ranks it as moves.
+#[test]
+fn superseding_a_decision_demotes_the_documents_that_cited_it() {
+    let fixture = Fixture::new("authority");
+    fixture.write(
+        LEDGER,
+        "# Ledger\n\n## D-0001 — Original\n\n- **Status:** Accepted\n- **Supersedes:** None\n",
+    );
+    fixture.write(
+        "design/1.1.md",
+        doc("decided", "decision_refs: [D-0001]\n", "Body of one"),
+    );
+    fixture.write(
+        "design/1.2.md",
+        doc(
+            "decided",
+            "decision_refs: [D-0001, D-0005]\n",
+            "Body of two",
+        ),
+    );
+    full_scan(&fixture.context(), &fixture.project);
+    assert_eq!(tiers(&fixture, "design/1.1.md", "Heading"), [3]);
+    assert_eq!(tiers(&fixture, "design/1.2.md", "Heading"), [3]);
+
+    // A new accepted entry retires D-0001 and introduces D-0005, which 1.2
+    // already cited speculatively. One edit, opposite verdicts.
+    fixture.write(
+        LEDGER,
+        "# Ledger\n\n## D-0001 — Original\n\n- **Status:** Accepted\n- **Supersedes:** None\n\n\
+         ## D-0005 — Replacement\n\n- **Status:** Accepted\n- **Supersedes:** D-0001\n",
+    );
+    let batch: BTreeSet<camino::Utf8PathBuf> =
+        [camino::Utf8PathBuf::from(LEDGER)].into_iter().collect();
+    let summary = index_paths(&fixture.context(), &fixture.project, &batch);
+
+    assert_eq!(
+        active(&fixture)
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["D-0005"],
+        "D-0001 is retired by an accepted successor"
+    );
+    assert_eq!(
+        tiers(&fixture, "design/1.1.md", "Heading"),
+        [1],
+        "its only citation is no longer active"
+    );
+    assert_eq!(
+        tiers(&fixture, "design/1.2.md", "Heading"),
+        [3],
+        "one surviving active citation is enough"
+    );
+    assert_eq!(summary.authority_violations, 1, "{summary:?}");
+
+    // And a *proposed* successor cannot do the same thing — canon invites
+    // agents to leave draft entries in the ledger.
+    fixture.write(
+        LEDGER,
+        "# Ledger\n\n## D-0001 — Original\n\n- **Status:** Accepted\n- **Supersedes:** None\n\n\
+         ## D-0005 — Replacement\n\n- **Status:** Proposed\n- **Supersedes:** D-0001\n",
+    );
+    index_paths(&fixture.context(), &fixture.project, &batch);
+    assert_eq!(
+        active(&fixture)
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["D-0001"]
+    );
+    assert_eq!(
+        tiers(&fixture, "design/1.1.md", "Heading"),
+        [3],
+        "a draft may not deactivate live canon"
+    );
+}
+
+/// Ledger recognition is by path convention, and this is a Windows-native tool
+/// (D-0003): a vault checked out as `0_canon/decisions.md` — which Windows
+/// treats as the same file — must not silently stop being the ledger, because
+/// the failure mode is the entire vault quietly losing its canon.
+#[cfg(windows)]
+#[test]
+fn a_case_varied_ledger_path_is_still_the_ledger_on_windows() {
+    let fixture = Fixture::new("authority");
+    fixture.write("design/0_canon/decisions.md", ledger_body());
+    fixture.write(
+        "design/1.1.md",
+        doc("decided", "decision_refs: [D-0001]\n", "Body of one"),
+    );
+    full_scan(&fixture.context(), &fixture.project);
+
+    assert_eq!(
+        active(&fixture)
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["D-0001", "D-0004"],
+        "the ledger was parsed despite its casing"
+    );
+    assert_eq!(
+        tiers(&fixture, "design/0_canon/decisions.md", "Status"),
+        [3]
+    );
+    assert_eq!(tiers(&fixture, "design/1.1.md", "Heading"), [3]);
+
+    // …and it re-triggers a recompute incrementally under that casing too.
+    fixture.write(
+        "design/0_canon/decisions.md",
+        "# Ledger\n\n## D-0001 — Retired\n\n- **Status:** Proposed\n",
+    );
+    let batch: BTreeSet<camino::Utf8PathBuf> =
+        [camino::Utf8PathBuf::from("design/0_canon/decisions.md")]
+            .into_iter()
+            .collect();
+    index_paths(&fixture.context(), &fixture.project, &batch);
+    assert!(active(&fixture).is_empty());
+    assert_eq!(tiers(&fixture, "design/1.1.md", "Heading"), [1]);
 }
