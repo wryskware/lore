@@ -29,6 +29,20 @@ briefs; details in the cited docs.
   SQL prefix pushdown, Windows case-folding parity in both arms) is still
   wanted for Unity workflows.
 
+## Dogfood findings (2026-08-15, first daemon session)
+
+- **Transient "authority declaration not honored" warnings on first scan.**
+  During a full scan that (re)indexes files, per-file authority is evaluated
+  before the ledger row lands, so validly-cited `decided` docs get a WARN
+  that the same pass's recompute immediately reverses. End state is correct;
+  the log misleads. Defer or suppress the warning until after ledger parse.
+- **Zombie daemon.** The 2026-08-14 daemon (pre-fix-wave binary) was found
+  alive but wedged: process running ~24 h, handshake stale, HTTP unresponsive.
+  Cause unknown; possibly an already-fixed hang. Watch for recurrence on the
+  current binary before investigating.
+- ~~Ledger parser retired partially-superseded decisions~~ — fixed same day
+  (bare-ID-list rule, Wrysk's call; see D-0010 and `authority.rs`).
+
 ## Residuals from the package-3 merge (2026-08-15)
 
 - **Unreadable-ledger degradation is untested.** `refresh_authority` keeps

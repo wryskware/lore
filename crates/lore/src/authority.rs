@@ -49,7 +49,6 @@ use std::collections::BTreeSet;
 
 use camino::Utf8Path;
 
-use crate::chunk::decision_refs;
 use crate::types::{DesignStatus, SourceKind, authority_tier};
 
 /// Directory that contains a project's decision ledger, by convention.
@@ -283,9 +282,18 @@ pub fn effective(
 /// Format (see `design/0_Canon/DECISIONS.md`): each entry is an ATX heading
 /// `## D-NNNN — Title` followed by a bullet list carrying `**Status:**` and
 /// `**Supersedes:**` fields. An entry is active when its status is `Accepted`
-/// *and* no **accepted** entry's `Supersedes` field names it — which is how an
-/// append-only ledger retires canon without rewriting history (README
+/// *and* no **accepted** entry's `Supersedes` field retires it — which is how
+/// an append-only ledger retires canon without rewriting history (README
 /// promotion rules).
+///
+/// A `Supersedes` field retires an entry only when its value is a **bare ID
+/// list** ("D-0004." / "D-0002, D-0003" / "D-0002 and D-0003") — D-0010.
+/// Real ledgers supersede *parts* of decisions in qualified prose ("D-0002's
+/// consumed-by-inscription clause only; the rest stands", "None (extends
+/// D-0015)"), and the entry's surviving clauses remain the canonical statement
+/// of what stands, so a partial supersession must leave it active. Any
+/// non-ID token in the value makes the whole field partial: it retires
+/// nothing.
 ///
 /// The accepted-only restriction on `Supersedes` is load-bearing, not
 /// tidiness. Canon explicitly invites agents to "draft proposed entries but
@@ -353,7 +361,7 @@ pub fn parse_ledger(src: &str) -> BTreeSet<String> {
                 .trim_end_matches(['*', '.', ' '])
                 .eq_ignore_ascii_case("accepted");
         } else if let Some(value) = field_value(trimmed, "Supersedes") {
-            entry.supersedes.extend(decision_refs(value));
+            entry.supersedes.extend(bare_supersedes_list(value));
         }
     }
     flush(&mut current, &mut accepted, &mut superseded);
@@ -362,6 +370,32 @@ pub fn parse_ledger(src: &str) -> BTreeSet<String> {
         .into_iter()
         .filter(|id| !superseded.contains(id))
         .collect()
+}
+
+/// IDs from a `Supersedes` field value, honored only when the value is a
+/// bare ID list (D-0010). Tokens may carry list decoration (`[[..]]`,
+/// emphasis, parentheses, `.,;`) and be joined by "and"/"&"; any other token
+/// — a possessive ("D-0002's"), a qualifier ("in part"), a negation ("None
+/// (extends D-0015)") — marks the field as partial prose and retires nothing.
+fn bare_supersedes_list(value: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    for token in value.split_whitespace() {
+        let token =
+            token.trim_matches(|c| matches!(c, '[' | ']' | '*' | '(' | ')' | '.' | ',' | ';'));
+        if token.is_empty() || token.eq_ignore_ascii_case("and") || token == "&" {
+            continue;
+        }
+        let bytes = token.as_bytes();
+        let shaped = bytes.len() == 6
+            && bytes[0] == b'D'
+            && bytes[1] == b'-'
+            && bytes[2..6].iter().all(u8::is_ascii_digit);
+        if !shaped {
+            return Vec::new();
+        }
+        ids.push(token.to_string());
+    }
+    ids
 }
 
 /// `D-NNNN` at the very start of `text`, if any.
@@ -608,6 +642,52 @@ mod tests {
         assert_eq!(
             active.iter().map(String::as_str).collect::<Vec<_>>(),
             ["D-0007"]
+        );
+    }
+
+    /// Every phrasing here is lifted from the live Lexomancy ledger, which
+    /// supersedes *parts* of decisions in qualified prose. Harvesting any
+    /// D-NNNN mention retired D-0002/D-0003/D-0005/D-0013/D-0014/D-0015
+    /// against the ledger's own words — "the rest of D-0002 stands",
+    /// "**Supersedes:** None (extends D-0015)" (D-0010).
+    #[test]
+    fn a_qualified_or_negated_supersession_is_partial_and_retires_nothing() {
+        let src = "# Ledger\n\n\
+                   ## D-0002 — Forge economy\n\n- **Status:** Accepted\n- **Supersedes:** None\n\n\
+                   ## D-0013 — Wildcards\n\n- **Status:** Accepted\n- **Supersedes:** None\n\n\
+                   ## D-0014 — Preview strip\n\n- **Status:** Accepted\n\
+                   - **Supersedes:** none (refines [[D-0013]]'s presentation half).\n\n\
+                   ## D-0015 — Unified cast\n\n- **Status:** Accepted\n\
+                   - **Supersedes:** D-0014 in the single Focus-chip-multiplier detail; otherwise none.\n\n\
+                   ## D-0016 — Targeting\n\n- **Status:** Accepted\n\
+                   - **Supersedes:** None (extends D-0015).\n\n\
+                   ## D-0017 — Inscription\n\n- **Status:** Accepted\n\
+                   - **Supersedes:** D-0002's \"consumed by inscription\" clause only; the rest stands.\n";
+        assert_eq!(
+            parse_ledger(src)
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["D-0002", "D-0013", "D-0014", "D-0015", "D-0016", "D-0017"],
+            "qualified prose must not retire the entries it mentions"
+        );
+    }
+
+    #[test]
+    fn a_bare_id_list_retires_every_named_entry() {
+        let src = "# Ledger\n\n\
+                   ## D-0001 — First\n\n- **Status:** Accepted\n- **Supersedes:** None\n\n\
+                   ## D-0002 — Second\n\n- **Status:** Accepted\n- **Supersedes:** None\n\n\
+                   ## D-0003 — Third\n\n- **Status:** Accepted\n- **Supersedes:** None\n\n\
+                   ## D-0004 — Sweep\n\n- **Status:** Accepted\n\
+                   - **Supersedes:** [[D-0001]], D-0002 and D-0003.\n";
+        assert_eq!(
+            parse_ledger(src)
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["D-0004"],
+            "a decorated bare list is still a bare list"
         );
     }
 

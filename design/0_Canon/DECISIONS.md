@@ -114,3 +114,15 @@ Append-only. Newest entries at the bottom. Schema per [[README]].
 - **Consequences:** Caveat recorded: luna-free measures capability, not cost savings — token-reduction claims need a model where tokens actually cost something. Bench harness lands early in the milestone plan.
 - **Supersedes:** None
 - **Canonical sources:** [[../5_Implementation/5.1_Milestones]]
+
+## D-0010 — Ledger supersession is a bare ID list; qualified prose is partial
+
+- **Date:** 2026-08-15
+- **Status:** Accepted
+- **Scope:** Decision-ledger parsing semantics (`parse_ledger`, effective authority)
+- **Decided by:** Wrysk (option choice during first dogfood session)
+- **Decision:** A `Supersedes` field retires a decision only when its value is a bare ID list ("D-0004." / "D-0002, D-0003" / "D-0002 and D-0003", decoration tolerated). Any other token — a possessive ("D-0002's … clause only"), a qualifier ("in part"), a negation ("None (extends D-0015)") — makes the field a partial supersession that retires nothing; the named entry stays active.
+- **Rationale:** Real ledgers supersede parts of decisions in qualified prose, and the surviving entry remains the canonical statement of what stands. Harvesting any D-NNNN mention retired 6 of 16 Lexomancy decisions against the ledger's own words (found dogfooding, 2026-08-15). The failure directions are asymmetric: under-retiring leaves stale canon ranked high but visible; over-retiring silently demotes valid canon and every document citing it.
+- **Consequences:** A full supersession must be written as a bare ID list — document this in ledger conventions when the promotion-gate docs land (M2). Partial supersessions need no special syntax.
+- **Supersedes:** None
+- **Canonical sources:** `crates/lore/src/authority.rs` (`bare_supersedes_list`); the Lexomancy ledger's D-0008/D-0010/D-0014/D-0015/D-0016 entries as the motivating corpus
