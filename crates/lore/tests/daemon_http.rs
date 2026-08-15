@@ -479,6 +479,125 @@ async fn expand_falls_back_to_stored_text_when_the_file_is_gone() {
     assert_eq!(body["line_end"], body["file_lines"]);
 }
 
+/// The S1#3 round trip: a search result hands back a `project_key`, and that
+/// key — not the display name — is what identifies the source on the way back
+/// in. The name path stays for humans and older clients.
+#[tokio::test]
+async fn expand_resolves_by_project_key_in_preference_to_the_display_name() {
+    let h = harness();
+    h.fixture
+        .write("notes.md", "# Heading\n\nA line about ranking.\n");
+    full_scan(&h.fixture.context(), &h.fixture.project);
+
+    let (_, search) = post(&h.router, "/v1/search", json!({ "query": "ranking" })).await;
+    let hit = &search["results"][0];
+    let key = hit["project_key"].as_str().unwrap().to_string();
+    let chunk_id = hit["chunk_id"].as_str().unwrap().to_string();
+    assert_eq!(key, "demo", "{search:#}");
+
+    // Key alone, with no `project` field at all.
+    let (status, body) = post(
+        &h.router,
+        "/v1/expand",
+        json!({ "project_key": key, "chunk_id": chunk_id }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    assert_eq!(body["path"], "notes.md");
+
+    // An unknown key is a 404 that names the key, not a silent fallback to
+    // whatever `project` happened to say.
+    let (status, body) = post(
+        &h.router,
+        "/v1/expand",
+        json!({ "project": "demo", "project_key": "ghost-key", "chunk_id": chunk_id }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        body["message"].as_str().unwrap().contains("ghost-key"),
+        "{body:#}"
+    );
+
+    // Neither is a bad request, not a confusing 404.
+    let (status, body) = post(&h.router, "/v1/expand", json!({ "chunk_id": chunk_id })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["message"].as_str().unwrap().contains("project_key"),
+        "{body:#}"
+    );
+}
+
+/// Two projects sharing a display name make name-based resolution ambiguous,
+/// which is how a search hit becomes an `expand` 404 (S1#3). The registry
+/// refuses to enter that state, and says which flag fixes it.
+#[tokio::test]
+async fn registering_a_duplicate_display_name_is_refused_with_a_remedy() {
+    let h = harness();
+    let other = tempfile::tempdir().unwrap();
+    let root = other.path().to_string_lossy().to_string();
+
+    let (status, body) = post(
+        &h.router,
+        "/v1/projects",
+        json!({ "root": root, "name": "demo" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:#}");
+    let message = body["message"].as_str().unwrap();
+    assert!(message.contains("already registered"), "{message}");
+    assert!(message.contains("--name"), "{message}");
+
+    // The same root under a free name is accepted and gets its own key.
+    let (status, body) = post(
+        &h.router,
+        "/v1/projects",
+        json!({ "root": root, "name": "other" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    assert_eq!(body["key"], "other");
+    assert_eq!(body["kind"], "repo");
+
+    // Re-registering the *same* root under its own name is a rename, not a
+    // collision with itself.
+    let (status, body) = post(
+        &h.router,
+        "/v1/projects",
+        json!({ "root": root, "name": "other" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    assert_eq!(body["key"], "other", "the key survives re-registration");
+}
+
+/// Registration is the only thing that writes the registry outside startup, so
+/// it must republish immediately — otherwise the project is indexed now and
+/// gone after the next restart.
+#[tokio::test]
+async fn registering_a_project_republishes_the_manifest() {
+    let h = harness();
+    let other = tempfile::tempdir().unwrap();
+    let root = other.path().to_string_lossy().to_string();
+    post(
+        &h.router,
+        "/v1/projects",
+        json!({ "root": root, "name": "second" }),
+    )
+    .await;
+
+    let manifest = lore::registry::read(&h.fixture.data_dir)
+        .expect("read manifest")
+        .expect("registration must publish a manifest");
+    let names: Vec<&str> = manifest
+        .projects
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert!(names.contains(&"second"), "{names:?}");
+    assert!(manifest.projects.iter().all(|entry| !entry.key.is_empty()));
+}
+
 #[tokio::test]
 async fn expand_rejects_unknown_projects_and_unknown_chunks() {
     let h = harness();
