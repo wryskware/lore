@@ -245,6 +245,142 @@ fn an_unparseable_manifest_is_quarantined_not_overwritten() {
     assert_eq!(fixture.rows().len(), 1, "the project survived");
 }
 
+/// The manifest is a hand-editable file, so the ways a human breaks it are
+/// part of its contract. Duplicate keys are the likely one — copy an entry,
+/// change the root, forget the key — and the key is the handle `expand` uses,
+/// so two entries sharing one is not cosmetic. Neither project may be dropped
+/// and neither may be left unreachable.
+#[test]
+fn a_manifest_with_duplicate_keys_reassigns_instead_of_losing_a_project() {
+    let mut fixture = Fixture::new();
+    registry::write(
+        &fixture.data_dir,
+        &Manifest {
+            projects: vec![
+                entry("lore", "lore", "C:/repos/lore"),
+                entry("lore", "lexomancy", "C:/repos/lexomancy"),
+            ],
+        },
+    )
+    .unwrap();
+
+    let outcome = fixture.reconcile();
+    assert_eq!(
+        outcome,
+        Reconciliation::Applied {
+            inserted: 2,
+            updated: 0,
+            removed: 0
+        },
+        "both projects survive"
+    );
+
+    let rows = fixture.rows();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].1, "lore", "the first claimant keeps the key");
+    assert_ne!(rows[1].1, "lore", "{rows:?}");
+    assert!(!rows[1].1.is_empty(), "{rows:?}");
+
+    // The repair is written back, so the next start is a no-op rather than a
+    // second reassignment with a different random suffix.
+    let repaired: Vec<String> = fixture
+        .manifest()
+        .projects
+        .iter()
+        .map(|entry| entry.key.clone())
+        .collect();
+    assert_eq!(repaired, vec![rows[0].1.clone(), rows[1].1.clone()]);
+    let outcome = fixture.reconcile();
+    assert_eq!(
+        outcome,
+        Reconciliation::Applied {
+            inserted: 0,
+            updated: 2,
+            removed: 0
+        }
+    );
+    assert_eq!(
+        fixture
+            .rows()
+            .into_iter()
+            .map(|(_, key, _)| key)
+            .collect::<Vec<_>>(),
+        repaired,
+        "keys are stable across restarts once repaired"
+    );
+}
+
+/// The same root listed twice (a merge conflict resolved badly) must not
+/// produce two rows for one directory, which would double every search hit.
+#[test]
+fn a_manifest_listing_one_root_twice_registers_it_once() {
+    let mut fixture = Fixture::new();
+    registry::write(
+        &fixture.data_dir,
+        &Manifest {
+            projects: vec![
+                entry("lore", "lore", "C:/repos/lore"),
+                entry("dup", "lore-again", r"C:\repos\lore\"),
+            ],
+        },
+    )
+    .unwrap();
+
+    fixture.reconcile();
+    let rows = fixture.rows();
+    assert_eq!(
+        rows.len(),
+        1,
+        "separator and case variants are one root: {rows:?}"
+    );
+    assert_eq!(rows[0].0, "lore", "the first entry wins");
+    assert_eq!(fixture.manifest().projects.len(), 1);
+}
+
+/// Roots the daemon cannot use: a relative path, and one that does not exist.
+///
+/// Asserting the *actual* behavior rather than a wish: both are accepted
+/// verbatim, because `reconcile` deliberately does not touch the filesystem —
+/// a root on a disconnected network share or an unmounted drive must not be
+/// silently deregistered on a restart, which is what an existence check at
+/// startup would do. The consequences are real but bounded, and belong in the
+/// report rather than in a startup failure:
+///
+/// - a missing root indexes to nothing and shows `files: 0` in `lore status`;
+/// - a **relative** root is resolved against the daemon's working directory by
+///   everything downstream, so it names a different tree depending on where
+///   the daemon was launched. Registration through `POST /v1/projects`
+///   canonicalizes and cannot produce one; only a hand-edited manifest can.
+#[test]
+fn a_relative_or_missing_manifest_root_is_accepted_as_written() {
+    let mut fixture = Fixture::new();
+    std::fs::write(
+        registry::manifest_path(&fixture.data_dir),
+        "[[project]]\nkey = 'rel'\nname = 'relative'\nroot = 'design/vault'\n\n\
+         [[project]]\nkey = 'gone'\nname = 'missing'\nroot = 'C:/nowhere/at/all'\n",
+    )
+    .unwrap();
+
+    let outcome = fixture.reconcile();
+    assert_eq!(
+        outcome,
+        Reconciliation::Applied {
+            inserted: 2,
+            updated: 0,
+            removed: 0
+        },
+        "a root the daemon cannot reach is still a registration, not an error"
+    );
+    assert_eq!(
+        fixture.rows(),
+        [
+            ("relative".into(), "rel".into(), "design/vault".into()),
+            ("missing".into(), "gone".into(), "C:/nowhere/at/all".into()),
+        ],
+        "roots are stored exactly as written, unresolved and unverified"
+    );
+}
+
 /// Removing a project takes its index with it; leaving orphaned chunks behind
 /// would make a deregistered project keep answering searches.
 #[test]
