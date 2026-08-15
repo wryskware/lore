@@ -283,8 +283,22 @@ pub fn effective(
 /// Format (see `design/0_Canon/DECISIONS.md`): each entry is an ATX heading
 /// `## D-NNNN — Title` followed by a bullet list carrying `**Status:**` and
 /// `**Supersedes:**` fields. An entry is active when its status is `Accepted`
-/// *and* no entry's `Supersedes` field names it — which is how an append-only
-/// ledger retires canon without rewriting history (README promotion rules).
+/// *and* no **accepted** entry's `Supersedes` field names it — which is how an
+/// append-only ledger retires canon without rewriting history (README
+/// promotion rules).
+///
+/// The accepted-only restriction on `Supersedes` is load-bearing, not
+/// tidiness. Canon explicitly invites agents to "draft proposed entries but
+/// leave them unpromoted" (README §Promotion rules), so a `Proposed` — or
+/// `Rejected` — entry naming `Supersedes: D-0001` is an ordinary, expected
+/// state of the file. Letting it retire D-0001 would hand any agent that can
+/// append to the ledger the power to deactivate live canon without
+/// authorization, and would demote every document citing it. Supersession is
+/// an act of accepted canon or it is nothing.
+///
+/// Fields are collected per entry and resolved when the entry closes, so a
+/// `Supersedes` line that appears *before* its own `Status` line is judged by
+/// the same rule as one that appears after it.
 ///
 /// Deliberately lenient about decoration (`- `, `* `, bold markers, the `:`
 /// inside or outside the emphasis) and deliberately strict about the id shape
@@ -293,15 +307,25 @@ pub fn effective(
 /// to a smaller active set — which demotes over-claiming documents — rather
 /// than failing the index pass.
 pub fn parse_ledger(src: &str) -> BTreeSet<String> {
+    /// One `## D-NNNN` entry, accumulating until the next heading closes it.
+    struct Entry {
+        id: String,
+        accepted: bool,
+        supersedes: Vec<String>,
+    }
+
     let mut accepted: BTreeSet<String> = BTreeSet::new();
     let mut superseded: BTreeSet<String> = BTreeSet::new();
-    let mut current: Option<(String, bool)> = None;
+    let mut current: Option<Entry> = None;
 
-    let flush = |current: &mut Option<(String, bool)>, accepted: &mut BTreeSet<String>| {
-        if let Some((id, is_accepted)) = current.take()
-            && is_accepted
+    let flush = |current: &mut Option<Entry>,
+                 accepted: &mut BTreeSet<String>,
+                 superseded: &mut BTreeSet<String>| {
+        if let Some(entry) = current.take()
+            && entry.accepted
         {
-            accepted.insert(id);
+            accepted.insert(entry.id);
+            superseded.extend(entry.supersedes);
         }
     };
 
@@ -311,24 +335,28 @@ pub fn parse_ledger(src: &str) -> BTreeSet<String> {
             // Any heading closes the previous entry; only a `D-NNNN` one opens
             // a new entry, so a trailing "## Notes" section cannot absorb
             // fields into the last decision.
-            flush(&mut current, &mut accepted);
+            flush(&mut current, &mut accepted, &mut superseded);
             let rest = rest.trim_start_matches('#');
-            current = leading_decision_id(rest).map(|id| (id, false));
+            current = leading_decision_id(rest).map(|id| Entry {
+                id,
+                accepted: false,
+                supersedes: Vec::new(),
+            });
             continue;
         }
-        let Some((_, is_accepted)) = current.as_mut() else {
+        let Some(entry) = current.as_mut() else {
             continue;
         };
         if let Some(value) = field_value(trimmed, "Status") {
-            *is_accepted = value
+            entry.accepted = value
                 .trim()
                 .trim_end_matches(['*', '.', ' '])
                 .eq_ignore_ascii_case("accepted");
         } else if let Some(value) = field_value(trimmed, "Supersedes") {
-            superseded.extend(decision_refs(value));
+            entry.supersedes.extend(decision_refs(value));
         }
     }
-    flush(&mut current, &mut accepted);
+    flush(&mut current, &mut accepted, &mut superseded);
 
     accepted
         .into_iter()
@@ -591,6 +619,60 @@ mod tests {
         assert!(parse_ledger("## Decisions\n- **Status:** Accepted\n").is_empty());
         // Malformed ids are not decisions.
         assert!(parse_ledger("## D-12 — short\n- **Status:** Accepted\n").is_empty());
+    }
+
+    /// Canon invites agents to draft proposed entries and leave them
+    /// unpromoted (README §Promotion rules). A drafted entry that *proposes*
+    /// replacing D-0001 is therefore an ordinary state of the file — and it
+    /// must not be able to retire D-0001 on its own say-so, because that would
+    /// let any agent with write access to the ledger deactivate live canon and
+    /// mass-demote every document citing it.
+    #[test]
+    fn an_unpromoted_entrys_supersedes_cannot_retire_live_canon() {
+        let src = "# Ledger\n\n\
+                   ## D-0001 — Live canon\n\n- **Status:** Accepted\n- **Supersedes:** None\n\n\
+                   ## D-0009 — A draft an agent left behind\n\n\
+                   - **Status:** Proposed\n- **Supersedes:** D-0001\n\n\
+                   ## D-0010 — Considered and declined\n\n\
+                   - **Status:** Rejected\n- **Supersedes:** D-0001\n";
+        assert_eq!(
+            parse_ledger(src)
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["D-0001"],
+            "only an accepted entry may supersede"
+        );
+
+        // The moment the same entry *is* accepted, the supersession takes
+        // effect — proving the gate is the status and nothing else.
+        let promoted = src.replace("- **Status:** Proposed", "- **Status:** Accepted");
+        assert_eq!(
+            parse_ledger(&promoted)
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["D-0009"]
+        );
+    }
+
+    /// Field order inside an entry is a formatting choice, so the accepted-only
+    /// rule cannot depend on `Status` being read before `Supersedes`.
+    #[test]
+    fn supersedes_is_judged_by_status_whichever_line_comes_first() {
+        let ignored = "## D-0001 — Canon\n- **Status:** Accepted\n\n\
+                       ## D-0009 — Draft\n- **Supersedes:** D-0001\n- **Status:** Proposed\n";
+        assert!(parse_ledger(ignored).contains("D-0001"));
+
+        let honored = "## D-0001 — Canon\n- **Status:** Accepted\n\n\
+                       ## D-0009 — Replacement\n- **Supersedes:** D-0001\n- **Status:** Accepted\n";
+        assert_eq!(
+            parse_ledger(honored)
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["D-0009"]
+        );
     }
 
     #[test]
