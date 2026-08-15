@@ -172,10 +172,18 @@ async fn status(State(state): State<AppState>) -> ApiResult<DaemonStatus> {
             .map(|p| lore_core::ProjectStatus {
                 id: p.project,
                 name: p.name,
+                key: p.key,
                 root: p.root.into_string(),
+                kind: p.kind.as_str().to_string(),
                 files: p.files,
                 chunks: p.chunks,
                 embedded_chunks: p.embedded_chunks,
+                authority_violations: p.authority_violations,
+                authority_violation_paths: p
+                    .authority_violation_paths
+                    .into_iter()
+                    .map(camino::Utf8PathBuf::into_string)
+                    .collect(),
                 // Same reasoning as `embeddings` below: a watch that is not
                 // armed degrades the daemon silently unless it is reported.
                 watch: state.watch_status.of(p.project),
@@ -225,6 +233,24 @@ async fn register_project(
             .to_string(),
     };
 
+    // Display names are how humans (and the CLI, and older wire clients) name
+    // a project, so two projects sharing one is not a cosmetic problem — it
+    // makes `expand(project, chunk_id)` resolve the wrong source or 404
+    // (S1#3). Reject at the door rather than silently accepting an ambiguous
+    // registry; the caller has a one-flag fix.
+    let existing = projects_of(&state).await?;
+    if crate::registry::names_taken_by_others(&existing, &root).contains(&name) {
+        let other = existing
+            .iter()
+            .find(|project| project.name == name)
+            .map(|project| project.root.to_string())
+            .unwrap_or_default();
+        return Err(ApiErr::bad_request(format!(
+            "a project named `{name}` is already registered ({other}); \
+             pass --name to give this one a different display name"
+        )));
+    }
+
     let registered = {
         let root = root.clone();
         let name = name.clone();
@@ -236,12 +262,40 @@ async fn register_project(
             .map_err(|err| ApiErr::internal("register", err))?
     };
 
-    let project = Project {
-        id: registered,
-        root,
-        name,
-    };
-    tracing::info!(project = %project.name, root = %project.root, id = project.id, "project registered");
+    // The manifest is authoritative, so it is republished from the store the
+    // moment the store changes. A failure here does not fail the
+    // registration — the project *is* registered — but it means the next
+    // startup would drop it, which is exactly the kind of thing that must not
+    // be silent.
+    {
+        let data_dir = state.data_dir.clone();
+        match state
+            .store
+            .with(move |store| crate::registry::publish(store, &data_dir))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) | Err(err) => tracing::error!(
+                error = %format!("{err:#}"),
+                "project registered but the registry manifest could not be written; \
+                 it will not survive a restart"
+            ),
+        }
+    }
+
+    let projects = projects_of(&state).await?;
+    let project = projects
+        .into_iter()
+        .find(|project| project.id == registered)
+        .ok_or_else(|| ApiErr::internal("register", "the registered project vanished"))?;
+
+    tracing::info!(
+        project = %project.name,
+        key = %project.key,
+        root = %project.root,
+        id = project.id,
+        "project registered"
+    );
     let _ = state.watch.send(WatchCommand::Watch(project.clone()));
     state.queue.request_full(project.id);
 
@@ -300,9 +354,20 @@ async fn expand_route(
     ApiJson(request): ApiJson<ExpandRequest>,
 ) -> ApiResult<lore_core::ExpandResponse> {
     let projects = projects_of(&state).await?;
-    let project = super::resolve_project(&projects, &request.project)
-        .ok_or_else(|| ApiErr::not_found(format!("unknown project `{}`", request.project)))?
-        .clone();
+    // Key first: it is exact. The display-name path stays for humans, older
+    // clients, and anyone typing a command by hand.
+    let project = match &request.project_key {
+        Some(key) => super::resolve_project_key(&projects, key)
+            .ok_or_else(|| ApiErr::not_found(format!("unknown project key `{key}`")))?,
+        None if request.project.is_empty() => {
+            return Err(ApiErr::bad_request(
+                "expand needs a project: pass project_key from the search result",
+            ));
+        }
+        None => super::resolve_project(&projects, &request.project)
+            .ok_or_else(|| ApiErr::not_found(format!("unknown project `{}`", request.project)))?,
+    }
+    .clone();
 
     let chunk_id = request.chunk_id.clone();
     let context_lines = request.context_lines;
@@ -331,6 +396,8 @@ fn info(project: &Project) -> ProjectInfo {
     ProjectInfo {
         id: project.id,
         name: project.name.clone(),
+        key: project.key.clone(),
         root: project.root.to_string(),
+        kind: project.kind.as_str().to_string(),
     }
 }

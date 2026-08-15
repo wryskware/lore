@@ -46,6 +46,7 @@ use tokio_util::task::TaskTracker;
 
 use crate::config::Config;
 use crate::embed::Embedder;
+use crate::registry;
 use crate::store::Project;
 
 pub use handshake::Handshake;
@@ -78,6 +79,15 @@ pub fn resolve_project<'a>(projects: &'a [Project], key: &str) -> Option<&'a Pro
             .ok()
             .and_then(|id| projects.iter().find(|p| p.id == id))
     })
+}
+
+/// Resolve by stable opaque key — exact, unambiguous, and unaffected by
+/// renames (S1#3). Kept separate from [`resolve_project`] on purpose: a single
+/// resolver that accepted names *and* keys would reintroduce exactly the
+/// ambiguity the key exists to remove, the moment someone names a project
+/// after another project's key.
+pub fn resolve_project_key<'a>(projects: &'a [Project], key: &str) -> Option<&'a Project> {
+    projects.iter().find(|p| p.key == key)
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +129,24 @@ pub async fn run(options: DaemonOptions) -> Result<()> {
     }
 
     let store = StoreHandle::open(data_dir.join(paths::DB_FILE))?.with_owner(owner);
+
+    // Before anything is watched, scanned or served: make the derived
+    // `projects` table agree with the authoritative manifest (S1#7). A failure
+    // here is not fatal — the database still holds a usable registry, and
+    // refusing to start would turn a recoverable file problem into an outage.
+    {
+        let manifest_dir = data_dir.clone();
+        match store
+            .with(move |store| registry::reconcile(store, &manifest_dir))
+            .await?
+        {
+            Ok(outcome) => tracing::info!(?outcome, "project registry reconciled"),
+            Err(err) => tracing::error!(
+                error = %format!("{err:#}"),
+                "could not reconcile the project registry; continuing with the index's own list"
+            ),
+        }
+    }
 
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
