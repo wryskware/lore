@@ -35,7 +35,7 @@ $modelMap = @{
 $repoMap = @{
     lore      = @{ dir = 'C:\Users\perag\bench-e2e\lore-bench'; vcs = 'git' }
     terrarium = @{ dir = 'C:\Users\perag\bench-e2e\terrarium-bench'; vcs = 'git' }
-    lexomancy = @{ dir = 'C:\Users\perag\Unity\Lexomancy-bench'; vcs = 'cm'; cmDir = 'C:\Users\perag\Unity\Lexomancy-alt' }
+    lexomancy = @{ dir = 'C:\Users\perag\Unity\Lexomancy-bench'; vcs = 'cm'; cmDir = 'C:\Users\perag\Unity\Lexomancy-alt'; cmPin = 'cs:134' }
 }
 $prompts = Get-Content (Join-Path $benchRoot 'prompts.json') -Raw | ConvertFrom-Json
 
@@ -112,7 +112,17 @@ function Invoke-Cell([string]$model, [string]$repo, [string]$arm, [string]$task)
                 foreach ($line in $newChanges) {
                     # cm status --short lines end in the path; undo each new one.
                     $p = ($line -split '\s+')[-1]
-                    if ($p) { cm diff $p 2>$null | Add-Content (Join-Path $outDir 'diff.patch'); cm undo $p 2>$null | Out-Null }
+                    if (-not $p) { continue }
+                    # HARD RULE (Lexomancy CLAUDE.md / uvcs-hygiene): never
+                    # `cm diff <path>` — it opens a blocking GUI window and cm
+                    # has no textual hunk output. Pull the pinned revision and
+                    # diff locally instead.
+                    $base = Join-Path ([IO.Path]::GetTempPath()) ("t5base-" + [IO.Path]::GetFileName($p))
+                    cm getfile "$p#$($r.cmPin)" --file="$base" 2>$null | Out-Null
+                    if (-not (Test-Path $base)) { Set-Content $base '' }  # added file: empty base
+                    git diff --no-index -- $base $p 2>$null | Add-Content (Join-Path $outDir 'diff.patch')
+                    Remove-Item $base -ErrorAction SilentlyContinue
+                    cm undo $p 2>$null | Out-Null
                 }
             } finally { Pop-Location }
             if ($newChanges) { Write-Warning "[$cell] cm changes captured and undone: $($newChanges.Count) file(s). Verify with 'cm status'." }
