@@ -251,7 +251,7 @@ fn collapse_anchor(chunk: &Chunk) -> String {
         ChunkKind::Code { symbol_path, .. } => {
             format!("code:{}", strip_discriminators(symbol_path, &WINDOW_MARKER))
         }
-        ChunkKind::Section { heading_path } => {
+        ChunkKind::Section { heading_path, .. } => {
             let titles: Vec<&str> = heading_path
                 .iter()
                 .filter(|title| !is_discriminator(title, &WINDOW_MARKER))
@@ -304,7 +304,7 @@ fn to_result(names: &HashMap<ProjectId, String>, hit: SearchHit) -> SearchResult
     let chunk = hit.chunk;
     let (symbol_path, heading_path) = match &chunk.kind {
         ChunkKind::Code { symbol_path, .. } => (Some(symbol_path.clone()), None),
-        ChunkKind::Section { heading_path } => (None, Some(heading_path.clone())),
+        ChunkKind::Section { heading_path, .. } => (None, Some(heading_path.clone())),
         ChunkKind::Window { .. } => (None, None),
     };
     let (design_status, decision_refs) = match &chunk.vault {
@@ -397,6 +397,7 @@ mod tests {
     fn section(title: &str) -> ChunkKind {
         ChunkKind::Section {
             heading_path: vec![title.to_string()],
+            window: None,
         }
     }
 
@@ -500,6 +501,7 @@ mod tests {
         let code = |suffix: &str| ChunkKind::Code {
             symbol_kind: "method_declaration".into(),
             symbol_path: format!("Board.Update{suffix}"),
+            window: None,
         };
         // Both windows of `Board.Update` match; only the better one survives.
         let lexical = vec![
@@ -525,6 +527,7 @@ mod tests {
                 Some(s) => vec!["Ranking".into(), s.to_string()],
                 None => vec!["Ranking".into()],
             },
+            window: None,
         };
         let hits = vec![
             hit("s0", "3.1.md", windowed(Some("#w0")), None),
@@ -535,6 +538,7 @@ mod tests {
                 "3.1.md",
                 ChunkKind::Section {
                     heading_path: vec!["Ranking".into(), "#d1".into()],
+                    window: None,
                 },
                 None,
             ),

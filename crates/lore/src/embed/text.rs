@@ -75,6 +75,7 @@ fn anchor_phrase(kind: &ChunkKind) -> Option<String> {
         ChunkKind::Code {
             symbol_kind,
             symbol_path,
+            ..
         } => {
             let symbol = strip_discriminators(symbol_path, &ALL_MARKERS);
             // "group" means the chunker merged several tiny siblings; naming
@@ -95,7 +96,7 @@ fn anchor_phrase(kind: &ChunkKind) -> Option<String> {
             };
             (!phrase.is_empty()).then_some(phrase)
         }
-        ChunkKind::Section { heading_path } => {
+        ChunkKind::Section { heading_path, .. } => {
             let titles: Vec<&str> = heading_path
                 .iter()
                 .filter(|title| !is_discriminator(title, &ALL_MARKERS))
@@ -177,6 +178,7 @@ mod tests {
         ChunkKind::Code {
             symbol_kind: symbol_kind.into(),
             symbol_path: symbol_path.into(),
+            window: None,
         }
     }
 
@@ -201,6 +203,7 @@ mod tests {
             Some("markdown"),
             ChunkKind::Section {
                 heading_path: vec!["Retrieval".into(), "Ranking".into()],
+                window: None,
             },
             "RRF fuses the two arms.",
         );
@@ -230,6 +233,10 @@ mod tests {
             Some("markdown"),
             ChunkKind::Section {
                 heading_path: vec!["Top".into(), "#w2".into()],
+                window: Some(crate::types::WindowFamily {
+                    family: 0,
+                    index: 2,
+                }),
             },
             "",
         );

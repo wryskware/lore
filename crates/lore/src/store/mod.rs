@@ -766,6 +766,7 @@ mod tests {
     fn chunk(path: &str, symbol: &str, text: &str) -> Chunk {
         let path = Utf8PathBuf::from(path);
         let kind = ChunkKind::Code {
+            window: None,
             symbol_kind: "function".into(),
             symbol_path: symbol.into(),
         };

@@ -61,6 +61,27 @@ pub struct VaultMeta {
     pub body_decision_refs: Vec<String>,
 }
 
+/// Membership in one generated window family.
+///
+/// The chunker splits an oversized symbol or section into overlapping line
+/// windows. Those windows are *one place in one file*, so ranking collapses
+/// them to a single result — but only if it can tell them apart from
+/// genuinely distinct content that happens to share an anchor (two C#
+/// overloads under `Parser.Parse`, two sibling `## Notes` sections). The
+/// `#w<n>` anchor suffix cannot carry that: it is a user-authorable string,
+/// and two *independently* windowed overloads both spell `Parse#w0`,
+/// `Parse#w1`, … Membership is therefore recorded here, at chunk time, by the
+/// only code that knows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowFamily {
+    /// Per-file ordinal of the split span, assigned in emission order. Two
+    /// oversized overloads sharing a symbol path get *different* families.
+    pub family: u32,
+    /// 0-based window ordinal within the family; the `<n>` of the `#w<n>`
+    /// anchor suffix this chunk carries.
+    pub index: u32,
+}
+
 /// Structural identity of a chunk within its file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -70,9 +91,21 @@ pub enum ChunkKind {
     Code {
         symbol_kind: String,
         symbol_path: String,
+        /// `Some` exactly when this chunk is one window of an oversized
+        /// span. Serde-defaulted and omitted when absent, so rows written
+        /// before `CHUNK_FORMAT_VERSION` 4 (which have no such key) read back
+        /// as `None` and no SQLite migration is needed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window: Option<WindowFamily>,
     },
     /// A Markdown heading-tree leaf; `heading_path` is root-to-leaf titles.
-    Section { heading_path: Vec<String> },
+    Section {
+        heading_path: Vec<String>,
+        /// `Some` exactly when this chunk is one window of an oversized
+        /// section; same contract as the `window` field of `Code`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window: Option<WindowFamily>,
+    },
     /// A fallback line window over unknown text; `index` is the 0-based
     /// window ordinal within the file.
     Window { index: u32 },
@@ -80,13 +113,28 @@ pub enum ChunkKind {
 
 impl ChunkKind {
     /// Canonical anchor string used in [`ChunkId::derive`].
+    ///
+    /// Deliberately blind to [`WindowFamily`]: the family is bookkeeping
+    /// *about* an anchor, not part of it. Keeping it out means adding the
+    /// metadata leaves every derived chunk id — and therefore every stored
+    /// embedding and FTS row — exactly where it was.
     pub fn anchor(&self) -> String {
         match self {
             ChunkKind::Code { symbol_path, .. } => format!("code:{symbol_path}"),
-            ChunkKind::Section { heading_path } => {
+            ChunkKind::Section { heading_path, .. } => {
                 format!("md:{}", heading_path.join(" > "))
             }
             ChunkKind::Window { index } => format!("win:{index}"),
+        }
+    }
+
+    /// The window family this chunk belongs to, if it is a generated window.
+    pub fn window_family(&self) -> Option<WindowFamily> {
+        match self {
+            ChunkKind::Code { window, .. } | ChunkKind::Section { window, .. } => *window,
+            // A text window's ordinal is *not* a family: consecutive windows
+            // of a log file are different content, not one split span.
+            ChunkKind::Window { .. } => None,
         }
     }
 }
@@ -132,12 +180,60 @@ mod tests {
         let kind = ChunkKind::Code {
             symbol_kind: "fn".into(),
             symbol_path: "foo".into(),
+            window: None,
         };
         let a = Chunk::derive_id(&path, &kind, "fn foo() {}");
         let b = Chunk::derive_id(&path, &kind, "fn foo() {}");
         let c = Chunk::derive_id(&path, &kind, "fn foo() { 1; }");
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    /// The whole point of keeping the family out of [`ChunkKind::anchor`]:
+    /// re-chunking to *gain* the metadata must not move a single chunk id,
+    /// or the format bump would silently discard every embedding.
+    #[test]
+    fn window_family_metadata_does_not_move_chunk_ids() {
+        let path = Utf8PathBuf::from("Assets/Board.cs");
+        let bare = ChunkKind::Code {
+            symbol_kind: "method_declaration".into(),
+            symbol_path: "Board.Update#w1".into(),
+            window: None,
+        };
+        let tagged = ChunkKind::Code {
+            symbol_kind: "method_declaration".into(),
+            symbol_path: "Board.Update#w1".into(),
+            window: Some(WindowFamily {
+                family: 7,
+                index: 1,
+            }),
+        };
+        assert_eq!(bare.anchor(), tagged.anchor());
+        assert_eq!(
+            Chunk::derive_id(&path, &bare, "body"),
+            Chunk::derive_id(&path, &tagged, "body")
+        );
+    }
+
+    /// Rows persisted before `CHUNK_FORMAT_VERSION` 4 carry no `window` key;
+    /// they must read back as "not a window" rather than failing the whole
+    /// query. A `None` family must also serialize back to the old shape.
+    #[test]
+    fn kind_json_is_backward_and_forward_compatible() {
+        let legacy = r##"{"kind":"section","heading_path":["Ranking","#w0"]}"##;
+        let kind: ChunkKind = serde_json::from_str(legacy).expect("legacy row parses");
+        assert_eq!(kind.window_family(), None);
+        assert_eq!(serde_json::to_string(&kind).unwrap(), legacy);
+
+        let tagged = ChunkKind::Section {
+            heading_path: vec!["Ranking".into(), "#w0".into()],
+            window: Some(WindowFamily {
+                family: 0,
+                index: 0,
+            }),
+        };
+        let json = serde_json::to_string(&tagged).unwrap();
+        assert_eq!(serde_json::from_str::<ChunkKind>(&json).unwrap(), tagged);
     }
 
     #[test]

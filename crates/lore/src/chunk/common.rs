@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use camino::Utf8PathBuf;
 
-use crate::types::{Chunk, ChunkKind, DesignStatus, VaultMeta};
+use crate::types::{Chunk, ChunkKind, DesignStatus, VaultMeta, WindowFamily};
 
 /// Files larger than this are skipped outright (never parsed, never read
 /// into a chunk). 3.1 leaves the number open; 2 MiB comfortably covers
@@ -141,9 +141,12 @@ pub(crate) enum Tpl<'a> {
 }
 
 impl Tpl<'_> {
-    /// `window` is `Some(i)` only when the span was split; the discriminator
-    /// keeps the derived IDs of the parts distinct and stable.
-    fn kind(&self, window: Option<u32>) -> ChunkKind {
+    /// `window` is `Some` only when the span was split. Its index becomes the
+    /// `#w<n>` anchor discriminator, which is what keeps the derived IDs of
+    /// the parts distinct and stable; the family ordinal rides alongside as
+    /// metadata so ranking can recognise the parts without re-deriving
+    /// membership from a string anyone may also have typed.
+    fn kind(&self, window: Option<WindowFamily>) -> ChunkKind {
         match self {
             Tpl::Code {
                 symbol_kind,
@@ -151,16 +154,20 @@ impl Tpl<'_> {
             } => ChunkKind::Code {
                 symbol_kind: (*symbol_kind).to_string(),
                 symbol_path: match window {
-                    Some(i) => format!("{symbol_path}#w{i}"),
+                    Some(w) => format!("{symbol_path}#w{}", w.index),
                     None => (*symbol_path).to_string(),
                 },
+                window,
             },
             Tpl::Section { heading_path } => {
                 let mut path = heading_path.to_vec();
-                if let Some(i) = window {
-                    path.push(format!("#w{i}"));
+                if let Some(w) = window {
+                    path.push(format!("#w{}", w.index));
                 }
-                ChunkKind::Section { heading_path: path }
+                ChunkKind::Section {
+                    heading_path: path,
+                    window,
+                }
             }
         }
     }
@@ -174,6 +181,11 @@ pub(crate) struct Emitter<'a> {
     src: &'a str,
     lines: LineIndex,
     vault: Option<FileVault>,
+    /// Next [`WindowFamily::family`] ordinal for this file. One counter for
+    /// the whole file (not per anchor), so two oversized `Parser.Parse`
+    /// overloads land in different families even though their windows spell
+    /// the same `#w<n>` suffixes.
+    next_family: u32,
     out: Vec<Chunk>,
 }
 
@@ -185,6 +197,7 @@ impl<'a> Emitter<'a> {
             src,
             lines: LineIndex::new(src),
             vault: None,
+            next_family: 0,
             out: Vec::new(),
         }
     }
@@ -209,11 +222,24 @@ impl<'a> Emitter<'a> {
         let windows =
             self.lines
                 .windows(first, last, u32::MAX, MAX_CHUNK_BYTES, WINDOW_OVERLAP_LINES);
+        // One family per *split span*, claimed even when the span degenerates
+        // to a single window (a 4 KB+ single line): the metadata and the
+        // `#w<n>` suffix must agree, or ranking's "this is bookkeeping" test
+        // would disagree with the anchor it is looking at.
+        let family = self.next_family;
+        self.next_family += 1;
         for (i, (a, b)) in windows.iter().enumerate() {
             let ws = self.lines.line_start(*a).max(start);
             let we = self.lines.line_end(*b).min(end);
             if let Some((ws, we)) = trim_span(self.src, ws, we) {
-                self.emit(ws, we, tpl.kind(Some(i as u32)));
+                self.emit(
+                    ws,
+                    we,
+                    tpl.kind(Some(WindowFamily {
+                        family,
+                        index: i as u32,
+                    })),
+                );
             }
         }
     }
@@ -262,19 +288,30 @@ impl<'a> Emitter<'a> {
     }
 }
 
+/// Adds a `#d<n>` discriminator. Window membership is *preserved*: two
+/// identical windows of two different families collide on anchor and text, and
+/// disambiguating them must not also erase the family that keeps them apart.
 fn disambiguate(kind: &ChunkKind, dup: u32) -> ChunkKind {
     match kind {
         ChunkKind::Code {
             symbol_kind,
             symbol_path,
+            window,
         } => ChunkKind::Code {
             symbol_kind: symbol_kind.clone(),
             symbol_path: format!("{symbol_path}#d{dup}"),
+            window: *window,
         },
-        ChunkKind::Section { heading_path } => {
+        ChunkKind::Section {
+            heading_path,
+            window,
+        } => {
             let mut path = heading_path.clone();
             path.push(format!("#d{dup}"));
-            ChunkKind::Section { heading_path: path }
+            ChunkKind::Section {
+                heading_path: path,
+                window: *window,
+            }
         }
         ChunkKind::Window { index } => ChunkKind::Window { index: *index },
     }
