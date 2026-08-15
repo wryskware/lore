@@ -29,7 +29,9 @@
 
 mod query;
 mod schema;
-mod vector;
+/// Crate-visible so the embed worker can screen vectors with the *same*
+/// predicate the write path uses (see [`vector::is_usable`]).
+pub(crate) mod vector;
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -173,6 +175,10 @@ pub struct SearchHit {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmbedCandidate {
     pub project: ProjectId,
+    /// Storage-order key, monotonic per insertion. It is the paging cursor for
+    /// [`Store::chunks_missing_embeddings`], not a stable chunk identity —
+    /// `chunk.id` is that.
+    pub rowid: i64,
     pub chunk: Chunk,
 }
 
@@ -615,21 +621,33 @@ impl Store {
 
     // ---- embeddings -------------------------------------------------------
 
-    /// Next batch of chunks with no vector, oldest rowid first (so a large
+    /// One page of chunks with no vector, oldest rowid first (so a large
     /// backlog drains in insertion order and repeated calls make progress).
-    pub fn chunks_missing_embeddings(&self, limit: usize) -> Result<Vec<EmbedCandidate>> {
+    ///
+    /// `after` is an exclusive [`EmbedCandidate::rowid`] cursor. The caller
+    /// pages with it to walk *past* candidates it has decided to skip; without
+    /// a cursor a page full of skipped rows is indistinguishable from an empty
+    /// backlog, and everything behind it starves.
+    ///
+    /// A short page means the end of the missing set was reached.
+    pub fn chunks_missing_embeddings(
+        &self,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<EmbedCandidate>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {CHUNK_COLS} FROM chunks c
+            "SELECT {CHUNK_COLS}, c.id FROM chunks c
              LEFT JOIN embeddings e ON e.chunk_rowid = c.id
-             WHERE e.chunk_rowid IS NULL
+             WHERE e.chunk_rowid IS NULL AND c.id > ?
              ORDER BY c.id
              LIMIT ?"
         ))?;
-        let mut rows = stmt.query(params![limit as i64])?;
+        let mut rows = stmt.query(params![after, limit as i64])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             out.push(EmbedCandidate {
                 project: row.get(0)?,
+                rowid: row.get(11)?,
                 chunk: row_to_chunk(row)?,
             });
         }
