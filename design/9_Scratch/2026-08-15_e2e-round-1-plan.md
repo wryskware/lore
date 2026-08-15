@@ -73,14 +73,16 @@ first pass, cut to T1/T2/T4 (the most retrieval-sensitive) = 36 runs.
 
 ## Environment constraints
 
-- **No Unity editor GUI.** Lexomancy tasks are read/trace/audit plus at most
-  compile-and-test. Parent-verified: every csproj (including
-  `EncounterKernel.csproj`, `Lexomancy.BattleKernel.Tests.csproj`) is
-  Unity-generated (SDK-style, Unity analyzers), so plain `dotnet test` is
-  unlikely to work; the realistic headless route is Unity batchmode via the
-  `unity test` CLI (compiles + runs tests, no GUI). Prerequisite: confirm
-  that command empirically at harness setup; if even batchmode is
-  objectionable, T5 grading falls back to compile-only plus parent review.
+- **No Unity editor for benchmark agents.** Lexomancy tasks are
+  read/trace/audit plus at most compile-and-test. Luna-verified: the repo's
+  own policy says "Verify in Unity, never with `dotnet`"
+  (`Lexomancy/AGENTS.md:41–47`) — every csproj is Unity-generated and
+  `dotnet test` is explicitly not a correctness signal. The documented test
+  route is EditMode runs via the Unity CLI / MCP `run_tests` against a
+  connected Editor; a true standalone `-batchmode` invocation is
+  undocumented and unverified. Resolution: the benchmark *agent* never
+  touches Unity — it delivers a diff; the *grading harness* (us) runs the
+  EditMode suite against an editor we keep open at grading time.
 - **No browser.** qwen/opencode has no Chrome access (and codex runs won't
   get it either, for parity). No task may require visual verification or a
   running web app; terrarium grading is headless tests + CLI output only.
@@ -133,13 +135,16 @@ Repo root `~/Unity/Lexomancy`; code under `Lexomancy/Assets/Scripts/`,
 vault under `design/` (ledger: `design/0_Canon/DECISIONS.md`, D-0001–D-0016).
 ~33 KLoC C# across ~958 files — the scale case for the 128k arm.
 
-- T1: Trace a played word from the board to battle impact, naming file +
-  class at each hop. (Key: `Gameplay/WordplayScene/BoardCore/` →
-  `Gameplay/WordplayScene/Battle/SurgeCounterScoring.cs` →
-  `BattleKernel/Surge/SurgeState.cs` →
-  `BattleKernel/BattleSimulator.cs::Step` →
-  `EncounterKernel/Effects/Payloads/PayloadExecutor.cs` →
-  `BattleKernel/BattleUnit.cs`.)
+- T1: Trace a player Surge submission from the wordplay UI to battle
+  impact, naming file + class at each hop. (Key, luna-verified with lines:
+  `Gameplay/WordplayScene/Battle/BattleDirector.cs::SubmitSurgeAction`
+  (:287–301, accepts only while awaiting) → `PlayOut`/`AwaitSurgeAction`
+  hold (:327–340, 385–406) → `BattleKernel/BattleSimulator.cs::Step(SurgeAction)`
+  (:221–240, validates due-turn) → `StepInternal` (:240–284, timeline
+  advance, effects, telegraphs, `ActInteractive`) →
+  `EncounterKernel/Effects/Payloads/PayloadExecutor.cs` handlers →
+  `BattleKernel/BattleUnit.cs` state. Credit adjacent valid hops
+  (`SurgeCounterScoring`, `SurgeState`) on the scoring/commit side.)
 - T2: "What is the decided design for axiom capacity — do axioms cost Lexic
   Residue, and are there slots/tiers?" (Key, parent-verified: D-0006 —
   unlimited acquisition, fixed/unique, no capped-capacity machinery; D-0002 —
@@ -148,9 +153,15 @@ vault under `design/` (ledger: `design/0_Canon/DECISIONS.md`, D-0001–D-0016).
   frontmatter, states residue costs (line 20) and slots/tiers (§3), and both
   ledger entries *explicitly* supersede those sections ("Supersedes:
   [[1.6.5_Axioms]] §2 … §3–4"). Full credit = citing the ledger supersession;
-  citing 1.6.5 as authority fails. Bonus trap:
+  citing 1.6.5 as authority fails. Additional valid citations
+  (luna-verified): `1_GameSystems/1.6_ForgingSystem.md:39–51` (no
+  frontmatter, residue as primary forge resource) and
+  `6_UserInterface/6.1_Lexinomicon.md:42–44` (residue-cost forging tab,
+  self-declared predating the redesign). Bonus traps:
   `2.4_GuardianBattle_Surge.md` is `exploration`, partially superseded by
-  D-0015/D-0016 via inline callouts.)
+  D-0015/D-0016 via inline callouts; and `5.8_BoardEffectSubstrate_Stages.md`
+  / `5.9_PlayablePrototype_EchoUX.md` (both `leaning`) still call D-0004
+  presence-gating accepted although D-0007 superseded it.)
 - T3: "D-0002 says Lexic Residue does not exist. Audit the codebase: list
   every place that still references residue." (Key, parent-verified, 7
   files: `State/PlayerStats.cs` (full `Spend/GainLexonicResidue` API),
@@ -173,7 +184,11 @@ vault under `design/` (ledger: `design/0_Canon/DECISIONS.md`, D-0001–D-0016).
 - T5: Add one intermediate tiebreaker to `BattleKernel/TargetHeuristic.cs`
   (e.g. lowest shield percentage) between effective damage and HP fraction,
   RNG-free, no per-unit taunt state (D-0016 reserves that), with new cases
-  in `BattleKernel/Tests/AimAndTargetHeuristicTests.cs`. (~80 lines.)
+  in `BattleKernel/Tests/AimAndTargetHeuristicTests.cs`. (~80 lines.
+  Luna-verified alternates if a smaller seam is wanted:
+  `WildResolutionEngine.Shortlist` negative-`k` contract (:78–84, coverage
+  gap in `WildResolutionTests.cs:330–348`) or a D-0007 core-vs-socket
+  regression test in `Echoes/Tests/EchoFrameForgeTests.cs`.)
 
 ### latent-music-terrarium
 
@@ -184,25 +199,43 @@ vault under `design/` (ledger: `design/0_Canon/DECISIONS.md`, D-0001–D-0016).
   `sampler.ts::TimelineSampler.getChannel('stems')` →
   `mapping/stemfollow.ts::StemFollow.update`/`followMultiplier` →
   `sim/physarum/physarum.ts::uploadSpecies`.)
-- T2: "Does the web runtime consume the raw 1024-dim `embedding.json`
-  sidecar, and are `docs/handoff.md`'s 'non-negotiables' (reproducibility,
-  analytical fidelity) still binding?" (Key: no — plan.md Revision 4 dropped
-  runtime consumption in favor of the driver bank; the sidecar is still
-  *generated* for future learned mappings. handoff.md predates plan.md
-  Revision 1 and is historical; plan.md revised priorities 2026-08-06.)
+- T2: "Does the web runtime consume the raw 1024-dim embedding sidecar, and
+  are `docs/handoff.md`'s 'non-negotiables' (reproducibility, analytical
+  fidelity) still binding?" (Key, parent-verified: no runtime consumers —
+  `web/src` references it only in comments recording the removal
+  (`modulation.ts:318` "Revision 4 deleted the 11 MB raw-embedding sidecar
+  path", `loader.ts:29`, `types.ts:69`); analysis still optionally emits it.
+  handoff.md is historical one-song/one-sim scope; `docs/roadmap.md`
+  declares itself the "current sequencing authority" and plan.md's *later
+  revisions supersede its own earlier sections* — Revision 3's simplex
+  rejection sits *below* the original Decision 4 text it overrides, a
+  within-document modality trap. Bonus bait: `README.md`/`CLAUDE.md` still
+  say "placeholder repo, nothing implemented" over ~20 KLoC of shipped
+  code.)
 - T3: List every place in `web/src` that reads timeline channel or event
-  data after load. (Key: `mapping/modulation.ts::buildDriverBank`,
-  `mapping/stemfollow.ts`, `sim/impulses.ts::ImpulseEngine.onTick`,
-  `debug/overlay.ts`, `main.ts` glue; grade precision/recall.)
+  data after load. (Key, parent-verified: `main.ts` (tiles + advance loop +
+  segmentIndexAt), `debug/overlay.ts`, `runtime/sim-bundle.ts:165–173`
+  (setStemChannel/setAccentChannels/events), `sim/impulses.ts`
+  (EventCursor), `mapping/modulation.ts` (getChannel/segmentIndexAt),
+  `mapping/stemfollow.ts`, `export/worker.ts:556` (sampleAt), explore rig
+  via FeaturesFrame. Haiku's 5-item list missed export/, sim-bundle, and
+  explore — grade precision/recall against the full list.)
 - T4: "Why does modulation use a seeded random projection over a ~16-driver
-  bank instead of the raw embedding?" (Key: plan.md revision rationale —
-  variance-ordered, z-scored PCA drivers + structure channels; raw embedding
-  dropped from runtime.)
-- T5: Graceful fallback for malformed track metadata: if `timeline.json`
-  exists but manifest validation fails, construct a minimal valid manifest
-  (infer duration, skip segments) instead of failing the load chain.
-  (~40 lines; `web/src/timeline/catalog.ts` + `validate.ts`/`main.ts`;
-  add an unhappy-path test alongside `web/tests/catalog.test.ts`.)
+  bank instead of the raw embedding?" (Key, luna-verified: plan.md
+  Revision 3 — preset simplex "rejected by the user", replaced by seeded
+  random projection; Revision 4 — named driver bank replaces raw-embedding
+  modulation, which "reacts to everything and isolates nothing"
+  (`modulation.ts:15`).)
+- T5: Include WAV identity in the server track content version:
+  `analysis/src/terrarium_analysis/server.py::timeline_content_version`
+  hashes only the timeline json+bin while the export snapshot also serves
+  `audio.wav`; the current-state handoff flags this as lower-priority
+  hardening. Extend
+  `analysis/tests/test_server.py::test_version_changes_only_when_the_timeline_content_changes`.
+  (<100 lines, 2 files; luna-verified, headless via
+  `uv run --extra dev --extra server pytest -q`. Alternate if a TS-side
+  task is preferred: minimal-manifest fallback for failed timeline
+  validation — parent-unverified, check before use.)
 
 ### lore
 
@@ -232,6 +265,11 @@ vault under `design/` (ledger: `design/0_Canon/DECISIONS.md`, D-0001–D-0016).
    Lexomancy vault, then terrarium — shake out registration/indexing
    friction before any measured run.
 2. Verify opencode + ollama qwen3.8 wiring and the compaction workflow on a
-   throwaway prompt.
+   throwaway prompt. (Terrarium headless grading is already confirmed:
+   luna ran `web` node tests (442 pass) and `analysis` pytest (146 pass, 1
+   skip) with no browser.)
+   Scout evidence: haiku session reports + luna independent reports at
+   `~/Documents/codex/2026-08-15/scout-lexomancy-findings.md` and
+   `scout-terrarium-report.md`.
 3. Freeze task prompts + answer keys.
 4. Run the matrix; log per-run metrics into a results scratch doc.
