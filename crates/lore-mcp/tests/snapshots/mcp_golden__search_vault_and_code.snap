@@ -2,20 +2,27 @@
 source: crates/lore-mcp/tests/mcp_golden.rs
 expression: rendered
 ---
-2 result(s) for "how does expand work" (hybrid)
+3 result(s) for "how does expand work" (hybrid)
 
 [1] lore  design/4_Interfaces/4.1_MCP_Surface.md:15-18  score 0.874  [markdown]
     heading: MCP Tool Surface > v0.1 tools
     status: decided  refs: D-0007, D-0008
-    chunk_id: 9f3a1c2b7e
+    project_key: lore  chunk_id: 9f3a1c2b7e
 - **`search`** - one unified hybrid query. Filters: project, path glob,
   language, vault status.
 
 [2] lexomancy  Assets/Scripts/Board.cs:120-141  score 0.612  [csharp]
     symbol: Board.Update
-    chunk_id: 4e77ba0193
+    project_key: lexomancy  chunk_id: 4e77ba0193
 void Update()
 {
     if (!_dirty) return;
     Rebuild();
-    (excerpt truncated - expand project="lexomancy" chunk_id="4e77ba0193" for the full text)
+    (excerpt truncated - expand project_key="lexomancy" chunk_id="4e77ba0193" for the full text)
+
+[3] lore  design/9_Scratch/2026-08-14_notes.md:3-9  score 0.410  [markdown]
+    heading: Ranking rewrite
+    status: decided  refs: D-0007
+    authority: deprecated - 9_Scratch path cap
+    project_key: lore  chunk_id: 1c0ffee042
+Per D-0007 the daemon owns index state, so ranking should...

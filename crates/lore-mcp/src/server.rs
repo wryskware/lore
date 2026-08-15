@@ -23,9 +23,15 @@ use crate::render;
 // Spelled out as an enum rather than free strings so the vocabulary reaches the
 // agent in the tool schema instead of having to be guessed. NOTE: this doc
 // comment is agent-facing — schemars copies it into the JSON Schema.
-/// How settled a design document is. `decided` is settled canon; `leaning` and
+/// How settled a design document *declares* itself to be. `decided` means
+/// validated canon: Lore honors it only when the document cites a decision
+/// that is still active in the project's ledger, and demotes it otherwise
+/// (the result then carries an `authority note` saying so). `leaning` and
 /// `exploration` record thinking that is not binding; `deprecated` has been
 /// superseded; `unclassified` means the document declares no status at all.
+/// Note that this filters on the declaration, not on the authority Lore
+/// actually assigns — scratch and research material is demoted by path
+/// whatever it declares.
 #[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum StatusFilter {
@@ -88,6 +94,10 @@ impl From<SearchParams> for SearchRequest {
                 .into_iter()
                 .map(|status| status.as_wire().to_string())
                 .collect(),
+            // Not exposed as a tool parameter: every corpus a v1 daemon can
+            // hold is a repo, so a filter for it would be a knob with one
+            // setting. It arrives with the session ledger at M3.
+            sources: None,
             limit: params.limit,
         }
     }
@@ -95,8 +105,16 @@ impl From<SearchParams> for SearchRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ExpandParams {
-    #[schemars(description = "Project name exactly as it appeared in the search result.")]
-    pub project: String,
+    #[schemars(
+        description = "project_key exactly as it appeared in the search result. Prefer this \
+                       over `project`: it identifies the source unambiguously."
+    )]
+    pub project_key: Option<String>,
+    #[schemars(
+        description = "Project display name, for hand-typed calls. Ignored when project_key \
+                       is given, and ambiguous if two indexed projects share a name."
+    )]
+    pub project: Option<String>,
     #[schemars(description = "chunk_id from the search result you want to read.")]
     pub chunk_id: String,
     #[schemars(
@@ -129,10 +147,15 @@ impl LoreServer {
     #[tool(
         description = "Hybrid lexical+semantic search over the code projects and design vaults \
                        indexed on this machine. Each hit carries provenance (file, line span, \
-                       symbol path for code, heading path for Markdown) and vault authority \
-                       (decided / leaning / exploration / deprecated) with the decision IDs it \
-                       cites - prefer `decided` sources when documents disagree. Excerpts are \
-                       truncated; call `expand` with a hit's project and chunk_id to read it."
+                       symbol path for code, heading path for Markdown), the status the \
+                       document declares, and the authority Lore actually assigns it. Those \
+                       differ on purpose: `decided` is honored only when the document cites a \
+                       decision still active in the project's ledger, and scratch/research \
+                       paths are capped whatever they declare - a demoted hit says why in its \
+                       authority note. Prefer sources whose *effective* authority is `decided` \
+                       when documents disagree; cited decision IDs are provenance, not \
+                       authority. Excerpts are truncated; call `expand` with a hit's \
+                       project_key and chunk_id to read it."
     )]
     async fn search(&self, Parameters(params): Parameters<SearchParams>) -> CallToolResult {
         let query = params.query.clone();
@@ -148,13 +171,19 @@ impl LoreServer {
                        not quote or edit code from a search result without expanding it first."
     )]
     async fn expand(&self, Parameters(params): Parameters<ExpandParams>) -> CallToolResult {
+        let label = params
+            .project
+            .clone()
+            .or_else(|| params.project_key.clone())
+            .unwrap_or_default();
         let request = ExpandRequest {
-            project: params.project,
+            project: params.project.unwrap_or_default(),
+            project_key: params.project_key,
             chunk_id: params.chunk_id,
             context_lines: params.context_lines,
         };
         match self.client.expand(&request).await {
-            Ok(response) => text(render::expand(&request.project, &response)),
+            Ok(response) => text(render::expand(&label, &response)),
             Err(err) => failed(&err),
         }
     }
@@ -198,9 +227,12 @@ impl ServerHandler for LoreServer {
             .with_instructions(
                 "Lore indexes this machine's code projects and design vaults locally. Search it \
                  before answering questions about this codebase or about past design decisions, \
-                 and prefer sources marked `decided` over prose that merely sounds confident. \
-                 Registering projects and forcing a reindex are deliberately not available here: \
-                 ask the user to run `lore add <path>` or `lore index`.",
+                 and prefer sources whose effective authority is `decided` over prose that \
+                 merely sounds confident - a document declaring itself decided has not earned \
+                 that unless Lore validated it against the project's decision ledger, and it \
+                 will say so when it did not. Registering projects and forcing a reindex are \
+                 deliberately not available here: ask the user to run `lore add <path>` or \
+                 `lore index`.",
             )
     }
 }
@@ -299,7 +331,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("no description for {name}"))
                 .to_string()
         };
-        assert!(described("search").contains("prefer `decided`"));
+        assert!(described("search").contains("effective* authority is `decided`"));
+        // The declared/effective split has to reach the agent in the schema,
+        // not only in the payload it is about to misread.
+        assert!(described("search").contains("still active in the project's ledger"));
         assert!(described("expand").contains("truncated"));
         assert!(described("status").contains("lexical-only"));
     }

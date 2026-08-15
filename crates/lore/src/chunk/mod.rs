@@ -23,6 +23,10 @@ pub use common::{
     TEXT_WINDOW_MAX_BYTES, TINY_CHUNK_BYTES, WINDOW_OVERLAP_LINES,
 };
 
+/// `D-NNNN` extraction, shared with [`crate::authority`]'s ledger parser so
+/// the two agree on what a decision reference looks like.
+pub(crate) use common::decision_refs;
+
 use crate::types::Chunk;
 
 /// Bump whenever chunking policy changes in a way that should re-chunk

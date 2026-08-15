@@ -7,7 +7,7 @@ use rusqlite_migration::{M, Migrations};
 
 /// Ordered migration list. Index + 1 == `user_version` after application.
 pub(crate) fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(V1)])
+    Migrations::new(vec![M::up(V1), M::up(V2)])
 }
 
 /// v1 — initial schema.
@@ -129,4 +129,62 @@ CREATE TABLE meta (
     embedding_fingerprint TEXT
 );
 INSERT INTO meta (id, generation, embedding_fingerprint) VALUES (1, 0, NULL);
+"#;
+
+/// v2 — declared vs effective authority, source provenance, stable keys.
+///
+/// Three independent review findings land in one migration because they touch
+/// the same two tables and a migration boundary is not free:
+///
+/// - **S1#2 (authority laundering).** `chunks.authority_tier` keeps its
+///   meaning — the tier a document *declares* — and is still what `status`
+///   filters read. `effective_tier` is what ranking and `min_authority` read:
+///   the declared tier after ledger validation and path/source ceilings (see
+///   [`crate::authority`]). `demotion` records *why* they differ, as a stable
+///   code rather than prose so the note can be reworded without a migration.
+///   `project_decisions` persists the active-decision set parsed out of each
+///   project's `**/0_Canon/DECISIONS.md`, which is the one input the effective
+///   tier cannot derive from the chunk row alone — and having it stored is
+///   what makes the recompute pass a pure store operation (no re-chunk, no
+///   re-embed, chunk ids untouched).
+/// - **S1#5 (provenance).** `projects.kind` turns the project table into a
+///   source registry (`repo` today, `session` at M3, `issue` later);
+///   `files.source_ts` is the source-declared timestamp the M3 recency term
+///   will read. No CHECK constraint on `kind` on purpose: the vocabulary is
+///   expected to grow, and a CHECK would make adding `issue` a table rebuild.
+///   Unknown values read back as `repo`.
+/// - **S1#3/S1#7 (identity).** `projects.key` is the stable opaque handle that
+///   search results round-trip instead of a non-unique display name. SQLite
+///   cannot `ADD COLUMN ... UNIQUE`, so uniqueness is a separate index; that
+///   also allows the NULLs existing rows start with, which startup
+///   reconciliation backfills (`crate::registry`).
+///
+/// The `effective_tier` backfill here is deliberately only an approximation
+/// (declared == effective). The real values need each project's ledger, which
+/// lives on disk, so the daemon recomputes on its first pass over every
+/// project. Seeding the column with the declared tier means a daemon that
+/// somehow never recomputes still ranks exactly as v1 did, rather than
+/// flattening every document to a default.
+///
+/// `chunks_demoted` is partial: demotions are a small minority of rows, and
+/// `status` asks "which files in this project are violating?" on every call.
+const V2: &str = r#"
+ALTER TABLE chunks ADD COLUMN effective_tier INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE chunks ADD COLUMN demotion TEXT;
+UPDATE chunks SET effective_tier = authority_tier;
+
+CREATE INDEX chunks_by_effective ON chunks(project_id, effective_tier);
+CREATE INDEX chunks_demoted ON chunks(project_id, demotion) WHERE demotion IS NOT NULL;
+
+CREATE TABLE project_decisions (
+    project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    decision_id TEXT NOT NULL,
+    PRIMARY KEY (project_id, decision_id)
+) WITHOUT ROWID;
+
+ALTER TABLE projects ADD COLUMN kind TEXT NOT NULL DEFAULT 'repo';
+ALTER TABLE projects ADD COLUMN key TEXT;
+CREATE UNIQUE INDEX projects_by_key ON projects(key);
+
+ALTER TABLE files ADD COLUMN source_ts INTEGER;
 "#;

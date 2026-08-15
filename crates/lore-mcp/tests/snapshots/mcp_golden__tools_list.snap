@@ -3,7 +3,7 @@ source: crates/lore-mcp/tests/mcp_golden.rs
 expression: rendered
 ---
 {
-  "instructions": "Lore indexes this machine's code projects and design vaults locally. Search it before answering questions about this codebase or about past design decisions, and prefer sources marked `decided` over prose that merely sounds confident. Registering projects and forcing a reindex are deliberately not available here: ask the user to run `lore add <path>` or `lore index`.",
+  "instructions": "Lore indexes this machine's code projects and design vaults locally. Search it before answering questions about this codebase or about past design decisions, and prefer sources whose effective authority is `decided` over prose that merely sounds confident - a document declaring itself decided has not earned that unless Lore validated it against the project's decision ledger, and it will say so when it did not. Registering projects and forcing a reindex are deliberately not available here: ask the user to run `lore add <path>` or `lore index`.",
   "tools": [
     {
       "description": "Read a search hit in full, plus surrounding context lines. This is the 'now actually read it' step: search returns truncated excerpts, so do not quote or edit code from a search result without expanding it first.",
@@ -24,12 +24,21 @@ expression: rendered
             ]
           },
           "project": {
-            "description": "Project name exactly as it appeared in the search result.",
-            "type": "string"
+            "description": "Project display name, for hand-typed calls. Ignored when project_key is given, and ambiguous if two indexed projects share a name.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_key": {
+            "description": "project_key exactly as it appeared in the search result. Prefer this over `project`: it identifies the source unambiguously.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
-          "project",
           "chunk_id"
         ],
         "type": "object"
@@ -37,11 +46,11 @@ expression: rendered
       "name": "expand"
     },
     {
-      "description": "Hybrid lexical+semantic search over the code projects and design vaults indexed on this machine. Each hit carries provenance (file, line span, symbol path for code, heading path for Markdown) and vault authority (decided / leaning / exploration / deprecated) with the decision IDs it cites - prefer `decided` sources when documents disagree. Excerpts are truncated; call `expand` with a hit's project and chunk_id to read it.",
+      "description": "Hybrid lexical+semantic search over the code projects and design vaults indexed on this machine. Each hit carries provenance (file, line span, symbol path for code, heading path for Markdown), the status the document declares, and the authority Lore actually assigns it. Those differ on purpose: `decided` is honored only when the document cites a decision still active in the project's ledger, and scratch/research paths are capped whatever they declare - a demoted hit says why in its authority note. Prefer sources whose *effective* authority is `decided` when documents disagree; cited decision IDs are provenance, not authority. Excerpts are truncated; call `expand` with a hit's project_key and chunk_id to read it.",
       "inputSchema": {
         "$defs": {
           "StatusFilter": {
-            "description": "How settled a design document is. `decided` is settled canon; `leaning` and\n`exploration` record thinking that is not binding; `deprecated` has been\nsuperseded; `unclassified` means the document declares no status at all.",
+            "description": "How settled a design document *declares* itself to be. `decided` means\nvalidated canon: Lore honors it only when the document cites a decision\nthat is still active in the project's ledger, and demotes it otherwise\n(the result then carries an `authority note` saying so). `leaning` and\n`exploration` record thinking that is not binding; `deprecated` has been\nsuperseded; `unclassified` means the document declares no status at all.\nNote that this filters on the declaration, not on the authority Lore\nactually assigns — scratch and research material is demoted by path\nwhatever it declares.",
             "enum": [
               "exploration",
               "leaning",

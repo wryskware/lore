@@ -25,9 +25,10 @@ use std::collections::{HashMap, HashSet};
 
 use lore_core::{SearchRequest, SearchResponse, SearchResult};
 
+use crate::authority::Authority;
 use crate::embed::text::{WINDOW_MARKER, is_discriminator, strip_discriminators};
-use crate::store::{ProjectId, SearchFilter, SearchHit, StatusFilter, Store};
-use crate::types::{Chunk, ChunkKind, DesignStatus, authority_tier};
+use crate::store::{Project, ProjectId, SearchFilter, SearchHit, StatusFilter, Store};
+use crate::types::{Chunk, ChunkKind, DesignStatus, SourceKind};
 
 /// Results returned when the caller does not ask for a specific number.
 pub const DEFAULT_LIMIT: u32 = 20;
@@ -53,20 +54,23 @@ pub const VECTOR_CANDIDATES: usize = 50;
 /// list matter without letting rank 1 dominate rank 3.
 pub const RRF_K: f64 = 60.0;
 
-// Vault-authority multipliers, applied *after* fusion (3.1 step 2).
+// Vault-authority multipliers, applied *after* fusion (3.1 step 2), keyed by
+// the **effective** tier (`crate::authority`) rather than the declared one.
 //
 // The **ordering** — decided > leaning > exploration/unclassified >
 // deprecated — is the canon requirement (3.1, and `types::authority_tier`).
 // These exact numbers are tuning: they are deliberately gentle, so authority
 // breaks ties and lifts a near-miss, and never resurrects an irrelevant
 // document. Expect them to move during dogfooding.
-/// `decided` — ratified material.
+/// Effective tier 3 — validated `decided`, and the ledger itself.
 pub const AUTHORITY_DECIDED: f64 = 1.15;
-/// `leaning`, and unclassified-but-ledger-cited.
+/// Effective tier 2 — `leaning`.
 pub const AUTHORITY_LEANING: f64 = 1.05;
-/// `exploration`, unclassified, and all non-vault (code) chunks.
+/// Effective tier 1 — `exploration`, unclassified, non-vault (code) chunks,
+/// `7_Research`, and any declaration that failed validation.
 pub const AUTHORITY_NEUTRAL: f64 = 1.0;
-/// `deprecated` — still searchable, deliberately demoted.
+/// Effective tier 0 — `deprecated` and `9_Scratch`: still searchable,
+/// deliberately demoted.
 pub const AUTHORITY_DEPRECATED: f64 = 0.7;
 
 #[derive(Debug, thiserror::Error)]
@@ -77,6 +81,8 @@ pub enum SearchError {
         "unknown design status `{0}` (expected exploration, leaning, decided, deprecated or unclassified)"
     )]
     UnknownStatus(String),
+    #[error("unknown source kind `{0}` (expected repo or session)")]
+    UnknownSource(String),
     #[error(transparent)]
     Store(#[from] crate::store::StoreError),
 }
@@ -97,8 +103,7 @@ pub fn execute(
     query_vector: Option<&[f32]>,
 ) -> Result<SearchResponse, SearchError> {
     let projects = store.list_projects()?;
-    let names: HashMap<ProjectId, String> =
-        projects.iter().map(|p| (p.id, p.name.clone())).collect();
+    let sources: HashMap<ProjectId, Project> = projects.iter().map(|p| (p.id, p.clone())).collect();
 
     let mut filter = SearchFilter::default();
     if let Some(key) = &request.project {
@@ -118,6 +123,14 @@ pub fn execute(
             .map(|s| parse_status(s).ok_or_else(|| SearchError::UnknownStatus(s.clone())))
             .collect::<Result<Vec<_>, _>>()?;
         filter.statuses = Some(statuses);
+    }
+    if let Some(sources) = &request.sources {
+        filter.source_kinds = Some(
+            sources
+                .iter()
+                .map(|s| SourceKind::parse(s).ok_or_else(|| SearchError::UnknownSource(s.clone())))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
     }
 
     let limit = request.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
@@ -147,7 +160,10 @@ pub fn execute(
     let lexical_only = vector.is_empty();
     let hits = fuse(vec![lexical, vector], limit);
 
-    let results = hits.into_iter().map(|hit| to_result(&names, hit)).collect();
+    let results = hits
+        .into_iter()
+        .map(|hit| to_result(&sources, hit))
+        .collect();
     Ok(SearchResponse {
         results,
         lexical_only,
@@ -158,6 +174,7 @@ pub fn execute(
 struct Candidate {
     project: ProjectId,
     chunk: Chunk,
+    authority: Authority,
     /// Σ over the lists this chunk appears in.
     rrf: f64,
 }
@@ -187,6 +204,7 @@ fn fuse(lists: Vec<Vec<SearchHit>>, limit: usize) -> Vec<SearchHit> {
                     candidates.push(Candidate {
                         project: hit.project,
                         chunk: hit.chunk,
+                        authority: hit.authority,
                         rrf: contribution,
                     });
                 }
@@ -198,7 +216,7 @@ fn fuse(lists: Vec<Vec<SearchHit>>, limit: usize) -> Vec<SearchHit> {
         .into_iter()
         .map(|candidate| {
             (
-                candidate.rrf * authority_weight(&candidate.chunk),
+                candidate.rrf * authority_weight(candidate.authority.tier),
                 candidate,
             )
         })
@@ -233,6 +251,7 @@ fn fuse(lists: Vec<Vec<SearchHit>>, limit: usize) -> Vec<SearchHit> {
         out.push(SearchHit {
             project: candidate.project,
             chunk: candidate.chunk,
+            authority: candidate.authority,
             score: score as f32,
         });
     }
@@ -263,30 +282,23 @@ fn collapse_anchor(chunk: &Chunk) -> String {
     }
 }
 
-/// The 3.1 vault-status modifier.
+/// The 3.1 vault-status modifier, over the **effective** tier.
 ///
-/// One deliberate refinement: an *unclassified* chunk that cites decisions is
-/// weighted as `leaning` rather than as unclassified. 3.1 ranks
-/// "`decided`/ledger-cited" together, and a document quoting D-0007 is
-/// answering from the ledger whether or not anyone wrote frontmatter on it.
-/// Code chunks have no vault metadata at all and stay neutral.
-fn authority_weight(chunk: &Chunk) -> f64 {
-    let status = chunk.vault.as_ref().and_then(|vault| vault.design_status);
-    if status.is_none() && cites_decisions(chunk) {
-        return AUTHORITY_LEANING;
-    }
-    match authority_tier(status) {
+/// It used to read the declared status directly, with one "refinement": an
+/// unclassified chunk that cited *any* `D-NNNN` was weighted as `leaning`.
+/// That was the laundering vector the review found (S1#2) — scratch notes
+/// quote decision numbers constantly — and it is gone. Citations are still
+/// reported on every result; they simply buy nothing. Everything the tier
+/// encodes (ledger validation, path ceilings, the ledger pin, the session cap)
+/// happened at index time in [`crate::authority`], so ranking stays a table
+/// lookup.
+fn authority_weight(effective_tier: u8) -> f64 {
+    match effective_tier {
         3 => AUTHORITY_DECIDED,
         2 => AUTHORITY_LEANING,
         0 => AUTHORITY_DEPRECATED,
         _ => AUTHORITY_NEUTRAL,
     }
-}
-
-fn cites_decisions(chunk: &Chunk) -> bool {
-    chunk.vault.as_ref().is_some_and(|vault| {
-        !vault.decision_refs.is_empty() || !vault.body_decision_refs.is_empty()
-    })
 }
 
 fn parse_status(status: &str) -> Option<StatusFilter> {
@@ -300,7 +312,8 @@ fn parse_status(status: &str) -> Option<StatusFilter> {
     })
 }
 
-fn to_result(names: &HashMap<ProjectId, String>, hit: SearchHit) -> SearchResult {
+fn to_result(sources: &HashMap<ProjectId, Project>, hit: SearchHit) -> SearchResult {
+    let source = sources.get(&hit.project);
     let chunk = hit.chunk;
     let (symbol_path, heading_path) = match &chunk.kind {
         ChunkKind::Code { symbol_path, .. } => (Some(symbol_path.clone()), None),
@@ -318,10 +331,10 @@ fn to_result(names: &HashMap<ProjectId, String>, hit: SearchHit) -> SearchResult
 
     SearchResult {
         chunk_id: chunk.id.0,
-        project: names
-            .get(&hit.project)
-            .cloned()
+        project: source
+            .map(|source| source.name.clone())
             .unwrap_or_else(|| hit.project.to_string()),
+        project_key: source.map(|source| source.key.clone()).unwrap_or_default(),
         path: chunk.path.into_string(),
         line_start: chunk.line_start,
         line_end: chunk.line_end,
@@ -329,6 +342,11 @@ fn to_result(names: &HashMap<ProjectId, String>, hit: SearchHit) -> SearchResult
         symbol_path,
         heading_path,
         design_status: design_status.map(str::to_string),
+        effective_authority: hit.authority.label().to_string(),
+        authority_note: hit
+            .authority
+            .demotion
+            .map(|demotion| demotion.note().to_string()),
         decision_refs,
         score: f64::from(hit.score),
         excerpt,
@@ -369,12 +387,27 @@ fn status_label(status: DesignStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Chunk, ChunkId, VaultMeta};
+    use crate::authority::Demotion;
+    use crate::types::{Chunk, ChunkId, VaultMeta, authority_tier};
     use camino::Utf8PathBuf;
 
     /// `id` is what ties a chunk together across the two ranked lists, so the
     /// helper takes it explicitly.
     fn hit(id: &str, path: &str, kind: ChunkKind, vault: Option<VaultMeta>) -> SearchHit {
+        at_tier(id, path, kind, vault, authority_tier(None))
+    }
+
+    /// A hit whose *effective* tier is stated outright — which is how the
+    /// store hands it over. Deriving it from the vault metadata here would
+    /// re-implement the policy inside its own test; the policy itself is
+    /// covered in `crate::authority`.
+    fn at_tier(
+        id: &str,
+        path: &str,
+        kind: ChunkKind,
+        vault: Option<VaultMeta>,
+        tier: u8,
+    ) -> SearchHit {
         SearchHit {
             project: 1,
             chunk: Chunk {
@@ -388,6 +421,10 @@ mod tests {
                 line_end: 1,
                 text: format!("body of {id}"),
                 vault,
+            },
+            authority: Authority {
+                tier,
+                demotion: None,
             },
             // Deliberately meaningless: fusion must use ranks, not scores.
             score: 0.0,
@@ -446,53 +483,65 @@ mod tests {
     }
 
     #[test]
-    fn authority_orders_equal_ranks_by_vault_status() {
-        use DesignStatus::*;
+    fn authority_orders_equal_ranks_by_effective_tier() {
         // Every chunk is rank 1 of its own list, so fusion scores are equal
         // and only the authority multiplier can separate them.
         let lists: Vec<Vec<SearchHit>> = [
-            ("deprecated", vault(Some(Deprecated), &[])),
-            ("exploration", vault(Some(Exploration), &[])),
-            ("decided", vault(Some(Decided), &[])),
-            ("leaning", vault(Some(Leaning), &[])),
-            ("code", None),
-            ("cited", vault(None, &["D-0007"])),
+            ("deprecated", 0),
+            ("neutral", 1),
+            ("decided", 3),
+            ("leaning", 2),
         ]
         .into_iter()
-        .map(|(id, meta)| vec![hit(id, &format!("{id}.md"), section(id), meta)])
+        .map(|(id, tier)| vec![at_tier(id, &format!("{id}.md"), section(id), None, tier)])
         .collect();
 
         let fused = fuse(lists, 10);
-        let order = ids(&fused);
-        let rank = |id: &str| order.iter().position(|found| *found == id).unwrap();
+        assert_eq!(ids(&fused), ["decided", "leaning", "neutral", "deprecated"]);
+    }
 
-        assert_eq!(order[0], "decided", "{order:?}");
-        assert!(rank("leaning") < rank("exploration"), "{order:?}");
-        assert!(rank("exploration") < rank("deprecated"), "{order:?}");
-        assert_eq!(*order.last().unwrap(), "deprecated", "{order:?}");
-        // Unclassified-but-ledger-cited ranks with `leaning`, above plain
-        // exploration; a code chunk with no vault metadata stays neutral.
-        assert!(rank("cited") < rank("exploration"), "{order:?}");
-        assert!(rank("code") < rank("deprecated"), "{order:?}");
-        assert!(rank("leaning") < rank("code"), "{order:?}");
+    /// The laundering vector, at the ranking layer: a chunk that quotes
+    /// decisions used to be lifted to `leaning` purely for quoting them. The
+    /// multiplier now reads one number, and citations are inert.
+    #[test]
+    fn citations_no_longer_move_a_chunk_at_all() {
+        use DesignStatus::*;
+        let cited = at_tier(
+            "cited",
+            "design/9_Scratch/notes.md",
+            section("Notes"),
+            vault(None, &["D-0007", "D-0003"]),
+            authority_tier(None),
+        );
+        let plain = at_tier(
+            "plain",
+            "src/lib.rs",
+            section("Plain"),
+            None,
+            authority_tier(None),
+        );
+        assert_eq!(
+            authority_weight(cited.authority.tier),
+            authority_weight(plain.authority.tier)
+        );
+        // …and a *declared* status the store already refused still ranks where
+        // the store put it, not where the frontmatter asked.
+        let refused = at_tier(
+            "refused",
+            "design/x.md",
+            section("X"),
+            vault(Some(Decided), &[]),
+            crate::authority::UNCITED_DECIDED_TIER,
+        );
+        assert_eq!(authority_weight(refused.authority.tier), AUTHORITY_NEUTRAL);
     }
 
     #[test]
     fn authority_weights_match_the_documented_tiers() {
-        use DesignStatus::*;
-        let weight = |meta| authority_weight(&hit("x", "x.md", section("X"), meta).chunk);
-        assert_eq!(weight(vault(Some(Decided), &[])), AUTHORITY_DECIDED);
-        assert_eq!(weight(vault(Some(Leaning), &[])), AUTHORITY_LEANING);
-        assert_eq!(weight(vault(Some(Exploration), &[])), AUTHORITY_NEUTRAL);
-        assert_eq!(weight(vault(Some(Deprecated), &[])), AUTHORITY_DEPRECATED);
-        assert_eq!(weight(None), AUTHORITY_NEUTRAL);
-        assert_eq!(weight(vault(None, &[])), AUTHORITY_NEUTRAL);
-        assert_eq!(weight(vault(None, &["D-0003"])), AUTHORITY_LEANING);
-        // A cited *deprecated* document is still deprecated.
-        assert_eq!(
-            weight(vault(Some(Deprecated), &["D-0003"])),
-            AUTHORITY_DEPRECATED
-        );
+        assert_eq!(authority_weight(3), AUTHORITY_DECIDED);
+        assert_eq!(authority_weight(2), AUTHORITY_LEANING);
+        assert_eq!(authority_weight(1), AUTHORITY_NEUTRAL);
+        assert_eq!(authority_weight(0), AUTHORITY_DEPRECATED);
     }
 
     #[test]
@@ -568,6 +617,58 @@ mod tests {
 
         let short = "fn main() {}";
         assert_eq!(excerpt(short), (short.to_string(), false));
+    }
+
+    /// The wire has to carry *both* readings of authority, and the note only
+    /// when they disagree — an agent that cannot see the disagreement will
+    /// trust the declaration.
+    #[test]
+    fn results_report_declared_and_effective_authority_separately() {
+        let sources: HashMap<ProjectId, Project> = [(
+            1,
+            Project {
+                id: 1,
+                root: camino::Utf8PathBuf::from(r"C:\repos\lore"),
+                name: "lore".into(),
+                key: "lore".into(),
+                kind: SourceKind::Repo,
+            },
+        )]
+        .into_iter()
+        .collect();
+
+        let mut demoted = at_tier(
+            "x",
+            "design/9_Scratch/notes.md",
+            section("Notes"),
+            vault(Some(DesignStatus::Decided), &["D-0007"]),
+            0,
+        );
+        demoted.authority.demotion = Some(Demotion::ScratchPath);
+        let result = to_result(&sources, demoted);
+        assert_eq!(result.project, "lore");
+        assert_eq!(result.project_key, "lore");
+        assert_eq!(result.design_status.as_deref(), Some("decided"));
+        assert_eq!(result.effective_authority, "deprecated");
+        assert_eq!(result.authority_note.as_deref(), Some("9_Scratch path cap"));
+        // Citations survive as metadata even though they earn nothing.
+        assert_eq!(result.decision_refs, ["D-0007"]);
+
+        let honest = to_result(
+            &sources,
+            at_tier(
+                "y",
+                "design/1.1.md",
+                section("Overview"),
+                vault(Some(DesignStatus::Decided), &["D-0007"]),
+                3,
+            ),
+        );
+        assert_eq!(honest.effective_authority, "decided");
+        assert_eq!(
+            honest.authority_note, None,
+            "no note when nothing was demoted"
+        );
     }
 
     #[test]

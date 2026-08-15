@@ -38,9 +38,47 @@ pub enum DesignStatus {
     Deprecated,
 }
 
-/// Ranking authority tier (higher = more authoritative). Ordering is the
-/// canon requirement (3.1): decided > leaning > exploration/unclassified
-/// > deprecated. Exact weights derived from tiers are tuning.
+/// What kind of corpus a source (a row in `projects`) is.
+///
+/// `repo` is everything v1 indexes. `session` is the tier-2 session ledger
+/// (D-0006/D-0008), whose writer lands at M3 — the field exists now so the
+/// schema, the store filter seam and the ranking cap can be expressed without
+/// another migration. `issue` is expected later; unknown spellings read back
+/// as `Repo` rather than failing an index pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceKind {
+    #[default]
+    Repo,
+    Session,
+}
+
+impl SourceKind {
+    /// Canonical on-disk / on-the-wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SourceKind::Repo => "repo",
+            SourceKind::Session => "session",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Some(match text {
+            "repo" => SourceKind::Repo,
+            "session" => SourceKind::Session,
+            _ => return None,
+        })
+    }
+}
+
+/// **Declared** ranking authority tier (higher = more authoritative), derived
+/// from frontmatter alone. Ordering is the canon requirement (3.1):
+/// decided > leaning > exploration/unclassified > deprecated. Exact weights
+/// derived from tiers are tuning.
+///
+/// This is what a document *claims*. What ranking actually uses is
+/// [`crate::authority::effective`], which validates the claim against the
+/// project's ledger and the file's path.
 pub fn authority_tier(status: Option<DesignStatus>) -> u8 {
     match status {
         Some(DesignStatus::Decided) => 3,

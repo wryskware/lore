@@ -28,8 +28,9 @@ use camino::{Utf8Path, Utf8PathBuf};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
+use crate::authority::{Demotion, is_ledger_path, parse_ledger};
 use crate::chunk::{FileChunks, chunk_file};
-use crate::store::{FileWrite, Project, StoreError};
+use crate::store::{FileWrite, Project, Recompute, StoreError};
 
 use super::queue::{IndexQueue, ProjectWork};
 use super::store_handle::StoreHandle;
@@ -79,6 +80,12 @@ pub struct PassSummary {
     pub chunks_deleted: usize,
     /// Files that could not be read or written; the pass continues.
     pub errors: usize,
+    /// Files whose effective authority was rewritten by the recompute pass
+    /// (a ledger edit changed what `decided` is allowed to mean).
+    pub authority_recomputed: usize,
+    /// Files declaring `decided` without citing an active decision, as of the
+    /// end of this pass.
+    pub authority_violations: usize,
     /// True when the pass stopped early because shutdown was requested.
     pub cancelled: bool,
 }
@@ -125,6 +132,11 @@ pub fn full_scan(ctx: &IndexContext, project: &Project) -> PassSummary {
 
     if !summary.cancelled {
         prune_missing(ctx, project, &seen, &mut summary);
+        // Unconditional on a full scan: this is also the migration/startup
+        // backfill path, where the stored effective tiers may be the V2
+        // migration's declared-tier approximation and the active-decision set
+        // may never have been parsed at all.
+        refresh_authority(ctx, project, true, &mut summary);
     }
 
     finish(ctx, project, "full_scan", started, &summary);
@@ -224,10 +236,134 @@ pub fn index_paths(
 
     if !summary.cancelled {
         remove_paths_and_subtrees(ctx, project, &to_remove, &mut summary);
+        // Only when this batch touched a ledger. Every *other* file already
+        // got its effective tier stamped on write; re-deriving the whole
+        // project because one source file changed would be pure waste.
+        let ledger_touched = to_index
+            .iter()
+            .chain(to_remove.iter())
+            .any(|rel| is_ledger_path(rel));
+        if ledger_touched {
+            refresh_authority(ctx, project, false, &mut summary);
+        }
     }
 
     finish(ctx, project, "incremental", started, &summary);
     summary
+}
+
+/// Re-read the project's ledger, and rebuild every effective tier if that
+/// changed what counts as canon (or if `force`, which is how a full scan
+/// doubles as the migration/startup backfill).
+///
+/// The ledger is read from **disk**, not reassembled from its chunks: chunk
+/// text is a verbatim slice but the chunker splits and trims, and parsing a
+/// reassembly of the thing that defines canon is exactly where a subtle
+/// mis-parse would be least visible.
+///
+/// A project may legitimately have more than one ledger (two vaults in one
+/// repo); their active sets are unioned, because a document citing either
+/// ledger is citing an active decision *of this project*.
+fn refresh_authority(
+    ctx: &IndexContext,
+    project: &Project,
+    force: bool,
+    summary: &mut PassSummary,
+) {
+    let files = match ctx.store.blocking(|store| store.list_files(project.id)) {
+        Ok(files) => files,
+        Err(err) => {
+            tracing::warn!(project = %project.name, error = %err, "listing files for the ledger scan failed");
+            summary.errors += 1;
+            return;
+        }
+    };
+
+    let mut active: BTreeSet<String> = BTreeSet::new();
+    let mut ledgers = 0usize;
+    for record in files.iter().filter(|f| is_ledger_path(&f.path)) {
+        ledgers += 1;
+        match std::fs::read_to_string(project.root.join(&record.path)) {
+            Ok(text) => active.extend(parse_ledger(&text)),
+            Err(err) => {
+                // The set stays as-is for this ledger rather than collapsing:
+                // an unreadable file is a transient condition, and treating it
+                // as "no decisions are active" would mass-demote the vault.
+                tracing::warn!(
+                    project = %project.name,
+                    path = %record.path,
+                    error = %err,
+                    "decision ledger is unreadable; leaving its decisions active"
+                );
+                summary.errors += 1;
+                match ctx
+                    .store
+                    .blocking(|store| store.active_decisions(project.id))
+                {
+                    Ok(previous) => active.extend(previous),
+                    Err(err) => {
+                        tracing::warn!(project = %project.name, error = %err, "reading the stored decision set failed")
+                    }
+                }
+            }
+        }
+    }
+
+    let changed = match ctx
+        .store
+        .blocking(|store| store.set_active_decisions(project.id, &active))
+    {
+        Ok(changed) => changed,
+        Err(err) => {
+            tracing::warn!(project = %project.name, error = %err, "storing the active decision set failed");
+            summary.errors += 1;
+            return;
+        }
+    };
+    if !changed && !force {
+        return;
+    }
+
+    match ctx
+        .store
+        .blocking(|store| store.recompute_effective_authority(project.id))
+    {
+        Ok(recompute) => record_recompute(project, ledgers, &active, changed, recompute, summary),
+        Err(err) => {
+            tracing::warn!(project = %project.name, error = %err, "recomputing effective authority failed");
+            summary.errors += 1;
+        }
+    }
+}
+
+fn record_recompute(
+    project: &Project,
+    ledgers: usize,
+    active: &BTreeSet<String>,
+    ledger_changed: bool,
+    recompute: Recompute,
+    summary: &mut PassSummary,
+) {
+    summary.authority_recomputed = recompute.files_changed;
+    summary.authority_violations = recompute.violations;
+    if ledger_changed || recompute.files_changed > 0 {
+        tracing::info!(
+            project = %project.name,
+            ledgers,
+            active_decisions = active.len(),
+            files_changed = recompute.files_changed,
+            chunks_changed = recompute.chunks_changed,
+            violations = recompute.violations,
+            "effective authority recomputed"
+        );
+    }
+    if recompute.violations > 0 {
+        tracing::warn!(
+            project = %project.name,
+            files = recompute.violations,
+            "files declare `decided` without citing an active decision; they rank as neutral (see `lore status`)"
+        );
+    }
 }
 
 /// Read, hash, chunk and store one file. All error paths are logged and
@@ -282,8 +418,16 @@ fn index_one(ctx: &IndexContext, project: &Project, rel: &Utf8Path, summary: &mu
                         inserted = write.inserted,
                         kept = write.kept,
                         deleted = write.deleted,
+                        effective_tier = write.authority.tier,
                         "indexed file"
                     );
+                    // One line per offending file, at index time: `status`
+                    // gives the count, the log says which file and why.
+                    if let Some(demotion) = write.authority.demotion
+                        && demotion.is_violation()
+                    {
+                        log_violation(project, rel, demotion);
+                    }
                     summary.record(write);
                 }
                 Err(err) => {
@@ -427,6 +571,8 @@ fn finish(
         chunks_inserted = summary.chunks_inserted,
         chunks_kept = summary.chunks_kept,
         chunks_deleted = summary.chunks_deleted,
+        authority_recomputed = summary.authority_recomputed,
+        authority_violations = summary.authority_violations,
         errors = summary.errors,
         duration_ms = started.elapsed().as_millis() as u64,
         "index pass complete"
@@ -443,6 +589,18 @@ fn finish(
 
 fn log_store_error(project: &Project, rel: &Utf8Path, err: &StoreError) {
     tracing::warn!(project = %project.name, path = %rel, error = %err, "store call failed");
+}
+
+/// An authority declaration Lore refused to honor. A warning, not a debug
+/// line: the document claims to be canon, Lore has decided it is not, and the
+/// author is the only one who can reconcile that.
+fn log_violation(project: &Project, rel: &Utf8Path, demotion: Demotion) {
+    tracing::warn!(
+        project = %project.name,
+        path = %rel,
+        reason = demotion.note(),
+        "authority declaration not honored"
+    );
 }
 
 /// The indexer task: drain the coalescing queue until cancelled.

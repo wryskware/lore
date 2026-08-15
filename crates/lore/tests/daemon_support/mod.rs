@@ -35,22 +35,24 @@ impl Fixture {
         let data = canonicalize_root(data_dir.path()).expect("canonical data dir");
 
         let store = StoreHandle::open(data.join("lore.db")).expect("open store");
-        let id = {
+        let project = {
             let root = root.clone();
             let name = name.to_string();
             store
-                .blocking(move |store| store.register_project(&root, &name))
+                .blocking(move |store| {
+                    store.register_project(&root, &name)?;
+                    store.list_projects()
+                })
                 .expect("register project")
+                .into_iter()
+                .next()
+                .expect("the registered project")
         };
 
         Self {
             _project_dir: project_dir,
             _data_dir: data_dir,
-            project: Project {
-                id,
-                root: root.clone(),
-                name: name.to_string(),
-            },
+            project,
             root,
             data_dir: data,
             store,

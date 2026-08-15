@@ -27,7 +27,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use lore_core::discovery;
 use lore_core::{
     DaemonStatus, EmbeddingStatus, ExpandResponse, IndexRequest, IndexResponse, ProjectInfo,
-    RegisterProjectRequest, SearchRequest, SearchResponse, SearchResult, WatchState,
+    ProjectStatus, RegisterProjectRequest, SearchRequest, SearchResponse, SearchResult, WatchState,
 };
 use serde::Serialize;
 
@@ -63,6 +63,10 @@ pub struct SearchArgs {
     /// deprecated, unclassified.
     #[arg(long, value_delimiter = ',')]
     pub status: Vec<String>,
+    /// Corpus kind filter, comma-separated: repo, session. Empty = all kinds
+    /// (v1 indexes repos only; sessions arrive with the M3 ledger).
+    #[arg(long, value_delimiter = ',')]
+    pub source: Vec<String>,
     /// Maximum results. The daemon clamps this to a sane ceiling.
     #[arg(long)]
     pub limit: Option<u32>,
@@ -79,6 +83,7 @@ impl From<&SearchArgs> for SearchRequest {
             path_prefix: args.path_prefix.clone(),
             language: args.language.clone(),
             status: args.status.clone(),
+            sources: (!args.source.is_empty()).then(|| args.source.clone()),
             limit: args.limit,
         }
     }
@@ -103,7 +108,7 @@ pub async fn add(path: String) -> Result<()> {
         )
         .await?;
     let project: ProjectInfo = parse(&body)?;
-    println!("registered {} (id {})", project.name, project.id);
+    println!("registered {} (key {})", project.name, project.key);
     println!("  {}", project.root);
     Ok(())
 }
@@ -335,6 +340,15 @@ fn push_result(out: &mut String, rank: usize, result: &SearchResult) {
         }
         (None, true) => {}
     }
+    // Printed only when Lore refused the document's own declaration — see
+    // the same rule in `lore-mcp/src/render.rs`.
+    if let Some(note) = &result.authority_note {
+        let _ = writeln!(
+            out,
+            "    authority: {} - {note}",
+            result.effective_authority
+        );
+    }
     let _ = writeln!(out, "    chunk_id: {}", result.chunk_id);
 
     out.push_str(result.excerpt.trim_end_matches('\n'));
@@ -395,8 +409,36 @@ fn render_status(status: &DaemonStatus) -> String {
             root = project.root,
             watch = watch_note(project.watch),
         );
+        push_authority_violations(&mut out, project);
     }
     out
+}
+
+/// Documents declaring `decided` that Lore refused to honor. Silent when there
+/// are none; loud when there are, on the same reasoning as the watch note:
+/// otherwise the demotion is invisible and the author keeps believing those
+/// files are canon.
+fn push_authority_violations(out: &mut String, project: &ProjectStatus) {
+    if project.authority_violations == 0 {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "    AUTHORITY: {n} file(s) declare `decided` without citing an active decision; \
+         they rank as neutral",
+        n = project.authority_violations,
+    );
+    for path in &project.authority_violation_paths {
+        let _ = writeln!(out, "      {path}");
+    }
+    let listed = project.authority_violation_paths.len() as u64;
+    if project.authority_violations > listed {
+        let _ = writeln!(
+            out,
+            "      ... and {} more",
+            project.authority_violations - listed
+        );
+    }
 }
 
 /// Silent when the watch is armed — the common case should not add noise —
@@ -591,6 +633,7 @@ mod tests {
         SearchResult {
             chunk_id: "9f3a1c2b".into(),
             project: "lore".into(),
+            project_key: "lore".into(),
             path: "design/4_Interfaces/4.1_MCP_Surface.md".into(),
             line_start: 15,
             line_end: 17,
@@ -598,6 +641,8 @@ mod tests {
             symbol_path: None,
             heading_path: Some(vec!["MCP Tool Surface".into(), "v0.1 tools".into()]),
             design_status: Some("decided".into()),
+            effective_authority: "decided".into(),
+            authority_note: None,
             decision_refs: vec!["D-0007".into()],
             score: 0.8741,
             excerpt: "- **`search`** - one unified hybrid query.\n".into(),
@@ -609,6 +654,7 @@ mod tests {
         SearchResult {
             chunk_id: "4e77ba01".into(),
             project: "lexomancy".into(),
+            project_key: "lexomancy".into(),
             path: "Assets/Scripts/Board.cs".into(),
             line_start: 120,
             line_end: 141,
@@ -616,6 +662,8 @@ mod tests {
             symbol_path: Some("Board.Update".into()),
             heading_path: None,
             design_status: None,
+            effective_authority: "neutral".into(),
+            authority_note: None,
             decision_refs: vec![],
             score: 0.612,
             excerpt: "void Update() {".into(),
@@ -711,6 +759,57 @@ mod tests {
         assert_eq!(coverage(0, 0), "0/0");
         assert_eq!(coverage(0, 9134), "0/9134 (0%)");
         assert_eq!(coverage(1204, 1204), "1204/1204 (100%)");
+    }
+
+    /// The `status` half of "degradation is never silent" (1d). A refused
+    /// `decided` declaration is invisible everywhere else unless the author
+    /// happens to search for that exact file, so `lore status` has to name the
+    /// offenders — and say how many it did not name, or a vault with fifty
+    /// violations looks like a vault with five.
+    #[test]
+    fn status_names_the_refused_declarations_and_admits_what_it_truncated() {
+        let project = |violations: u64, paths: Vec<String>| DaemonStatus {
+            api_version: 1,
+            daemon_version: "0.1.0".into(),
+            generation: 3,
+            projects: vec![ProjectStatus {
+                id: 1,
+                name: "lore".into(),
+                key: "lore".into(),
+                root: r"C:\repos\lore".into(),
+                kind: "repo".into(),
+                files: 96,
+                chunks: 1204,
+                embedded_chunks: 1204,
+                authority_violations: violations,
+                authority_violation_paths: paths,
+                watch: WatchState::Armed,
+            }],
+            embeddings: EmbeddingStatus::Unconfigured,
+        };
+
+        // Clean vault: not a word about authority.
+        assert!(!render_status(&project(0, Vec::new())).contains("AUTHORITY"));
+
+        let rendered = render_status(&project(
+            2,
+            vec!["design/a.md".into(), "design/b.md".into()],
+        ));
+        assert!(rendered.contains("AUTHORITY: 2 file(s)"), "{rendered}");
+        assert!(rendered.contains("\n      design/a.md\n"), "{rendered}");
+        assert!(rendered.contains("\n      design/b.md\n"), "{rendered}");
+        assert!(
+            !rendered.contains("more"),
+            "nothing was truncated: {rendered}"
+        );
+
+        // The daemon caps the list; the count is the complete figure, so the
+        // difference has to be stated rather than quietly dropped.
+        let truncated = render_status(&project(
+            9,
+            vec!["design/a.md".into(), "design/b.md".into()],
+        ));
+        assert!(truncated.contains("... and 7 more"), "{truncated}");
     }
 
     #[test]
