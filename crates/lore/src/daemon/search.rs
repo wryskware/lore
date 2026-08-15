@@ -753,6 +753,120 @@ mod tests {
         assert_eq!(ids(&fuse(vec![hits], 10)), ["a", "b"]);
     }
 
+    /// S3#1 / S4#4 required test. Collapse folds *membership of one generated
+    /// window family* and nothing else, so every shape of "same anchor,
+    /// different content" has to survive it.
+    ///
+    /// The four cases are the ones the reviews named: C# overloads (D-0003's
+    /// flagship language gives `Parse(string)` and `Parse(Stream)` the same
+    /// structural path), repeated Markdown headings, one real family, and two
+    /// families whose anchors are indistinguishable as strings.
+    #[test]
+    fn collapse_preserves_overloads_and_repeated_headings() {
+        /// Same helper as [`hit`], with a real span so the two chunks differ
+        /// in everything except their anchor.
+        fn spanned(id: &str, path: &str, kind: ChunkKind, line: u32) -> SearchHit {
+            let mut h = hit(id, path, kind, None);
+            h.chunk.line_start = line;
+            h.chunk.line_end = line + 20;
+            h.chunk.byte_start = line * 40;
+            h.chunk.byte_end = (line + 20) * 40;
+            h
+        }
+        let overload = |id: &str, line: u32| {
+            spanned(
+                id,
+                "Assets/Scripts/Parser.cs",
+                ChunkKind::Code {
+                    symbol_kind: "method_declaration".into(),
+                    symbol_path: "Parser.Parse".into(),
+                    window: None,
+                },
+                line,
+            )
+        };
+        let notes = |id: &str, line: u32| {
+            spanned(
+                id,
+                "docs/notes.md",
+                ChunkKind::Section {
+                    heading_path: vec!["Design".into(), "Notes".into()],
+                    window: None,
+                },
+                line,
+            )
+        };
+
+        // 1. Two overloads: one anchor, one file, two methods. Both are results.
+        assert_eq!(
+            ids(&fuse(
+                vec![vec![
+                    overload("parse-text", 10),
+                    overload("parse-stream", 90)
+                ]],
+                10
+            )),
+            ["parse-text", "parse-stream"],
+        );
+
+        // 2. Two sibling `## Notes` sections under the same parent heading.
+        assert_eq!(
+            ids(&fuse(
+                vec![vec![notes("notes-a", 4), notes("notes-b", 60)]],
+                10
+            )),
+            ["notes-a", "notes-b"],
+        );
+
+        // 3. One oversized method, split by the chunker. Its windows are three
+        //    views of one span, and the best-scoring one speaks for them.
+        let member = |id: &str, index: u32| {
+            spanned(
+                id,
+                "Assets/Scripts/Parser.cs",
+                ChunkKind::Code {
+                    symbol_kind: "method_declaration".into(),
+                    symbol_path: format!("Parser.Parse#w{index}"),
+                    window: Some(WindowFamily { family: 0, index }),
+                },
+                10 + index * 30,
+            )
+        };
+        assert_eq!(
+            ids(&fuse(
+                vec![vec![member("w0", 0), member("w1", 1), member("w2", 2)]],
+                10
+            )),
+            ["w0"],
+        );
+
+        // 4. Both overloads oversized: two families, and every string they
+        //    carry — anchor, `#w` suffix, file — is identical across them.
+        //    Only the family ordinal separates them, and it must, or two
+        //    methods become one result.
+        let of_family = |id: &str, family: u32, index: u32| {
+            spanned(
+                id,
+                "Assets/Scripts/Parser.cs",
+                ChunkKind::Code {
+                    symbol_kind: "method_declaration".into(),
+                    symbol_path: format!("Parser.Parse#w{index}"),
+                    window: Some(WindowFamily { family, index }),
+                },
+                10 + family * 100 + index * 30,
+            )
+        };
+        let both = vec![
+            of_family("text-w0", 0, 0),
+            of_family("stream-w0", 1, 0),
+            of_family("text-w1", 0, 1),
+            of_family("stream-w1", 1, 1),
+        ];
+        // One result per family, in the order the arm ranked their best
+        // members — never one total, and never all four.
+        assert_eq!(ids(&fuse(vec![both], 10)), ["text-w0", "stream-w0"]);
+    }
+
     #[test]
     fn text_windows_are_not_collapsed() {
         // Consecutive log windows are different content, not one split span.
