@@ -174,6 +174,217 @@ async fn a_refused_chunk_is_skipped_and_the_rest_still_drain() {
     rig.stub.shutdown().await;
 }
 
+/// Poison is filtered *after* the store query, so a fetch page that filters
+/// away entirely used to read as "backlog drained" and everything behind it
+/// starved forever while status stayed Ready. The page size is shrunk here so
+/// the boundary is reachable without seeding thousands of rows; the mechanism
+/// under test is the same one production uses at [`PAGE_ROWS`].
+#[tokio::test]
+async fn poisoned_fetch_window_does_not_report_idle() {
+    const PAGE: usize = 8;
+
+    let rig = Rig::with("demo", |settings| settings.batch_max_items = 1).await;
+    for i in 0..PAGE {
+        rig.fixture.write(
+            &format!("docs/p{i}.md"),
+            format!("# P{i}\n\n{POISON} document {i}.\n"),
+        );
+    }
+    full_scan(&rig.fixture.context(), &rig.fixture.project);
+    // Indexed after the poison files, so its rowid is above every one of them.
+    rig.fixture
+        .write("docs/good.md", "# Good\n\nA perfectly fine document.\n");
+    full_scan(&rig.fixture.context(), &rig.fixture.project);
+    assert_eq!(rig.counts().0 as usize, PAGE + 1);
+
+    let mut worker = rig.worker();
+    worker.set_page_rows(PAGE);
+    worker.reconcile_fingerprint().await.unwrap();
+
+    // Fill exactly one fetch page with poison.
+    for _ in 0..PAGE {
+        assert!(worker.probe().await);
+        assert_eq!(worker.drain().await, Drained::Interrupted);
+    }
+    assert_eq!(worker.skipped(), PAGE);
+    assert_eq!(rig.counts().1, 0, "nothing good has been reached yet");
+
+    // The first page is now entirely poisoned. That is a page to step over,
+    // not the end of the missing set.
+    assert!(worker.probe().await);
+    assert_eq!(worker.drain().await, Drained::Idle);
+    assert_eq!(
+        rig.counts().1,
+        1,
+        "the chunk behind the poisoned page must still be embedded"
+    );
+    assert!(
+        rig.stub
+            .state
+            .inputs()
+            .iter()
+            .any(|input| input.contains("perfectly fine")),
+        "the good chunk was never sent to the endpoint"
+    );
+
+    // And it is genuinely done: no further work, no further requests.
+    let before = rig.stub.state.attempts();
+    assert_eq!(worker.drain().await, Drained::Idle);
+    assert_eq!(rig.stub.state.attempts(), before);
+    rig.stub.shutdown().await;
+}
+
+/// The worker screens vectors before handing them to the store, and the store
+/// aborts the *whole* transaction for one it will not normalize. If the two
+/// disagree by an epsilon, the batch retries forever with health still Ready —
+/// so the screen must be the store's own predicate, checked here through the
+/// real write path rather than against a copy of it.
+///
+/// Empty and non-finite vectors cannot reach this path (the client rejects an
+/// empty vector outright, and JSON cannot carry NaN or infinity); the store's
+/// own table covers those.
+#[tokio::test]
+async fn worker_and_store_agree_on_usable_vectors_at_the_threshold() {
+    let cases: [(&str, Vec<f32>, bool); 6] = [
+        ("zero", vec![0.0, 0.0], false),
+        ("far below epsilon", vec![1e-10, 0.0], false),
+        ("just below epsilon", vec![f32::EPSILON / 2.0, 0.0], false),
+        ("at epsilon", vec![f32::EPSILON, 0.0], false),
+        ("just above epsilon", vec![f32::EPSILON * 2.0, 0.0], true),
+        ("unit", vec![1.0, 0.0], true),
+    ];
+
+    for (label, vector, storable) in cases {
+        let rig = Rig::new("demo").await;
+        rig.fixture.write("docs/a.md", "# A\n\nFirst document.\n");
+        full_scan(&rig.fixture.context(), &rig.fixture.project);
+        assert_eq!(rig.counts().0, 1, "{label}");
+
+        let mut worker = rig.worker();
+        worker.reconcile_fingerprint().await.unwrap();
+        assert!(worker.probe().await, "{label}");
+        rig.stub.state.script([Reply::Vectors(vec![vector])]);
+
+        // A vector the worker accepts but the store rejects fails the upsert,
+        // which surfaces as `Interrupted` and an unchanged count.
+        assert_eq!(
+            worker.drain().await,
+            Drained::Idle,
+            "{label} wedged a drain"
+        );
+        assert_eq!(rig.counts().1, u64::from(storable), "{label}");
+        assert_eq!(worker.skipped(), usize::from(!storable), "{label}");
+        rig.stub.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn one_unusable_vector_does_not_block_its_batch() {
+    let rig = Rig::new("demo").await;
+    for name in ["a", "b", "c"] {
+        rig.fixture.write(
+            &format!("docs/{name}.md"),
+            format!("# {name}\n\nDocument.\n"),
+        );
+    }
+    full_scan(&rig.fixture.context(), &rig.fixture.project);
+    assert_eq!(rig.counts().0, 3);
+
+    let mut worker = rig.worker();
+    worker.reconcile_fingerprint().await.unwrap();
+    assert!(worker.probe().await);
+    // One vector the store will not normalize, among two it will. The default
+    // batch size is 8, so all three travel together.
+    rig.stub.state.script([Reply::Vectors(vec![
+        vec![1e-10, 0.0],
+        vec![1.0, 0.0],
+        vec![0.0, 1.0],
+    ])]);
+
+    assert_eq!(worker.drain().await, Drained::Idle);
+    assert_eq!(rig.counts(), (3, 2), "the valid peers were stored");
+    assert_eq!(worker.skipped(), 1);
+    rig.stub.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Health observations
+// ---------------------------------------------------------------------------
+
+/// A query embedding can stall for seconds while a probe answers in
+/// milliseconds. The slow one's verdict must not land on top of the fast one's
+/// — D-0007 wants the *current* state reported, not the last one written.
+#[tokio::test]
+async fn a_stale_failure_cannot_demote_a_newer_probe() {
+    let rig = Rig::new("demo").await;
+    let worker = rig.worker();
+    let health = rig.embedder.health();
+
+    // Claimed before the request, exactly as `Embedder::embed_query` does.
+    let in_flight = health.ticket();
+    assert!(worker.probe().await);
+    assert!(health.is_ready());
+
+    in_flight.set_unreachable(&rig.stub.base, "query embedding timed out after 3000ms");
+    assert!(
+        health.is_ready(),
+        "a stale timeout demoted a newer successful probe"
+    );
+    assert!(matches!(
+        rig.embedder.status(),
+        lore_core::EmbeddingStatus::Ready { .. }
+    ));
+
+    // A verdict claimed *after* the probe still wins, so real outages surface.
+    health
+        .ticket()
+        .set_unreachable(&rig.stub.base, "connection refused");
+    assert!(!health.is_ready());
+    rig.stub.shutdown().await;
+}
+
+/// A pass that finds nothing to do while health says the endpoint is down must
+/// re-probe, not sleep: the fallback tick is a minute away and every search in
+/// between is forced lexical-only on stale information.
+#[tokio::test]
+async fn an_idle_pass_reprobes_a_stale_unreachable_instead_of_sleeping() {
+    const CHUNKS: usize = 12;
+
+    let rig = Rig::with("demo", |settings| settings.batch_max_items = 1).await;
+    for i in 0..CHUNKS {
+        rig.fixture.write(
+            &format!("docs/f{i}.md"),
+            format!("# F{i}\n\nDocument {i}.\n"),
+        );
+    }
+    full_scan(&rig.fixture.context(), &rig.fixture.project);
+    assert_eq!(rig.counts().0 as usize, CHUNKS);
+    // One request per chunk, slow enough that the demotion below lands while
+    // the pass is provably still running.
+    rig.stub
+        .state
+        .set_delay(std::time::Duration::from_millis(30));
+
+    let task = tokio::spawn(rig.worker().run());
+
+    until("the drain to start", || rig.counts().1 >= 1).await;
+    rig.embedder
+        .health()
+        .set_unreachable(&rig.stub.base, "a query saw a blip");
+
+    // Nothing pulses the worker and IDLE_TICK is 60s, so recovery inside the
+    // helper's deadline can only have come from the end-of-pass re-probe.
+    until("health to recover without a pulse", || {
+        rig.embedder.health().is_ready()
+    })
+    .await;
+    assert_eq!(rig.counts().1 as usize, CHUNKS);
+
+    rig.cancel.cancel();
+    task.await.expect("the worker stops on cancellation");
+    rig.stub.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_transient_failure_leaves_the_backlog_for_later() {
     let rig = Rig::new("demo").await;

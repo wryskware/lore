@@ -72,6 +72,9 @@ pub enum Reply {
     Status(u16),
     /// Fail with this status and `Retry-After: <secs>`.
     StatusRetryAfter(u16, u64),
+    /// Succeed with exactly these vectors, one per input — the way to hand
+    /// the worker a vector no honest model would produce.
+    Vectors(Vec<Vec<f32>>),
 }
 
 #[derive(Default)]
@@ -85,11 +88,19 @@ pub struct StubState {
     /// Return `data` in reverse order (with correct `index` values) so a
     /// client that trusts arrival order is caught.
     pub shuffle: bool,
+    /// Milliseconds to stall before answering, so a test can act while the
+    /// worker is provably mid-drain rather than racing it.
+    pub delay_ms: AtomicUsize,
 }
 
 impl StubState {
     pub fn attempts(&self) -> usize {
         self.attempts.load(Ordering::SeqCst)
+    }
+
+    pub fn set_delay(&self, delay: std::time::Duration) {
+        self.delay_ms
+            .store(delay.as_millis() as usize, Ordering::SeqCst);
     }
 
     pub fn batches(&self) -> Vec<Vec<String>> {
@@ -192,7 +203,13 @@ async fn embeddings(State(state): State<Arc<StubState>>, body: String) -> Respon
         .collect();
     state.batches.lock().unwrap().push(inputs.clone());
 
-    if let Some(reply) = state.script.lock().unwrap().pop_front() {
+    let delay = state.delay_ms.load(Ordering::SeqCst);
+    if delay > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
+    }
+
+    let scripted = state.script.lock().unwrap().pop_front();
+    if let Some(reply) = scripted {
         return match reply {
             Reply::Status(code) => (status(code), "scripted failure").into_response(),
             Reply::StatusRetryAfter(code, secs) => (
@@ -201,6 +218,16 @@ async fn embeddings(State(state): State<Arc<StubState>>, body: String) -> Respon
                 "scripted failure",
             )
                 .into_response(),
+            Reply::Vectors(vectors) => {
+                assert_eq!(vectors.len(), inputs.len(), "scripted vectors per input");
+                let data: Vec<Value> = vectors
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, vector)| json!({ "index": index, "embedding": vector }))
+                    .collect();
+                axum::Json(json!({ "object": "list", "model": "stub", "data": data }))
+                    .into_response()
+            }
         };
     }
 
