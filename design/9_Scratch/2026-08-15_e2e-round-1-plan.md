@@ -64,12 +64,14 @@ first pass, cut to T1/T2/T4 (the most retrieval-sensitive) = 36 runs.
   - lore: `39da7c25c1`
   - latent-music-terrarium: `3b1eacd56f`
   - Lexomancy design vault (`design/` is its own repo): `d5e0d53310`
-- **Lexomancy code is currently unversioned.** The outer `.git` is an empty
-  directory and the inner Unity project's git history was archived to a
-  tarball on 2026-07-24; only `design/` and `tools/` are real repos. Until
-  Wrysk decides whether to re-init git there, runs use a **frozen snapshot
-  copy** of `Lexomancy/Assets/Scripts` + the csproj files, one fresh copy
-  per implementation run.
+- **Lexomancy spans three VCSes** (Wrysk, 2026-08-15): `Lexomancy/Lexomancy`
+  is under Unity VCS (`cm`, no git — the inner git history was archived
+  2026-07-24), while `design/` and `tools/` are git repos. Benchmark
+  workspace per Wrysk: a fresh top-level folder that symlinks
+  `C:\Users\perag\Unity\Lexomancy-alt` (a second cm workspace updated to
+  the most recent changeset) plus `design` and `tools`. The pin is the cm
+  changeset number + the two git SHAs. design/tools are read-only during
+  runs, so symlinks are safe; only the cm workspace sees T5 diffs.
 
 ## Environment constraints
 
@@ -89,8 +91,11 @@ first pass, cut to T1/T2/T4 (the most retrieval-sensitive) = 36 runs.
 
 ## Run protocol
 
-- Same task prompt verbatim for every cell; prompts name the repo root and
-  the deliverable format, nothing else.
+- Same task prompt verbatim for every cell. Prompts are **hint-free** and
+  read like Wrysk's lazy 1–2 sentence asks (e.g. "why is the targeting
+  heuristic rng-free? whats the ladder" — no file paths, no doc names, no
+  "check the ledger"). Everything detailed in this doc's task descriptions
+  is answer-key material, never prompt material.
 - Clean working tree per run; implementation tasks (T5) get graded on the
   diff, then reverted.
 - Retrieval-on arm: daemon running, repo registered and index drained
