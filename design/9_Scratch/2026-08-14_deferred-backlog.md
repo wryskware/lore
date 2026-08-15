@@ -28,3 +28,20 @@ briefs; details in the cited docs.
   implemented literal prefix; a real glob (`Assets/**/Tests/*.cs`, globset,
   SQL prefix pushdown, Windows case-folding parity in both arms) is still
   wanted for Unity workflows.
+
+## Residuals from the package-3 merge (2026-08-15)
+
+- **Unreadable-ledger degradation is untested.** `refresh_authority` keeps
+  the stored active set when a ledger read fails (so a transient IO error
+  cannot mass-demote the vault), but no test exercises it — making a file
+  reliably unreadable on Windows needs platform locking machinery.
+- **Pre-V2 duplicate display names are left in place.** Uniqueness is
+  enforced for new registrations only; `resolve_project("shared")` returns
+  the first match while project keys reach both. Acceptable migration
+  behavior; a `lore rename` affordance would let a user clean up.
+- **`registry::bootstrap` key backfill is per-row, not atomic.** Safe as
+  written (only allocates unheld keys); worth folding into
+  `apply_project_set` if bootstrap ever grows.
+- **Authority multiplier dominance is only proven at fixture scale.** The
+  ordering (0.7 scratch cap below neutral, etc.) is tested at the ranks the
+  fixtures produce, not against arbitrary RRF gaps on large corpora.
