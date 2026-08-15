@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use camino::Utf8PathBuf;
 use daemon_support::{Fixture, STANDARD_TREE_INDEXED, populate_standard_tree};
 use lore::daemon::index::{full_scan, index_paths};
+use lore::store::SearchFilter;
 
 fn paths(items: &[&str]) -> BTreeSet<Utf8PathBuf> {
     items.iter().map(Utf8PathBuf::from).collect()
@@ -242,6 +243,31 @@ fn a_cancelled_pass_stops_early_and_does_not_bump_the_generation() {
         fixture.generation(),
         before,
         "an aborted pass is not a pass"
+    );
+}
+
+/// End-to-end proof that a container heading's short introduction reaches
+/// FTS. A one-sentence rule under a parent heading is exactly the prose an
+/// agent asks for, and it used to exist in no chunk and no FTS row at all.
+#[test]
+fn a_short_markdown_parent_introduction_reaches_the_index() {
+    let fixture = Fixture::new("demo");
+    fixture.write(
+        "docs/safety.md",
+        "# Safety\n\nNever upload.\n\n## Details\n\nEverything stays on the local machine.\n",
+    );
+    full_scan(&fixture.context(), &fixture.project);
+
+    let hits = fixture
+        .store
+        .blocking(|store| store.lexical_search("upload", &SearchFilter::default(), 10))
+        .expect("lexical search");
+    assert!(
+        hits.iter().any(|h| h.chunk.text.contains("Never upload.")),
+        "short parent intro is not searchable; hits = {:?}",
+        hits.iter()
+            .map(|h| h.chunk.text.as_str())
+            .collect::<Vec<_>>()
     );
 }
 

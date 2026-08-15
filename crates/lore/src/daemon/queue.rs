@@ -8,12 +8,18 @@
 //! path twice costs nothing, and the debouncer's own coalescing is reinforced
 //! rather than duplicated.
 //!
+//! Service is round-robin over project ids rather than always lowest-first:
+//! two registered projects share one indexer, and a project whose files churn
+//! continuously would otherwise re-enter the set before the next take and
+//! starve every higher id indefinitely.
+//!
 //! Second bound: a project whose pending set exceeds [`MAX_PENDING_PATHS`]
 //! collapses to a full rescan. Past a few thousand changed files a rescan is
 //! cheaper than per-file bookkeeping anyway (hashing dominates either way),
 //! and it caps memory at a constant regardless of how violent the storm is.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 
 use camino::Utf8PathBuf;
@@ -37,8 +43,18 @@ pub struct ProjectWork {
 
 #[derive(Debug, Default)]
 struct Inner {
-    pending: Mutex<BTreeMap<ProjectId, ProjectWork>>,
+    pending: Mutex<Pending>,
     notify: Notify,
+}
+
+/// The pending set plus the round-robin cursor that keeps it fair.
+#[derive(Debug, Default)]
+struct Pending {
+    work: BTreeMap<ProjectId, ProjectWork>,
+    /// Last project handed out. The next take resumes *after* it and wraps,
+    /// so a project whose files churn continuously cannot hold the indexer
+    /// against a quieter project that happens to have a higher id.
+    cursor: ProjectId,
 }
 
 /// Cheap to clone; every producer and the single consumer share one set.
@@ -56,7 +72,7 @@ impl IndexQueue {
     pub fn request_full(&self, project: ProjectId) {
         {
             let mut pending = self.lock();
-            let work = pending.entry(project).or_default();
+            let work = pending.work.entry(project).or_default();
             work.full = true;
             work.paths.clear();
         }
@@ -68,7 +84,7 @@ impl IndexQueue {
         let mut added = false;
         {
             let mut pending = self.lock();
-            let work = pending.entry(project).or_default();
+            let work = pending.work.entry(project).or_default();
             for path in paths {
                 added = true;
                 if work.full {
@@ -91,12 +107,19 @@ impl IndexQueue {
         }
     }
 
-    /// Take all outstanding work for one project (the lowest id with work).
+    /// Take all outstanding work for one project, round-robin by id.
     /// Non-blocking; `None` when the queue is empty.
     pub fn take(&self) -> Option<(ProjectId, ProjectWork)> {
         let mut pending = self.lock();
-        let project = *pending.keys().next()?;
-        let work = pending.remove(&project)?;
+        let after = pending.cursor;
+        let project = pending
+            .work
+            .range((Bound::Excluded(after), Bound::Unbounded))
+            .next()
+            .or_else(|| pending.work.iter().next())
+            .map(|(id, _)| *id)?;
+        let work = pending.work.remove(&project)?;
+        pending.cursor = project;
         Some((project, work))
     }
 
@@ -118,10 +141,10 @@ impl IndexQueue {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.lock().is_empty()
+        self.lock().work.is_empty()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<ProjectId, ProjectWork>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Pending> {
         self.inner
             .pending
             .lock()
@@ -174,6 +197,40 @@ mod tests {
         let (_, work) = queue.take().unwrap();
         assert!(work.full, "pending set is bounded");
         assert!(work.paths.is_empty());
+    }
+
+    /// A project saving files in a loop re-enters the pending set between
+    /// every take. Lowest-id-first service would hand it the indexer forever;
+    /// the rotation must reach the quiet project on the very next take.
+    #[test]
+    fn a_churning_project_cannot_starve_a_higher_id() {
+        let queue = IndexQueue::new();
+        queue.request_paths(2, [path("quiet.rs")]);
+
+        let mut served = Vec::new();
+        for _ in 0..4 {
+            queue.request_paths(1, [path("busy.rs")]);
+            let (project, work) = queue.take().expect("work queued");
+            assert!(!work.paths.is_empty(), "work is never handed out empty");
+            served.push(project);
+        }
+        assert_eq!(served, [1, 2, 1, 1], "service rotates before repeating");
+    }
+
+    /// Rotation is scheduling only: everything queued for one project still
+    /// arrives in a single take.
+    #[test]
+    fn rotation_preserves_per_project_coalescing() {
+        let queue = IndexQueue::new();
+        for _ in 0..100 {
+            queue.request_paths(1, [path("a.rs"), path("b.rs")]);
+            queue.request_paths(2, [path("c.rs")]);
+        }
+        let (first, work) = queue.take().unwrap();
+        assert_eq!((first, work.paths.len()), (1, 2));
+        let (second, work) = queue.take().unwrap();
+        assert_eq!((second, work.paths.len()), (2, 1));
+        assert!(queue.is_empty());
     }
 
     #[tokio::test]

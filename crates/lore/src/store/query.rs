@@ -66,6 +66,14 @@ pub(crate) struct FilterSql {
     pub(crate) params: Vec<Value>,
 }
 
+/// Whether a stored path and a requested prefix that differ only in case name
+/// the same file. Mirrors [`crate::daemon::paths`]: Windows paths are
+/// ASCII-case-insensitive, everything else is exact. Full Unicode folding is
+/// deliberately not attempted — `daemon::paths` does not do it either, so
+/// `Ä`/`ä` in a Windows directory name still fails to match (a documented
+/// gap, not a new one).
+const PATHS_IGNORE_CASE: bool = cfg!(windows);
+
 /// Build the filter fragment for a query whose chunk table is aliased `c`.
 ///
 /// Path prefixing uses `substr(path, 1, n) = prefix` rather than `LIKE`:
@@ -80,9 +88,23 @@ pub(crate) fn filter_sql(filter: &SearchFilter) -> FilterSql {
         params.push(Value::Integer(project));
     }
     if let Some(prefix) = &filter.path_prefix {
-        sql.push_str(" AND substr(c.path, 1, ?) = ?");
-        params.push(Value::Integer(prefix.len() as i64));
-        params.push(Value::Text(prefix.clone()));
+        // SQLite counts *characters*; Rust's `len()` counts bytes. Passing
+        // the byte length would slice `données/parser.cs` to `données/p` and
+        // compare it against an eight-character prefix, hiding every file
+        // under the directory.
+        let chars = prefix.chars().count() as i64;
+        if PATHS_IGNORE_CASE {
+            // `lower()` without ICU folds ASCII only — exactly the policy
+            // `daemon::paths` uses for Windows containment — so the Rust side
+            // must fold the same way or `DONNÉES/` would diverge.
+            sql.push_str(" AND lower(substr(c.path, 1, ?)) = ?");
+            params.push(Value::Integer(chars));
+            params.push(Value::Text(prefix.to_ascii_lowercase()));
+        } else {
+            sql.push_str(" AND substr(c.path, 1, ?) = ?");
+            params.push(Value::Integer(chars));
+            params.push(Value::Text(prefix.clone()));
+        }
     }
     if let Some(language) = &filter.language {
         sql.push_str(" AND c.language = ?");
@@ -149,6 +171,34 @@ mod tests {
         assert_eq!(sanitize_fts_query("NEAR(a b, 3)"), "\"a\" \"b\" \"3\"");
         assert_eq!(sanitize_fts_query(")))"), "");
         assert_eq!(sanitize_fts_query("   "), "");
+    }
+
+    /// `substr` counts characters, so the bound handed to it must too.
+    #[test]
+    fn path_prefix_bound_is_a_character_count() {
+        let filter = SearchFilter {
+            path_prefix: Some("données/".into()),
+            ..SearchFilter::default()
+        };
+        let f = filter_sql(&filter);
+        assert!(f.sql.contains("substr(c.path, 1, ?)"), "{}", f.sql);
+        assert_eq!(
+            f.params[0],
+            Value::Integer(8),
+            "eight characters, not nine bytes"
+        );
+        // ASCII folding on both sides, or neither.
+        assert_eq!(f.sql.contains("lower("), PATHS_IGNORE_CASE);
+        if PATHS_IGNORE_CASE {
+            let filter = SearchFilter {
+                path_prefix: Some("Assets/Scripts/".into()),
+                ..SearchFilter::default()
+            };
+            assert_eq!(
+                filter_sql(&filter).params[1],
+                Value::Text("assets/scripts/".into())
+            );
+        }
     }
 
     #[test]

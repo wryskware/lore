@@ -29,7 +29,7 @@ use crate::types::Chunk;
 /// unchanged files. The indexer mixes this into its per-file content hash,
 /// so a version bump invalidates the hash short-circuit and the next scan
 /// re-chunks (and prunes newly-skipped) files whose bytes never moved.
-pub const CHUNK_FORMAT_VERSION: u32 = 2;
+pub const CHUNK_FORMAT_VERSION: u32 = 3;
 
 /// A single line longer than this marks a file as machine text (minified
 /// bundles, ML vocab dumps, serialized blobs). Dogfooding on the Lexomancy
@@ -223,6 +223,75 @@ mod tests {
         let broken = chunks("b.md", "---\ndesign_status: decided\n\n# H\n\nbody\n");
         assert_eq!(broken[0].vault.as_ref().unwrap().design_status, None);
         assert!(broken.iter().any(|c| c.text.contains("design_status")));
+    }
+
+    /// A Windows editor saving a vault document as "UTF-8 with BOM" must not
+    /// silently downgrade it to unclassified: U+FEFF is not whitespace, so
+    /// nothing trims it away before the `---` fence is compared.
+    #[test]
+    fn utf8_bom_does_not_hide_frontmatter() {
+        for body in [
+            "---\ndesign_status: decided\ndecision_refs: [D-0003, D-0004]\n---\n\n# H\n\nbody\n",
+            // Same document as a Windows editor writes it: BOM + CRLF.
+            "---\r\ndesign_status: decided\r\ndecision_refs:\r\n  - D-0003\r\n  - D-0004\r\n---\r\n\r\n# H\r\n\r\nbody\r\n",
+        ] {
+            let src = format!("\u{feff}{body}");
+            let out = chunks("bom.md", &src);
+            let vault = out[0].vault.as_ref().expect("markdown carries vault meta");
+            assert_eq!(vault.design_status, Some(DesignStatus::Decided));
+            assert_eq!(vault.decision_refs, ["D-0003", "D-0004"]);
+
+            // The YAML is metadata, never body text, and the BOM is in no chunk.
+            assert!(out.iter().all(|c| !c.text.contains("design_status")));
+            assert!(out.iter().all(|c| !c.text.contains('\u{feff}')));
+            assert!(out.iter().any(|c| c.text.contains("body")));
+
+            // Spans stay relative to the *original* bytes, BOM included.
+            for chunk in &out {
+                let slice = &src[chunk.byte_start as usize..chunk.byte_end as usize];
+                assert_eq!(slice, chunk.text, "span is not the file slice");
+            }
+        }
+    }
+
+    /// The same mark in front of a plain document must not swallow the first
+    /// heading either — without the skip, `\u{feff}#` is not an ATX marker.
+    #[test]
+    fn utf8_bom_without_frontmatter_keeps_the_first_heading() {
+        let src = "\u{feff}# Title\n\nsome prose\n";
+        let out = chunks("bom2.md", src);
+        assert!(out[0].text.starts_with("# Title"), "{:?}", out[0].text);
+        assert_eq!(
+            &src[out[0].byte_start as usize..out[0].byte_end as usize],
+            out[0].text
+        );
+    }
+
+    /// A rule short enough to fit in one sentence is exactly the kind of
+    /// prose that must stay searchable: the intro-size heuristic decides
+    /// which chunk holds it, never whether it is indexed at all.
+    #[test]
+    fn a_short_container_intro_is_folded_into_the_first_child() {
+        let src = "# Safety\n\nNever upload.\n\n## Details\n\nLocal-only, bound to loopback.\n";
+        let out = chunks("safety.md", src);
+        assert!(
+            out.iter().any(|c| c.text.contains("Never upload.")),
+            "short intro dropped: {:?}",
+            out.iter().map(|c| c.text.as_str()).collect::<Vec<_>>()
+        );
+        for chunk in &out {
+            let slice = &src[chunk.byte_start as usize..chunk.byte_end as usize];
+            assert_eq!(slice, chunk.text, "span is not the file slice");
+        }
+
+        // An intro past the threshold still earns its own chunk, and an
+        // empty one still leaves the child's span untouched.
+        let long = "# Safety\n\nNever upload anything to a remote service, ever.\n\n## Details\n\nLocal-only.\n";
+        assert_eq!(chunks("long.md", long).len(), 2);
+        let empty = "# Safety\n\n## Details\n\nLocal-only.\n";
+        let out = chunks("empty-intro.md", empty);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].text.starts_with("## Details"));
     }
 
     #[test]

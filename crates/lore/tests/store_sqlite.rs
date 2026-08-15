@@ -562,6 +562,125 @@ fn lexical_search_filters() {
     );
 }
 
+/// Path prefixes must survive the two ways a real Windows vault spells a
+/// directory: non-ASCII characters (SQLite `substr` counts characters, Rust
+/// `len()` counts bytes) and a different case (`assets/scripts/` is the same
+/// directory as `Assets/Scripts/`). Both search arms share `filter_sql`, so
+/// both are asserted.
+#[test]
+fn path_prefix_filter_handles_non_ascii_and_windows_case() {
+    let dir = TempDir::new().unwrap();
+    let mut store = open(&dir);
+    let a = store.register_project(p("C:/repos/a"), "a").unwrap();
+
+    let accented = code_chunk(
+        "données/parser.cs",
+        "Parser.Run",
+        "void Run() { /* wombat */ }",
+        "csharp",
+    );
+    // Same characters up to the separator: a prefix must not leak into it.
+    let sibling = code_chunk(
+        "données2/parser.cs",
+        "Sibling.Run",
+        "void Run() { /* wombat sibling */ }",
+        "csharp",
+    );
+    let mixed_case = code_chunk(
+        "Assets/Scripts/Foo.cs",
+        "Foo.Run",
+        "void Run() { /* wombat asset */ }",
+        "csharp",
+    );
+    for chunk in [&accented, &sibling, &mixed_case] {
+        store
+            .replace_file_chunks(a, chunk.path.as_path(), "h", std::slice::from_ref(chunk))
+            .unwrap();
+    }
+    store
+        .upsert_embeddings(&[
+            NewEmbedding {
+                project: a,
+                chunk_id: accented.id.clone(),
+                vector: vec![1.0, 0.0],
+            },
+            NewEmbedding {
+                project: a,
+                chunk_id: sibling.id.clone(),
+                vector: vec![1.0, 0.0],
+            },
+            NewEmbedding {
+                project: a,
+                chunk_id: mixed_case.id.clone(),
+                vector: vec![1.0, 0.0],
+            },
+        ])
+        .unwrap();
+
+    let with_prefix = |prefix: &str| SearchFilter {
+        project: Some(a),
+        path_prefix: Some(prefix.into()),
+        ..SearchFilter::default()
+    };
+    let paths_of = |hits: Vec<lore::store::SearchHit>| {
+        let mut out: Vec<String> = hits
+            .into_iter()
+            .map(|h| h.chunk.path.as_str().to_string())
+            .collect();
+        out.sort();
+        out
+    };
+
+    // Non-ASCII directory: the accented file, and only it.
+    let accented_only = with_prefix("données/");
+    assert_eq!(
+        paths_of(store.lexical_search("wombat", &accented_only, 10).unwrap()),
+        ["données/parser.cs"]
+    );
+    assert_eq!(
+        paths_of(
+            store
+                .vector_search(&[1.0, 0.0], &accented_only, 10)
+                .unwrap()
+        ),
+        ["données/parser.cs"]
+    );
+
+    // Exact-case ASCII prefix works everywhere.
+    let assets = with_prefix("Assets/Scripts/");
+    assert_eq!(
+        paths_of(store.lexical_search("wombat", &assets, 10).unwrap()),
+        ["Assets/Scripts/Foo.cs"]
+    );
+    assert_eq!(
+        paths_of(store.vector_search(&[1.0, 0.0], &assets, 10).unwrap()),
+        ["Assets/Scripts/Foo.cs"]
+    );
+
+    // Case folding follows `daemon::paths`: ASCII-insensitive on Windows,
+    // exact elsewhere, because elsewhere the two really are different files.
+    let lowercased = with_prefix("assets/scripts/");
+    let lexical = paths_of(store.lexical_search("wombat", &lowercased, 10).unwrap());
+    let vector = paths_of(store.vector_search(&[1.0, 0.0], &lowercased, 10).unwrap());
+    if cfg!(windows) {
+        assert_eq!(lexical, ["Assets/Scripts/Foo.cs"]);
+        assert_eq!(vector, ["Assets/Scripts/Foo.cs"]);
+    } else {
+        assert!(lexical.is_empty(), "{lexical:?}");
+        assert!(vector.is_empty(), "{vector:?}");
+    }
+
+    // A shorter prefix still stops at what it actually spells.
+    assert_eq!(
+        paths_of(
+            store
+                .lexical_search("wombat", &with_prefix("données"), 10)
+                .unwrap()
+        ),
+        ["données/parser.cs", "données2/parser.cs"]
+    );
+}
+
 #[test]
 fn lexical_search_survives_hostile_queries() {
     let dir = TempDir::new().unwrap();
