@@ -29,7 +29,9 @@
 
 mod query;
 mod schema;
-mod vector;
+/// Crate-visible so the embed worker can screen vectors with the *same*
+/// predicate the write path uses (see [`vector::is_usable`]).
+pub(crate) mod vector;
 
 use std::collections::HashSet;
 use std::path::Path;

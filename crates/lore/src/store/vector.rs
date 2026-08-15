@@ -8,15 +8,29 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-/// L2-normalize, rejecting vectors that cannot produce a meaningful cosine.
-pub(crate) fn normalize(v: &[f32]) -> Option<Vec<f32>> {
+/// The L2 norm, or `None` for a vector that cannot produce a meaningful
+/// cosine.
+///
+/// This is the **single** definition of "usable vector". The embed worker
+/// screens vectors before handing them to [`super::Store::upsert_embeddings`],
+/// which rejects an unusable one for the whole transaction; a second predicate
+/// that disagreed by even one epsilon would let a batch abort forever.
+fn usable_norm(v: &[f32]) -> Option<f32> {
     if v.is_empty() || v.iter().any(|x| !x.is_finite()) {
         return None;
     }
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if !norm.is_finite() || norm <= f32::EPSILON {
-        return None;
-    }
+    (norm.is_finite() && norm > f32::EPSILON).then_some(norm)
+}
+
+/// Would [`normalize`] — and therefore a store write — accept this vector?
+pub(crate) fn is_usable(v: &[f32]) -> bool {
+    usable_norm(v).is_some()
+}
+
+/// L2-normalize, rejecting vectors that cannot produce a meaningful cosine.
+pub(crate) fn normalize(v: &[f32]) -> Option<Vec<f32>> {
+    let norm = usable_norm(v)?;
     Some(v.iter().map(|x| x / norm).collect())
 }
 
@@ -113,6 +127,36 @@ mod tests {
         assert!(normalize(&[0.0, 0.0]).is_none());
         assert!(normalize(&[f32::NAN, 1.0]).is_none());
         assert!(normalize(&[]).is_none());
+    }
+
+    /// The screening predicate and the write path must agree on every input,
+    /// including the ones straddling the epsilon threshold.
+    #[test]
+    fn is_usable_agrees_with_normalize_at_the_threshold() {
+        let below = f32::EPSILON / 2.0;
+        let at = f32::EPSILON;
+        let above = f32::EPSILON * 2.0;
+        let cases: [(&str, Vec<f32>); 9] = [
+            ("empty", vec![]),
+            ("zero", vec![0.0, 0.0]),
+            ("nan", vec![f32::NAN, 1.0]),
+            ("inf", vec![f32::INFINITY]),
+            ("below epsilon", vec![below, 0.0]),
+            ("at epsilon", vec![at, 0.0]),
+            ("above epsilon", vec![above, 0.0]),
+            ("tiny denormal", vec![1e-10, 0.0]),
+            ("unit", vec![1.0, 0.0]),
+        ];
+        for (label, v) in cases {
+            assert_eq!(
+                is_usable(&v),
+                normalize(&v).is_some(),
+                "screening and write disagree on {label}"
+            );
+        }
+        assert!(!is_usable(&[below, 0.0]));
+        assert!(!is_usable(&[at, 0.0]), "the store's bound is exclusive");
+        assert!(is_usable(&[above, 0.0]));
     }
 
     #[test]

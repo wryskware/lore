@@ -306,8 +306,9 @@ impl EmbedWorker {
         for (candidate, vector) in batch.iter().zip(vectors) {
             // The store rejects an unusable vector for the whole transaction;
             // catching it here keeps one bad vector from blocking the batch
-            // (and then the batch from blocking the backlog, forever).
-            if usable(&vector) {
+            // (and then the batch from blocking the backlog, forever). The
+            // predicate is the store's own, so the two cannot drift apart.
+            if crate::store::vector::is_usable(&vector) {
                 items.push(NewEmbedding {
                     project: candidate.project,
                     chunk_id: candidate.chunk.id.clone(),
@@ -379,26 +380,5 @@ pub fn fingerprint(settings: &super::client::EmbedSettings) -> EmbeddingFingerpr
         query_prefix: settings.query_prefix.clone(),
         document_prefix: settings.document_prefix.clone(),
         normalization: NORMALIZATION.to_string(),
-    }
-}
-
-/// Would the store accept this vector? (It L2-normalizes on write and rejects
-/// anything with a zero or non-finite norm.)
-fn usable(vector: &[f32]) -> bool {
-    let norm: f32 = vector.iter().map(|value| value * value).sum();
-    !vector.is_empty() && norm.is_finite() && norm > 0.0
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn usable_rejects_what_the_store_would_reject() {
-        assert!(usable(&[0.0, 1.0]));
-        assert!(!usable(&[]));
-        assert!(!usable(&[0.0, 0.0]));
-        assert!(!usable(&[f32::NAN, 1.0]));
-        assert!(!usable(&[f32::INFINITY]));
     }
 }
