@@ -18,6 +18,7 @@
 
 use camino::{Utf8Path, Utf8PathBuf};
 use ignore::WalkBuilder;
+use tokio_util::sync::CancellationToken;
 
 use super::paths;
 
@@ -66,11 +67,17 @@ pub fn is_excluded_rel(rel: &Utf8Path) -> bool {
 /// `start` must be `root` or a directory under it; `max_depth` of `Some(1)`
 /// lists just that directory's own files, which is how a watcher event is
 /// checked against the ignore rules without re-walking the project.
+///
+/// A cancelled token stops the walk between entries, so shutdown is not
+/// stuck behind a large or slow (UNC, reconnecting) tree. The returned list
+/// is then *partial* — callers must not treat it as the complete truth of
+/// what exists (a prune against it would delete everything unwalked).
 pub fn walk_files(
     root: &Utf8Path,
     start: &Utf8Path,
     max_depth: Option<usize>,
     data_dir: &Utf8Path,
+    cancel: Option<&CancellationToken>,
 ) -> Vec<Utf8PathBuf> {
     if paths::is_within(data_dir, start) {
         return Vec::new();
@@ -109,6 +116,9 @@ pub fn walk_files(
 
     let mut out = Vec::new();
     for entry in builder.build() {
+        if cancel.is_some_and(|c| c.is_cancelled()) {
+            break;
+        }
         match entry {
             Ok(entry) => {
                 if !entry.file_type().is_some_and(|t| t.is_file()) {

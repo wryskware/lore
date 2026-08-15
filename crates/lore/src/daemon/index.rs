@@ -101,12 +101,22 @@ pub fn full_scan(ctx: &IndexContext, project: &Project) -> PassSummary {
     let started = Instant::now();
     let mut summary = PassSummary::default();
 
-    let files = walk::walk_files(&project.root, &project.root, None, &ctx.data_dir);
+    let files = walk::walk_files(
+        &project.root,
+        &project.root,
+        None,
+        &ctx.data_dir,
+        Some(&ctx.cancel),
+    );
     let seen: BTreeSet<Utf8PathBuf> = files.into_iter().collect();
     summary.seen = seen.len();
+    // A cancelled walk is partial: pruning against it would treat every
+    // unwalked file as deleted. Record the cancellation before anything
+    // consults `seen`.
+    summary.cancelled = ctx.cancel.is_cancelled();
 
     for rel in &seen {
-        if ctx.cancel.is_cancelled() {
+        if summary.cancelled || ctx.cancel.is_cancelled() {
             summary.cancelled = true;
             break;
         }
@@ -157,7 +167,13 @@ pub fn index_paths(
         match std::fs::metadata(&abs) {
             Err(_) => missing.push(rel),
             Ok(meta) if meta.is_dir() => {
-                to_index.extend(walk::walk_files(&project.root, &abs, None, &ctx.data_dir));
+                to_index.extend(walk::walk_files(
+                    &project.root,
+                    &abs,
+                    None,
+                    &ctx.data_dir,
+                    Some(&ctx.cancel),
+                ));
             }
             Ok(_) => {
                 let parent = rel.parent().unwrap_or(Utf8Path::new("")).to_owned();
@@ -174,10 +190,15 @@ pub fn index_paths(
         } else {
             project.root.join(&parent)
         };
-        let allowed: BTreeSet<Utf8PathBuf> =
-            walk::walk_files(&project.root, &start, Some(1), &ctx.data_dir)
-                .into_iter()
-                .collect();
+        let allowed: BTreeSet<Utf8PathBuf> = walk::walk_files(
+            &project.root,
+            &start,
+            Some(1),
+            &ctx.data_dir,
+            Some(&ctx.cancel),
+        )
+        .into_iter()
+        .collect();
         for rel in files {
             if allowed.contains(rel) {
                 to_index.insert(rel.to_owned());
@@ -188,9 +209,13 @@ pub fn index_paths(
     }
 
     summary.seen = to_index.len() + to_remove.len();
+    // A cancelled walk above may have classified a still-allowed file as
+    // removable (its parent listing came back partial); removing on partial
+    // evidence deletes real index rows, so stop before the removals run.
+    summary.cancelled = ctx.cancel.is_cancelled();
 
     for rel in &to_index {
-        if ctx.cancel.is_cancelled() {
+        if summary.cancelled || ctx.cancel.is_cancelled() {
             summary.cancelled = true;
             break;
         }
@@ -308,7 +333,13 @@ fn remove_paths_and_subtrees(
     if paths.is_empty() {
         return;
     }
+    // Removals are idempotent, so stopping mid-list is safe: the next pass
+    // sees the same difference and finishes the job.
     for rel in paths {
+        if ctx.cancel.is_cancelled() {
+            summary.cancelled = true;
+            return;
+        }
         remove_one(ctx, project, rel, summary);
     }
 
@@ -322,6 +353,10 @@ fn remove_paths_and_subtrees(
     };
     let prefixes: Vec<String> = paths.iter().map(|p| format!("{p}/")).collect();
     for record in indexed {
+        if ctx.cancel.is_cancelled() {
+            summary.cancelled = true;
+            return;
+        }
         if prefixes.iter().any(|p| record.path.as_str().starts_with(p)) {
             remove_one(ctx, project, &record.path, summary);
         }
@@ -345,6 +380,10 @@ fn prune_missing(
         }
     };
     for record in indexed {
+        if ctx.cancel.is_cancelled() {
+            summary.cancelled = true;
+            return;
+        }
         if !seen.contains(&record.path) {
             remove_one(ctx, project, &record.path, summary);
         }
