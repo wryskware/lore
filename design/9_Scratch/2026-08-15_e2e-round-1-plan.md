@@ -15,7 +15,8 @@ instead uses Wrysk's own three repos — they cover the same language spread
 (C# + vault, TS + Python + prose docs, Rust + vault) and double as the
 dogfood targets D-0004 already mandates. The OSS fixture round still matters
 later (reproducibility, no vault-familiarity confound) but is not this round.
-If this posture sticks, D-0009 should be amended by Wrysk, not silently.
+Amended by Wrysk 2026-08-15 as D-0011 (partial supersession of D-0009's
+corpora clause; the rest of D-0009 stands).
 
 ## Matrix
 

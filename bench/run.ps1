@@ -4,6 +4,13 @@
 #
 #   .\run.ps1 -Model luna -Repo lore -Arm on -Task T4     # one cell
 #   .\run.ps1 -Matrix                                     # everything
+#   .\run.ps1 -Matrix -Models luna -Throttle 5            # luna only, 5-way parallel
+#
+# Matrix concurrency: read-only cells (T1-T4) run as parallel child pwsh
+# processes, capped at -Throttle (each child owns its OPENCODE_CONFIG, so
+# arms cannot cross-contaminate). T5 cells mutate working trees and qwen
+# cells contend for the GPU — both always run serially, after the parallel
+# wave.
 #
 # Results land in bench\results\<stamp>-<model>-<repo>-<arm>-<task>\.
 param(
@@ -11,7 +18,9 @@ param(
     [ValidateSet('lore', 'terrarium', 'lexomancy')] [string]$Repo,
     [ValidateSet('on', 'off')] [string]$Arm,
     [ValidateSet('T1', 'T2', 'T3', 'T4', 'T5')] [string]$Task,
-    [switch]$Matrix
+    [switch]$Matrix,
+    [ValidateSet('luna', 'qwen')] [string[]]$Models = @('luna', 'qwen'),
+    [ValidateRange(1, 16)] [int]$Throttle = 5
 )
 
 $ErrorActionPreference = 'Stop'
@@ -129,16 +138,40 @@ function Invoke-Cell([string]$model, [string]$repo, [string]$arm, [string]$task)
 }
 
 if ($Matrix) {
-    foreach ($mo in 'luna', 'qwen') {
+    $total = [System.Diagnostics.Stopwatch]::StartNew()
+    $cells = foreach ($mo in $Models) {
         foreach ($re in 'lore', 'terrarium', 'lexomancy') {
-            # Off first so a warm lore index can't leak into the comparison story.
             foreach ($ar in 'off', 'on') {
                 foreach ($ta in 'T1', 'T2', 'T3', 'T4', 'T5') {
-                    Invoke-Cell $mo $re $ar $ta
+                    [pscustomobject]@{ Model = $mo; Repo = $re; Arm = $ar; Task = $ta }
                 }
             }
         }
     }
+    $parallel = @($cells | Where-Object { $_.Model -eq 'luna' -and $_.Task -ne 'T5' })
+    $serial = @($cells | Where-Object { $_.Model -ne 'luna' -or $_.Task -eq 'T5' })
+
+    $procs = @()
+    foreach ($c in $parallel) {
+        while (@($procs | Where-Object { -not $_.HasExited }).Count -ge $Throttle) {
+            Start-Sleep -Seconds 3
+        }
+        $log = Join-Path $resultsRoot "launch-$($c.Model)-$($c.Repo)-$($c.Arm)-$($c.Task).log"
+        Write-Host "[matrix] launching $($c.Model)/$($c.Repo)/$($c.Arm)/$($c.Task)" -ForegroundColor DarkCyan
+        $procs += Start-Process pwsh -PassThru -WindowStyle Hidden -RedirectStandardOutput $log `
+            -ArgumentList '-NoProfile', '-File', $PSCommandPath,
+            '-Model', $c.Model, '-Repo', $c.Repo, '-Arm', $c.Arm, '-Task', $c.Task
+    }
+    $procs | ForEach-Object { $_.WaitForExit() }
+    $failed = @($procs | Where-Object { $_.ExitCode -ne 0 }).Count
+    if ($failed) { Write-Warning "[matrix] $failed parallel cell(s) exited non-zero — check launch-*.log" }
+
+    foreach ($c in $serial) {
+        Invoke-Cell $c.Model $c.Repo $c.Arm $c.Task
+    }
+    $total.Stop()
+    Write-Host ("[matrix] {0} cells in {1:n1} min ({2} parallel @ {3}, {4} serial)" -f
+        $cells.Count, $total.Elapsed.TotalMinutes, $parallel.Count, $Throttle, $serial.Count) -ForegroundColor Green
 } else {
     if (-not ($Model -and $Repo -and $Arm -and $Task)) {
         throw 'Provide -Model -Repo -Arm -Task, or -Matrix.'

@@ -126,3 +126,15 @@ Append-only. Newest entries at the bottom. Schema per [[README]].
 - **Consequences:** A full supersession must be written as a bare ID list — document this in ledger conventions when the promotion-gate docs land (M2). Partial supersessions need no special syntax.
 - **Supersedes:** None
 - **Canonical sources:** `crates/lore/src/authority.rs` (`bare_supersedes_list`); the Lexomancy ledger's D-0008/D-0010/D-0014/D-0015/D-0016 entries as the motivating corpus
+
+## D-0011 — Round-1 e2e corpora are Wrysk's own repos; OSS fixtures deferred
+
+- **Date:** 2026-08-15
+- **Status:** Accepted
+- **Scope:** E2E benchmark fixture corpora (amends D-0009)
+- **Decided by:** Wrysk ("no decisions set in stone about the corpora")
+- **Decision:** Benchmark round 1 runs on Wrysk's own three repos — lore, latent-music-terrarium, and Lexomancy — instead of OSS fixture repos. They cover the same language spread (Rust, TS+Python, C#, two styles of Markdown vault/docs), double as the dogfood targets D-0004 mandates, and allow parent-verified answer keys. OSS fixture corpora remain a later option for a reproducibility-focused round (no vault-familiarity confound), deferred rather than dropped.
+- **Rationale:** Round 1's job is shaking out the daemon and measuring retrieval deltas on corpora whose ground truth we can verify by hand; reproducibility against public repos matters once there is something worth publishing.
+- **Consequences:** `design/9_Scratch/2026-08-15_e2e-round-1-plan.md` is the round-1 protocol; the bench harness lives in `bench/`.
+- **Supersedes:** D-0009's fixture-corpora clause only ("a few mid-size repos from established OSS projects"); its early-benchmarks posture and driving-model choices stand.
+- **Canonical sources:** [[../9_Scratch/2026-08-15_e2e-round-1-plan]]
