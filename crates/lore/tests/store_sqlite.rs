@@ -156,7 +156,7 @@ fn replace_file_chunks_evicts_stale_and_preserves_unchanged_embeddings() {
         ])
         .unwrap();
     assert_eq!(stored, 2);
-    assert!(store.chunks_missing_embeddings(10).unwrap().is_empty());
+    assert!(store.chunks_missing_embeddings(0, 10).unwrap().is_empty());
 
     // Re-index: `stable` is byte-identical (same id), `doomed` is replaced by
     // a new chunk, and `stable` moved down the file (span changed only).
@@ -192,7 +192,7 @@ fn replace_file_chunks_evicts_stale_and_preserves_unchanged_embeddings() {
 
     // The unchanged chunk kept its embedding; the new one has none; the
     // deleted one's vector is gone.
-    let missing = store.chunks_missing_embeddings(10).unwrap();
+    let missing = store.chunks_missing_embeddings(0, 10).unwrap();
     assert_eq!(missing.len(), 1);
     assert_eq!(missing[0].chunk.id, fresh.id);
 
@@ -806,7 +806,7 @@ fn embedding_fingerprint_set_get_clear() {
 
     assert_eq!(store.clear_all_embeddings().unwrap(), 1);
     assert_eq!(store.status().unwrap().projects[0].embedded_chunks, 0);
-    assert_eq!(store.chunks_missing_embeddings(10).unwrap().len(), 1);
+    assert_eq!(store.chunks_missing_embeddings(0, 10).unwrap().len(), 1);
     // Chunks themselves are untouched.
     assert!(store.get_chunk(a, &c.id).unwrap().is_some());
     // Fingerprint is left for the caller to overwrite deliberately.

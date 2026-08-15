@@ -65,9 +65,12 @@ pub const PROBE_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// cannot grow this set without limit.
 pub const MAX_POISONED: usize = 10_000;
 
-/// Ceiling on one `chunks_missing_embeddings` request, which is widened by
-/// the poison count so skipped chunks cannot hide the work behind them.
-const MAX_FETCH: usize = 5_000;
+/// Rows hydrated per `chunks_missing_embeddings` page. Poisoned chunks are
+/// filtered after the query, so pages — not one widened fetch — are what
+/// carries the scan past them; this only bounds how many full chunk rows are
+/// in memory at once. `MAX_POISONED / PAGE_ROWS` bounds the extra pages a
+/// fully poisoned prefix can cost.
+pub const PAGE_ROWS: usize = 512;
 
 /// Normalization tag recorded in the fingerprint. The store L2-normalizes
 /// every vector on write, so cosine is a dot product thereafter.
@@ -91,6 +94,7 @@ pub struct EmbedWorker {
     poisoned: HashSet<(ProjectId, ChunkId)>,
     /// Chunks abandoned this process lifetime; logged, not persisted.
     skipped: usize,
+    page_rows: usize,
 }
 
 impl EmbedWorker {
@@ -109,7 +113,15 @@ impl EmbedWorker {
             cancel,
             poisoned: HashSet::new(),
             skipped: 0,
+            page_rows: PAGE_ROWS,
         }
+    }
+
+    /// Shrink the fetch page. Exists so a test can exercise the paging walk
+    /// past a fully poisoned page without seeding [`PAGE_ROWS`] rows; nothing
+    /// in the daemon calls it.
+    pub fn set_page_rows(&mut self, rows: usize) {
+        self.page_rows = rows.max(1);
     }
 
     /// Chunks abandoned after a non-retryable rejection.
@@ -265,38 +277,59 @@ impl EmbedWorker {
         }
     }
 
-    /// `None` on a store failure; an empty vec when the backlog is drained.
+    /// `None` on a store failure; an empty vec **only** when the query walked
+    /// off the end of the missing set.
+    ///
+    /// Poisoned chunks are filtered after the query, so a page that filters
+    /// away entirely is not an empty backlog — it is a page to step over. The
+    /// rowid cursor makes that distinction; without it the oldest poisoned
+    /// rows fill every request forever and everything behind them starves.
+    /// The walk terminates because each page either yields work or consumes
+    /// poisoned rows from a set capped at [`MAX_POISONED`].
     async fn next_batch(&self) -> Option<Vec<EmbedCandidate>> {
         let want = self.client.settings().batch_max_items.max(1);
-        // Widened by the poison count: skipped chunks sort first (lowest
-        // rowid) and would otherwise fill every request forever.
-        let fetch = want.saturating_add(self.poisoned.len()).min(MAX_FETCH);
-        let fetched = match self
-            .store
-            .with(move |s| s.chunks_missing_embeddings(fetch))
-            .await
-        {
-            Ok(Ok(fetched)) => fetched,
-            Ok(Err(err)) => {
-                tracing::warn!(error = %err, "could not list chunks missing embeddings");
-                return None;
+        // Independent of `want`: the walk fills a batch larger than one page
+        // from several pages, so hydrated rows stay bounded whatever the
+        // configured batch size is.
+        let page = self.page_rows;
+        let mut batch = Vec::with_capacity(want.min(page));
+        let mut cursor = 0i64;
+
+        loop {
+            let fetched = match self
+                .store
+                .with(move |s| s.chunks_missing_embeddings(cursor, page))
+                .await
+            {
+                Ok(Ok(fetched)) => fetched,
+                Ok(Err(err)) => {
+                    tracing::warn!(error = %err, "could not list chunks missing embeddings");
+                    return None;
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "store task failed while listing embed candidates");
+                    return None;
+                }
+            };
+            let end_of_set = fetched.len() < page;
+
+            for candidate in fetched {
+                cursor = cursor.max(candidate.rowid);
+                if !self
+                    .poisoned
+                    .contains(&(candidate.project, candidate.chunk.id.clone()))
+                {
+                    batch.push(candidate);
+                    if batch.len() == want {
+                        return Some(batch);
+                    }
+                }
             }
-            Err(err) => {
-                tracing::warn!(error = %err, "store task failed while listing embed candidates");
-                return None;
+
+            if end_of_set {
+                return Some(batch);
             }
-        };
-        Some(
-            fetched
-                .into_iter()
-                .filter(|candidate| {
-                    !self
-                        .poisoned
-                        .contains(&(candidate.project, candidate.chunk.id.clone()))
-                })
-                .take(want)
-                .collect(),
-        )
+        }
     }
 
     /// Returns false on a store failure (the caller stops this pass).
