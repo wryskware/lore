@@ -221,8 +221,8 @@ makes sense"); remaining picks follow the note's recommendations.
 5. **Part 2 + Part 3**: **approved as specced** (delegated).
 6. **Part 4**: **amend 4.1 to prefix** (Wrysk selected in-thread; treated as
    the required authorization), `path_glob` filed as a backlog issue.
-7. Issues: **all seven candidates filed** (delegated; closing an unwanted
-   issue is cheap, losing a deferred item is not).
+7. Deferred items: **tracked in `2026-08-14_deferred-backlog.md`**, not
+   GitHub issues (Wrysk: solo repo, no issue ceremony).
 
 If implementation follows approval: worktree, 235-test suite green,
 clippy/fmt clean, `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`.
