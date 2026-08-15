@@ -1,0 +1,236 @@
+{
+  "corpus": "lore-bench",
+  "root": "C:\\Users\\perag\\bench-e2e\\lore-bench",
+  "frozen_at": "977364ad1994b0293be67da931a9b7204133f0e3",
+  "queries": [
+    {
+      "id": "LB-01",
+      "kind": "semantic",
+      "query": "what stops two copies of the background service from both writing to the same index at once",
+      "relevant": [
+        { "path": "crates/lore/src/daemon/ownership.rs", "lines": [1, 70] }
+      ],
+      "why": "This module is the cross-process admission primitive: an exclusive OS lock held for process lifetime, explicitly contrasted with an existence-check lockfile."
+    },
+    {
+      "id": "LB-02",
+      "kind": "semantic",
+      "query": "if a branch switch touches thousands of files at once, how does the tool keep memory from growing without bound",
+      "relevant": [
+        { "path": "crates/lore/src/daemon/queue.rs", "lines": [1, 108] },
+        { "path": "crates/lore/src/daemon/watch.rs", "lines": [24, 28] }
+      ],
+      "why": "queue.rs is a set (not a channel) with a pending-path bound that degrades to a full rescan; watch.rs bounds the callback boundary with a try_send channel plus an overflow bit answered by a rescan."
+    },
+    {
+      "id": "LB-03",
+      "kind": "semantic",
+      "query": "why does compiler output and downloaded package content never turn up in results",
+      "relevant": [
+        { "path": "crates/lore/src/daemon/walk.rs", "lines": [1, 47] }
+      ],
+      "why": "The single 'is this file indexable' decision point, with a hard-exclude list (target, node_modules, Library, Temp, obj, bin) plus gitignore rules via the ignore crate."
+    },
+    {
+      "id": "LB-04",
+      "kind": "semantic",
+      "query": "how does it tell that a file's contents really changed rather than just its modification time being bumped",
+      "relevant": [
+        { "path": "crates/lore/src/daemon/index.rs", "lines": [1, 22] }
+      ],
+      "why": "The indexer's change detection is content hashing rather than mtime, with the reasoning about mtime lying across branch switches and restores stated in the module header and implemented in index_file."
+    },
+    {
+      "id": "LB-05",
+      "kind": "semantic",
+      "query": "what keeps a rough working note from outranking a ratified document when both discuss the same topic",
+      "relevant": [
+        { "path": "crates/lore/src/authority.rs", "lines": [1, 50] },
+        { "path": "design/2_Memory/2.1_Memory_Model.md" },
+        { "path": "design/3_Retrieval/3.1_Chunking_and_Ranking.md" }
+      ],
+      "why": "Computes the effective tier used by ranking: path ceilings demote scratch and research material, and a 'decided' declaration is honored only if it cites an active ledger entry. The two design docs state the same policy (status-aware ranking) and are accepted alternates."
+    },
+    {
+      "id": "LB-06",
+      "kind": "semantic",
+      "query": "how are two separately ordered result lists combined into one ordering without comparing their raw scores",
+      "relevant": [
+        { "path": "crates/lore/src/daemon/search.rs", "lines": [330, 461] }
+      ],
+      "why": "fuse_detailed combines ranks (not magnitudes) from the two arms; the module header explains why blending incomparable BM25 and cosine numbers was rejected."
+    },
+    {
+      "id": "LB-07",
+      "kind": "semantic",
+      "query": "if the server replies with the batch shuffled, how does each vector still land on the snippet it belongs to",
+      "relevant": [
+        { "path": "crates/lore/src/embed/client.rs", "lines": [317, 350] }
+      ],
+      "why": "restore_order rebuilds input order from each response item's index field and validates widths, calling a misattached vector a silent permanent corruption."
+    },
+    {
+      "id": "LB-08",
+      "kind": "semantic",
+      "query": "how does an editor plugin figure out where to reach the local service after it has been restarted on a new port",
+      "relevant": [
+        { "path": "crates/lore-mcp/src/daemon.rs", "lines": [1, 45] },
+        { "path": "crates/lore-core/src/discovery.rs", "lines": [1, 45] }
+      ],
+      "why": "lore-mcp re-reads the discovery record on every tool call precisely because the process it proxies restarts with a new port and pid; lore-core owns the record type, its freshness rule and data-directory resolution."
+    },
+    {
+      "id": "LB-09",
+      "kind": "semantic",
+      "query": "when an agent asks to see more of the surrounding lines, is that text read fresh from the file or served from what was stored",
+      "relevant": [
+        { "path": "crates/lore/src/daemon/expand.rs", "lines": [1, 16] }
+      ],
+      "why": "States outright that the text comes from disk rather than the index, and that the stored chunk is only a fallback when disk and index disagree."
+    },
+    {
+      "id": "LB-10",
+      "kind": "semantic",
+      "query": "what happens if someone types unbalanced quotes or stray brackets into the search box",
+      "relevant": [
+        { "path": "crates/lore/src/store/query.rs", "lines": [12, 61] }
+      ],
+      "why": "sanitize_fts_query whitelists alphanumeric runs into quoted phrase terms so unterminated quotes, stray parens and bare operators can never produce a syntax error."
+    },
+    {
+      "id": "LB-11",
+      "kind": "lexical",
+      "query": "does search degrade to lexical-only when the embedding endpoint is missing or unhealthy",
+      "relevant": [
+        { "path": "crates/lore/src/embed/mod.rs", "lines": [1, 30] }
+      ],
+      "why": "The embed module header states the D-0007 contract directly: absent or unhealthy endpoint degrades search to lexical-only, visibly in GET /v1/status, and never fails a search."
+    },
+    {
+      "id": "LB-12",
+      "kind": "lexical",
+      "query": "how large can a chunk be before it is split into overlapping windows, and what are the chunk size limits",
+      "relevant": [
+        { "path": "crates/lore/src/chunk/common.rs", "lines": [10, 39] }
+      ],
+      "why": "Defines MAX_FILE_BYTES, MAX_CHUNK_BYTES, TINY_CHUNK_BYTES, SMALL_CONTAINER_BYTES, TEXT_WINDOW_LINES and WINDOW_OVERLAP_LINES with the rationale for each."
+    },
+    {
+      "id": "LB-13",
+      "kind": "lexical",
+      "query": "which FTS5 tokenizer does the SQLite schema use and why is underscore a token character",
+      "relevant": [
+        { "path": "crates/lore/src/store/schema.rs", "lines": [30, 40] }
+      ],
+      "why": "The migration doc explains the unicode61 remove_diacritics 2 tokenchars '_' choice and why stock unicode61 shatters snake_case identifiers."
+    },
+    {
+      "id": "LB-14",
+      "kind": "lexical",
+      "query": "how does the watcher handle nested project roots where one registered root contains another",
+      "relevant": [
+        { "path": "crates/lore/src/daemon/watch.rs", "lines": [20, 23] }
+      ],
+      "why": "The pump routes each event to all roots containing it; routing to the first match is named as the defect that leaves the other project's index permanently stale."
+    },
+    {
+      "id": "LB-15",
+      "kind": "lexical",
+      "query": "what is the retry policy, backoff delay and request timeout for embedding requests",
+      "relevant": [
+        { "path": "crates/lore/src/embed/client.rs", "lines": [41, 58] }
+      ],
+      "why": "DEFAULT_MAX_ATTEMPTS, RETRY_BASE_DELAY, RETRY_MAX_DELAY and REQUEST_TIMEOUT are declared here with their rationale."
+    },
+    {
+      "id": "LB-16",
+      "kind": "symbol",
+      "query": "where is bare_supersedes_list defined",
+      "relevant": [
+        { "path": "crates/lore/src/authority.rs", "lines": [377, 399] }
+      ],
+      "why": "The function is defined here; it is also the canonical source cited by decision D-0010."
+    },
+    {
+      "id": "LB-17",
+      "kind": "symbol",
+      "query": "which file contains the sanitize_fts_query function",
+      "relevant": [
+        { "path": "crates/lore/src/store/query.rs", "lines": [33, 61] }
+      ],
+      "why": "sanitize_fts_query is declared in this module."
+    },
+    {
+      "id": "LB-18",
+      "kind": "symbol",
+      "query": "where does page_is_final live",
+      "relevant": [
+        { "path": "crates/lore/src/daemon/search.rs", "lines": [261, 294] }
+      ],
+      "why": "page_is_final is defined here as the acquisition loop's stop condition."
+    },
+    {
+      "id": "LB-19",
+      "kind": "symbol",
+      "query": "where is Store::apply_project_set implemented",
+      "relevant": [
+        { "path": "crates/lore/src/store/mod.rs", "lines": [420, 498] }
+      ],
+      "why": "The method and its remove/release/claim ordering are implemented on Store in this file."
+    },
+    {
+      "id": "LB-20",
+      "kind": "design",
+      "query": "why did we decide to build a new context daemon instead of adopting or forking an existing one",
+      "relevant": [
+        { "path": "design/0_Canon/DECISIONS.md", "lines": [22, 32] }
+      ],
+      "why": "D-0002 records the accepted decision to build Lore, with the rationale that the commodity layer is solved everywhere while the motivating capabilities exist nowhere."
+    },
+    {
+      "id": "LB-21",
+      "kind": "design",
+      "query": "what is the authority order in this vault and how does a document become canon",
+      "relevant": [
+        { "path": "design/0_Canon/README.md", "lines": [12, 43] }
+      ],
+      "why": "Lists the six-level authority order, the design_status document states, the certainty callouts, and the promotion rules that gate canon."
+    },
+    {
+      "id": "LB-22",
+      "kind": "design",
+      "query": "what does the design say the ranking steps must be and which part is a requirement versus tuning",
+      "relevant": [
+        { "path": "design/3_Retrieval/3.1_Chunking_and_Ranking.md", "lines": [46, 53] }
+      ],
+      "why": "The Ranking section specifies BM25 plus vector cosine fused with RRF, then a vault-status modifier after fusion, and states that the ordering is the requirement while weights are tuning."
+    },
+    {
+      "id": "LB-23",
+      "kind": "design",
+      "query": "what ships in each milestone and what is on the backlog",
+      "relevant": [
+        { "path": "design/5_Implementation/5.1_Milestones.md", "lines": [10, 31] }
+      ],
+      "why": "Enumerates M0 through M4, the indexing scope note, the backlog items, and the benchmark posture."
+    },
+    {
+      "id": "LB-24",
+      "kind": "design",
+      "query": "which tools are in the v0.1 MCP surface and what was deliberately excluded from it",
+      "relevant": [
+        { "path": "design/4_Interfaces/4.1_MCP_Surface.md", "lines": [13, 32] }
+      ],
+      "why": "Names search, expand and status as the v0.1 tools and lists the deliberate exclusions (registration/reindex are CLI-only, no memory-write API, no graph tools)."
+    },
+    {
+      "id": "LB-25",
+      "kind": "design",
+      "query": "what did the post-mortem conclude about the earlier tool that made the machine unusable",
+      "relevant": [
+        { "path": "design/7_Research/01_landscape.md", "lines": [45, 53] }
+      ],
+      "why": "The CCE post-mortem section walks the five findings (process-local asyncio locks, per-process watchers, mutual re-indexing cascade, stale lifecycle state, the 36-indexer issue) and the resulting design lessons."
+    }
+  ]
+}

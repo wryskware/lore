@@ -1,0 +1,237 @@
+{
+  "corpus": "terrarium-bench",
+  "root": "C:\\Users\\perag\\bench-e2e\\terrarium-bench",
+  "frozen_at": "3b1eacd56fe1c33f19a49a00582b425b316eb4ad",
+  "queries": [
+    {
+      "id": "TB-01",
+      "kind": "semantic",
+      "query": "how does each little organism decide which way to turn — does it look straight ahead and off to each side before it moves?",
+      "relevant": [
+        { "path": "web/src/sim/physarum/shaders/agents.wgsl", "lines": [145, 213] }
+      ],
+      "why": "stepAgents samples the field at a forward point and two flanking points offset by the sensor angle, then turns toward whichever reads strongest."
+    },
+    {
+      "id": "TB-02",
+      "kind": "semantic",
+      "query": "when one instrument drops out of the mix, what makes its part of the picture fade down without disappearing entirely?",
+      "relevant": [
+        { "path": "web/src/mapping/stemfollow.ts", "lines": [1, 64] }
+      ],
+      "why": "The multiplier is floor + (1 - floor) * activity^curve with a default floor of 0.25 — explicitly 'a floor, not a gate', so a silent instrument keeps a ghost rather than blacking out."
+    },
+    {
+      "id": "TB-03",
+      "kind": "semantic",
+      "query": "a user's edits were never being written to storage because changes kept streaming in and reset the timer forever — what bounds the wait so a write eventually lands?",
+      "relevant": [
+        { "path": "web/src/ui/autosave.ts", "lines": [1, 90] }
+      ],
+      "why": "The header documents the trailing-debounce starvation failure ('my exposure settings are lost on reload') and maxWaitMs (default 2000) sets a deadline timer once dirty so the write happens regardless of the change stream."
+    },
+    {
+      "id": "TB-04",
+      "kind": "semantic",
+      "query": "why would the same song come out with mirrored axes on two different runs, and what pins the orientation down?",
+      "relevant": [
+        { "path": "analysis/src/terrarium_analysis/stages/character.py", "lines": [40, 73] }
+      ],
+      "why": "The decomposition notes that SVD leaves each direction's sign arbitrary so an unconstrained run flips axes between runs and tracks; the fix forces the largest-magnitude loading in each direction positive."
+    },
+    {
+      "id": "TB-05",
+      "kind": "semantic",
+      "query": "the human just points at whichever variation looks better and the system keeps moving that way — how does that steering work when there is no objective function to optimize?",
+      "relevant": [
+        { "path": "web/src/explore/search.ts", "lines": [1, 57] }
+      ],
+      "why": "Documented as a (1+lambda) evolution strategy with lambda = 8 over a black box with a noisy ordinal oracle: sample around the incumbent, keep the winner, and repeat the winning displacement as a free line search."
+    },
+    {
+      "id": "TB-06",
+      "kind": "semantic",
+      "query": "pulling rendered images back off the graphics card leaves each line of pixels padded out to an alignment boundary — where is that padding removed so consumers get tightly packed bytes?",
+      "relevant": [
+        { "path": "web/src/export/frame-readback.ts", "lines": [1, 104] }
+      ],
+      "why": "COPY_BYTES_PER_ROW_ALIGNMENT = 256 drives the padded/unpadded row layout, and stripReadbackRowPadding copies row by row from the staging buffer into a tightly packed output."
+    },
+    {
+      "id": "TB-07",
+      "kind": "semantic",
+      "query": "the picture was landing slightly before you could hear the hit — how is the gap between handing samples to the sound hardware and actually hearing them accounted for?",
+      "relevant": [
+        { "path": "web/src/audio/clock.ts", "lines": [99, 111] }
+      ],
+      "why": "outputDelay() adds baseLatency plus outputLatency into the time origin, with the comment that without it the simulation leads the audio by 20-50 ms on WASAPI and drops land early."
+    },
+    {
+      "id": "TB-08",
+      "kind": "semantic",
+      "query": "what keeps two mutually attracting groups from crushing themselves into a single point within a few frames?",
+      "relevant": [
+        { "path": "web/src/sim/plife/shaders/step.wgsl", "lines": [53, 58] },
+        { "path": "web/src/sim/plife/shaders/step.wgsl", "lines": [180, 201] }
+      ],
+      "why": "REPULSE = 3.0 is a universal sign-blind short-range term applied to every pair — the comment states that without it two mutually attracted kinds collapse to a point — and the force law makes it divergent toward contact rather than linearly capped."
+    },
+    {
+      "id": "TB-09",
+      "kind": "semantic",
+      "query": "if you jump forward a couple of seconds in the track, why doesn't everything that would have happened in the skipped stretch all fire at once?",
+      "relevant": [
+        { "path": "web/src/timeline/sampler.ts", "lines": [42, 126] }
+      ],
+      "why": "A gap larger than MAX_WALK_GAP_TICKS is treated as a seek and relocates the pointer by binary search, discarding what was skipped — the comment names the exact failure of walking instead (two seconds of hats and kicks firing together)."
+    },
+    {
+      "id": "TB-10",
+      "kind": "semantic",
+      "query": "a song fetched once still plays later even with the machine that served it switched off — where does that storage layer live?",
+      "relevant": [
+        { "path": "web/src/timeline/cache.ts", "lines": [1, 30] },
+        { "path": "web/src/timeline/cache.ts", "lines": [72, 95] }
+      ],
+      "why": "The module stores whole HTTP responses (a ~200 KB manifest, ~600 KB binary and ~40 MB of audio) in the Cache API with only a small index in localStorage, and cachingFetch is the read-through the loader and the transport call instead of fetch."
+    },
+    {
+      "id": "TB-11",
+      "kind": "semantic",
+      "query": "glow around the brightest filaments used to snap on and off as they crossed the cutoff — how was that made a gradual transition?",
+      "relevant": [
+        { "path": "web/src/sim/render/shaders/bloom.wgsl", "lines": [1, 38] }
+      ],
+      "why": "fsPrefilter uses a soft-knee threshold (credited to Karis) whose quadratic transition replaces a hard threshold that made the effect pop on and off as a filament crossed it, which read as flicker."
+    },
+    {
+      "id": "TB-12",
+      "kind": "lexical",
+      "query": "how is a per-stem activity curve built from RMS loudness and onset strength?",
+      "relevant": [
+        { "path": "analysis/src/terrarium_analysis/stages/stems.py", "lines": [33, 68] }
+      ],
+      "why": "activity_from_curves combines a dB-domain level with a gated onset boost and then an asymmetric EMA with fast attack and slow release."
+    },
+    {
+      "id": "TB-13",
+      "kind": "lexical",
+      "query": "what does the slew limiter do to modulated parameters, and what are the fast / medium / slow time constants?",
+      "relevant": [
+        { "path": "web/src/mapping/slew.ts", "lines": [1, 98] }
+      ],
+      "why": "SlewLimiter applies exponential approach per parameter class with DEFAULT_SLEW = { fast: 0.05, medium: 0.5, slow: 8 }, plus snapClass for section boundaries."
+    },
+    {
+      "id": "TB-14",
+      "kind": "lexical",
+      "query": "how is the seed resolved at startup — does a URL query parameter beat a pinned seed?",
+      "relevant": [
+        { "path": "web/src/sim/seed.ts", "lines": [54, 89] }
+      ],
+      "why": "resolveSeed checks ?seed= first, then the localStorage pin, then a fresh random seed; syncUrlSeed only rewrites the parameter when it is already present."
+    },
+    {
+      "id": "TB-15",
+      "kind": "lexical",
+      "query": "which PQ / ST 2084 transfer function constants does the HDR10 export path use?",
+      "relevant": [
+        { "path": "web/src/export/hdr.ts", "lines": [29, 62] }
+      ],
+      "why": "PQ_M1/PQ_M2/PQ_C1/PQ_C2/PQ_C3 are declared in exact rational form with pqEncodeNits and pqDecodeNits implementing the inverse EOTF and EOTF against a 10,000-nit peak."
+    },
+    {
+      "id": "TB-16",
+      "kind": "lexical",
+      "query": "how does the driver bank z-score its channels and reorder the latent components by variance?",
+      "relevant": [
+        { "path": "web/src/mapping/modulation.ts", "lines": [1, 45] }
+      ],
+      "why": "The module header describes the ~16-channel named bank (novelty4, novelty16, chorus-ness plus the top ~13 components), z-scoring per track, and re-measuring variance at load because post-PCA smoothing broke the stored ordering."
+    },
+    {
+      "id": "TB-17",
+      "kind": "lexical",
+      "query": "how does the analysis server compute the track content version the browser caches on?",
+      "relevant": [
+        { "path": "analysis/src/terrarium_analysis/server.py", "lines": [242, 296] }
+      ],
+      "why": "timeline_content_version sha256s timeline.json and timeline.bin and truncates to 16 hex chars; track_entry memoises it on (size, mtime_ns) and explains why it is a content hash rather than an mtime."
+    },
+    {
+      "id": "TB-18",
+      "kind": "symbol",
+      "query": "where is smoothDtFrames defined?",
+      "relevant": [
+        { "path": "web/src/sim/step-cadence.ts", "lines": [34, 41] }
+      ],
+      "why": "Exported function that smooths the render frame length in 60 Hz units, with the DT_FRAMES_TAU_S constant above it."
+    },
+    {
+      "id": "TB-19",
+      "kind": "symbol",
+      "query": "which shader file contains the stepAgents compute entry point?",
+      "relevant": [
+        { "path": "web/src/sim/physarum/shaders/agents.wgsl", "lines": [145, 213] }
+      ],
+      "why": "@compute @workgroup_size(64) fn stepAgents is declared there, alongside initAgents, respawnAgents and splashAgents."
+    },
+    {
+      "id": "TB-20",
+      "kind": "symbol",
+      "query": "where is the followMultiplier function implemented?",
+      "relevant": [
+        { "path": "web/src/mapping/stemfollow.ts", "lines": [52, 64] }
+      ],
+      "why": "Exported pure helper returning floor + (1 - floor) * pow(activity, curve), used by the StemFollow class in the same file."
+    },
+    {
+      "id": "TB-21",
+      "kind": "symbol",
+      "query": "where does maxChromaForLh live?",
+      "relevant": [
+        { "path": "web/src/sim/hsluv.ts", "lines": [70, 79] }
+      ],
+      "why": "Module-private function in the vendored HSLuv transcription, taking the inner envelope of the six gamut boundary lines; called by hsluvToRgb and rgbToHsluv."
+    },
+    {
+      "id": "TB-22",
+      "kind": "docs",
+      "query": "which layer of the music model did the research settle on, and why not the final layer?",
+      "relevant": [
+        { "path": "docs/research/audio-analysis.md", "lines": [44, 64] },
+        { "path": "docs/research/audio-embeddings.md", "lines": [31, 38] }
+      ],
+      "why": "Both cite arXiv 2505.16306's per-layer probing table: layer ~6 for genre/emotion character, layers 9-12 for structural identity, and the finding that the best layer is almost never the last."
+    },
+    {
+      "id": "TB-23",
+      "kind": "docs",
+      "query": "why did we stop projecting straight from the raw 1024-dimensional embedding and introduce a bank of named signals instead?",
+      "relevant": [
+        { "path": "docs/plan.md", "lines": [413, 431] },
+        { "path": "web/src/mapping/modulation.ts", "lines": [1, 45] }
+      ],
+      "why": "plan.md Revision 4 records the reason ('raw-1024 random projections react to everything and isolate nothing; nobody can tune 1024 weights') and the implementation header repeats it as the rationale for the named, gain-per-channel tuning surface."
+    },
+    {
+      "id": "TB-24",
+      "kind": "docs",
+      "query": "did the HDR video export end up shipping on HEVC or AV1, and what was wrong with the earlier conclusion?",
+      "relevant": [
+        { "path": "docs/handoffs/headless-export-current-state.md", "lines": [3, 38] }
+      ],
+      "why": "The 2026-08-13 correction states the earlier HEVC conclusion was caused by an old local FFmpeg, that av1_metadata has existed since FFmpeg 4.3, and that the shipped profiles are now av1-hdr10-2160p120 / av1-hdr10-1080p120 with hevc_nvenc removed entirely."
+    },
+    {
+      "id": "TB-25",
+      "kind": "docs",
+      "query": "why was HSLuv chosen over OKLCh for the species palette?",
+      "relevant": [
+        { "path": "docs/handoffs/hsluv-palette-v2.md", "lines": [28, 46] },
+        { "path": "web/src/sim/oklch.ts", "lines": [1, 22] }
+      ],
+      "why": "The handoff records the decision (every H,S,L triple is inside sRGB by construction and equal-L hues have equal perceived lightness, matching the vuzic prior art), and oklch.ts states the same trade-off from the other side."
+    }
+  ]
+}

@@ -1,0 +1,290 @@
+{
+  "corpus": "lexomancy",
+  "root": "C:\\Users\\perag\\Unity\\Lexomancy",
+  "frozen_at": "cs:134 (changeset pin, per bench prerequisites)",
+  "notes": "Paths are relative to the stated root. The Unity project is nested one level down, so code paths begin with 'Lexomancy/Assets/...' and the design vault (its own git repo) with 'design/...'. If the retrieval arm reports paths relative to the inner Unity project instead, strip the leading 'Lexomancy/' segment.",
+  "queries": [
+    {
+      "id": "LX-01",
+      "kind": "semantic",
+      "query": "when an attack has nobody picked out to receive it, how does the game decide which opponent it lands on, and is that decision repeatable across replays?",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/BattleKernel/TargetHeuristic.cs", "lines": [30, 117]}
+      ],
+      "why": "The static ladder that picks a single-target recipient with no RNG: secure the kill, else biggest effective bite, else lowest HP fraction, else lane order."
+    },
+    {
+      "id": "LX-02",
+      "kind": "semantic",
+      "query": "how do gameplay extension pieces get discovered and installed at startup without anyone maintaining a hand-written registration list?",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/EncounterKernel/KernelBootstrap.cs", "lines": [12, 60]},
+        {"path": "Lexomancy/Assets/Scripts/EncounterKernel/KernelModuleAttribute.cs", "lines": [5, 13]},
+        {"path": "Lexomancy/Assets/Scripts/EncounterKernel/KernelBuilder.cs", "lines": [8, 56]}
+      ],
+      "why": "KernelBootstrap walks AppDomain assemblies, filters types carrying a marker attribute, Activator-creates each and calls Install against the builder."
+    },
+    {
+      "id": "LX-03",
+      "kind": "semantic",
+      "query": "how does one system tell another that a run just began or that the player's health moved, without either side holding a reference to the other?",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/Core/CoreEvents.cs", "lines": [15, 205]}
+      ],
+      "why": "A static hub of C# Action delegates plus type-safe Raise* publishers, explicitly documented as decoupling modules from singleton instances."
+    },
+    {
+      "id": "LX-04",
+      "kind": "semantic",
+      "query": "what makes the tiles you're holding spread into a curve and lift up when the pointer moves over one of them?",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/Core/HandLayoutManager.cs", "lines": [10, 110]}
+      ],
+      "why": "MonoBehaviour with serialized spacing/elevation/scale fields, an AnimationCurve for adjacent displacement, and a coroutine that animates toward target positions on hover and selection."
+    },
+    {
+      "id": "LX-05",
+      "kind": "semantic",
+      "query": "why are some saved collections kept as plain ordered lists when the data is really a set of unique identifiers?",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/State/RunState.cs", "lines": [53, 122]}
+      ],
+      "why": "Comments on visitedNodes, ownedAxiomIds and axiomInscriptions each state the collection is a List rather than a HashSet/Dictionary specifically because Unity serialization cannot round-trip those."
+    },
+    {
+      "id": "LX-06",
+      "kind": "semantic",
+      "query": "what stops a neural-network encode from blocking a frame when the player clicks something, and where does it fail loudly instead of degrading?",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/Lexinomicon/AnalysisEngine/SyncEmbedGate.cs", "lines": [47, 88]}
+      ],
+      "why": "A depth-counted opt-in scope whose AssertAllowed throws InvalidOperationException during play mode outside an explicit Allow(...) using-block."
+    },
+    {
+      "id": "LX-07",
+      "kind": "semantic",
+      "query": "how is a struct message handed to every interested listener in a fixed before / modify / after ordering, with the listeners stored per message type?",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/EncounterKernel/Effects/Events/EventRouter.cs", "lines": [11, 88]}
+      ],
+      "why": "Generic Subscribe/Dispatch constrained to `where T : struct, IGameEvent`, handler lists boxed in a Dictionary<Type, object>, dispatched Pre/Modify/Post with a LINQ Where+OrderBy on priority."
+    },
+    {
+      "id": "LX-08",
+      "kind": "semantic",
+      "query": "what's the shared authored-asset base class every menu ability derives from, with a resource price and a hook for the ones that need extra player input first?",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/Player/Actions/PlayerActionSO.cs", "lines": [7, 60]},
+        {"path": "Lexomancy/Assets/Scripts/Inventory/ConsumableDefinition.cs", "lines": [18, 68]}
+      ],
+      "why": "Both are abstract ScriptableObject bases with a cost field, CanExecute/Execute, and virtual RequiresAdditionalInput + OnEnter/OnExitPerformActionState hooks; ConsumableDefinition's docs say it mirrors PlayerActionSO."
+    },
+    {
+      "id": "LX-09",
+      "kind": "semantic",
+      "query": "how does the game keep dealing out characters without ever running dry of vowels, while still making the uncommon ones feel scarce?",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/Gameplay/WordplayScene/LetterBag.cs", "lines": [9, 102]}
+      ],
+      "why": "A weighted cumulative random draw over a per-character count dictionary that auto-adds a fresh virtual set once the pool falls under a threshold fraction of its initial size."
+    },
+    {
+      "id": "LX-10",
+      "kind": "semantic",
+      "query": "how does a single word get sorted into the closest thematic category using vector distance, and where do the runner-up categories come from?",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/Echoes/Affinity/AffinityMatcher.cs", "lines": [12, 61]}
+      ],
+      "why": "Embeds the word, scores it against every category centroid via IEmbeddingService.Similarity, sorts descending, takes the top as primary and collects secondaries above a configured floor."
+    },
+    {
+      "id": "LX-11",
+      "kind": "semantic",
+      "query": "there are two lanes for background inference requests — one where only the newest submission still matters and one where every callback is guaranteed to fire in order. where is that implemented?",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/Gameplay/WordplayScene/UI/EmbeddingAsyncDispatcher.cs", "lines": [13, 113]}
+      ],
+      "why": "Class doc names exactly three channels — a superseding single pending slot, a guaranteed-delivery FIFO queue, and a batch channel riding the same queue — with one in-flight request at a time."
+    },
+    {
+      "id": "LX-12",
+      "kind": "semantic",
+      "query": "which component paints the six-sided grid into Unity's tile renderer and keeps cells the player hasn't uncovered hidden?",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/Level/HexRoomGenerator.cs", "lines": [15, 100]}
+      ],
+      "why": "MonoBehaviour holding a Tilemap reference plus TileBase assets for hidden/available/occupied/door/portal states, subscribing to tile-state-change events in Start and unsubscribing in OnDestroy."
+    },
+    {
+      "id": "LX-13",
+      "kind": "semantic",
+      "query": "is the logic for holding, selecting and hovering the player's items written twice for the two modes, or shared behind a type parameter?",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/Hand/GenericHandController.cs", "lines": [9, 67]},
+        {"path": "Lexomancy/Assets/Scripts/Hand/HAND_SYSTEM_INTEGRATION.md", "lines": [1, 30]}
+      ],
+      "why": "A pure-C# `GenericHandController<T> where T : IHandItem` with Action<T> events; the companion doc states the same system serves letter tiles and word cards."
+    },
+    {
+      "id": "LX-14",
+      "kind": "lexical",
+      "query": "how does a loot table roll its rewards, and how are duplicate gold or currency drops consolidated before they reach the player?",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/Loot/LootTableSO.cs", "lines": [12, 72]},
+        {"path": "Lexomancy/Assets/Scripts/Loot/LootApplicator.cs", "lines": [12, 81]}
+      ],
+      "why": "LootTableSO.Roll seeds an RNG from the run, rolls each group, then ConsolidateCurrencies/RemoveDuplicateItems; LootApplicator switches on reward type to mutate RunState."
+    },
+    {
+      "id": "LX-15",
+      "kind": "lexical",
+      "query": "how is the word dictionary loaded from the text asset and how does word validation look a word up?",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/Dictionary/Dictionary.cs", "lines": [4, 80]}
+      ],
+      "why": "Awake splits a TextAsset into a HashSet<string> of trimmed lowercase words; Lookup does the case-insensitive Contains check with a disableValidation bypass."
+    },
+    {
+      "id": "LX-16",
+      "kind": "lexical",
+      "query": "how does the inventory keep stacks of consumable items and make them persist between rooms but reset on a new run?",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/Inventory/InventoryController.cs", "lines": [9, 70]}
+      ],
+      "why": "Serializable ConsumableStack plus a DontDestroyOnLoad singleton MonoBehaviour with InitializeForNewRun clearing and re-seeding starting items."
+    },
+    {
+      "id": "LX-17",
+      "kind": "lexical",
+      "query": "what does the wordplay turn manager do with the input action map, and how does it track the current turn state?",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/Gameplay/WordplayScene/WordPlayTurnManager.cs", "lines": [13, 90]}
+      ],
+      "why": "Singleton MonoBehaviour that constructs PlayerInput in Awake, enables the WordGame map and binds SubmitTurn/CancelTurn in OnEnable, unbinds in OnDisable, and exposes IGameState + OnStateChanged."
+    },
+    {
+      "id": "LX-18",
+      "kind": "lexical",
+      "query": "how are pending telegraphed actions scheduled and then taken when they come due on the battle tick timeline?",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/BattleKernel/Telegraphs/PendingActionScheduler.cs", "lines": [16, 59]}
+      ],
+      "why": "Post appends to an active list; TakeDue(tick) removes and returns every action whose absolute ResolveAtTick matches; RemoveActive cancels one early."
+    },
+    {
+      "id": "LX-19",
+      "kind": "lexical",
+      "query": "where are hex neighbors and the direction between two hex coordinates computed?",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/Hex/HexUtils.cs", "lines": [8, 70]}
+      ],
+      "why": "Static GetNeighbors iterating the six HexDirection values and GetDirectionBetween resolving axis-collinear q/r/s differences."
+    },
+    {
+      "id": "LX-20",
+      "kind": "symbol",
+      "query": "where is TargetHeuristic.ChooseTarget implemented?",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/BattleKernel/TargetHeuristic.cs", "lines": [37, 58]}
+      ],
+      "why": "Exact definition site of the static ChooseTarget method."
+    },
+    {
+      "id": "LX-21",
+      "kind": "symbol",
+      "query": "where is the EffectManager class defined and what events does it expose?",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/EncounterKernel/Effects/EffectManager.cs", "lines": [11, 70]}
+      ],
+      "why": "Class declaration with OnEffectAdded/Removed/Ticked/Expired/Countered events and AddEffect/RemoveEffect."
+    },
+    {
+      "id": "LX-22",
+      "kind": "symbol",
+      "query": "find the SimpleHeuristicSelector implementation of IAbilitySelector",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/BattleKernel/SimpleHeuristicSelector.cs", "lines": [15, 60]},
+        {"path": "Lexomancy/Assets/Scripts/BattleKernel/IAbilitySelector.cs"}
+      ],
+      "why": "SimpleHeuristicSelector : IAbilitySelector with the heal-threshold / expected-damage / first-ready selection ladder."
+    },
+    {
+      "id": "LX-23",
+      "kind": "symbol",
+      "query": "where is BertTokenizer and its WordPiece tokenization method?",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/Lexinomicon/AnalysisEngine/BertTokenizer.cs", "lines": [13, 135]}
+      ],
+      "why": "Class at line 13; BasicTokenize at 83 and WordPieceTokenize at 119, feeding Tokenize's input_ids/attention_mask output."
+    },
+    {
+      "id": "LX-24",
+      "kind": "symbol",
+      "query": "where is the AxiomHost class implemented?",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/Axioms/AxiomHost.cs", "lines": [35, 90]}
+      ],
+      "why": "Sealed class owning the run's acquired axiom set and projecting them onto the scoring registrations and the capability AxiomEngine."
+    },
+    {
+      "id": "LX-25",
+      "kind": "docs",
+      "query": "design document covering axioms and the forging flow — what's decided versus still leaning?",
+      "relevant": [
+        {"path": "design/1_GameSystems/1.16_Axioms_and_Forging.md", "lines": [1, 40]}
+      ],
+      "why": "Front-matter marks design_status: leaning with decision_refs D-0002..D-0009, and the body states P-1..P-5 were accepted as ledger entries while the library stays working-level."
+    },
+    {
+      "id": "LX-26",
+      "kind": "docs",
+      "query": "what is supposed to happen when a player types gibberish — does the game refuse the input or still produce something playable?",
+      "relevant": [
+        {"path": "design/3_AnalysisEngine/3.6_Fallback_Safety.md", "lines": [1, 30]}
+      ],
+      "why": "States the fallback guarantee 'every input produces a valid Battle Card', with no error message, deterministic output, and a tone-to-generic-pattern table."
+    },
+    {
+      "id": "LX-27",
+      "kind": "docs",
+      "query": "how do the global managers come into existence when you press play on a single scene instead of starting from the front end?",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/BOOTSTRAP_SYSTEM.md", "lines": [1, 30]},
+        {"path": "Lexomancy/Assets/Scripts/GameBootstrapper.cs", "lines": [13, 70]}
+      ],
+      "why": "The doc describes the lazy-initialization GlobalManagers prefab with DontDestroyOnLoad singletons; GameBootstrapper.Awake instantiates that prefab only when GameController.Instance is null, then destroys itself."
+    },
+    {
+      "id": "LX-28",
+      "kind": "docs",
+      "query": "notes on how a placed word is checked for validity and whether it stays connected to the rest of the board",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/Gameplay/validation_algorithm.md", "lines": [1, 43]},
+        {"path": "Lexomancy/Assets/Scripts/Gameplay/WordplayScene/BoardCore/ThreadingRuleEvaluator.cs", "lines": [11, 80]}
+      ],
+      "why": "The markdown describes dictionary lookup plus the adjacency/connectedness check and the leaf-node pickup rule; ThreadingRuleEvaluator is the pure rule class implementing valid-placement discovery over tile and thread snapshots."
+    },
+    {
+      "id": "LX-29",
+      "kind": "multi-file",
+      "query": "trace changing one held letter into a different letter: the action asset, the picker that pops up, and where the discarded letter goes",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/Player/Actions/TransmuteLetterActionSO.cs", "lines": [9, 145]},
+        {"path": "Lexomancy/Assets/Scripts/UI/TransmuteActionModalController.cs", "lines": [14, 47]},
+        {"path": "Lexomancy/Assets/Scripts/Gameplay/WordplayScene/LetterBag.cs", "lines": [84, 102]}
+      ],
+      "why": "The SO returns RequiresAdditionalInput true and opens the modal via EnsureInScene, subscribing OnLetterSelected; its callback at line 139 calls HandManager.LetterBag.ReturnLetter(oldLetter), which increments the bag count."
+    },
+    {
+      "id": "LX-30",
+      "kind": "multi-file",
+      "query": "the arithmetic that turns a hit into lost hit points, and the separate projection of that same arithmetic used when the game picks who to swing at",
+      "relevant": [
+        {"path": "Lexomancy/Assets/Scripts/BattleKernel/BattleEffectContext.cs", "lines": [86, 105]},
+        {"path": "Lexomancy/Assets/Scripts/BattleKernel/BattleUnit.cs", "lines": [125, 133]},
+        {"path": "Lexomancy/Assets/Scripts/BattleKernel/TargetHeuristic.cs", "lines": [74, 88]}
+      ],
+      "why": "ResolveDamage does base + attacker Attack - defender Defense floored at zero then modifier channels; BattleUnit.TakeDamage drains Block once before HP; TargetHeuristic.ProjectedHpLoss deliberately mirrors both minus the modifier channels."
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+[
+  {
+    "id": "lexical",
+    "notes": "Control arm: no embedding endpoint; measures what BM25 alone does."
+  },
+  {
+    "id": "nomic-v1.5",
+    "gguf_repo": "nomic-ai/nomic-embed-text-v1.5-GGUF",
+    "gguf_file": "nomic-embed-text-v1.5.Q8_0.gguf",
+    "dimensions": 768,
+    "pooling": "mean",
+    "ctx": 8192,
+    "query_prefix": "search_query: ",
+    "document_prefix": "search_document: ",
+    "license": "Apache-2.0",
+    "notes": "Incumbent: same weights as Ollama's nomic-embed-text."
+  },
+  {
+    "id": "nomic-v2-moe",
+    "gguf_repo": "nomic-ai/nomic-embed-text-v2-moe-GGUF",
+    "gguf_file": "nomic-embed-text-v2-moe.Q8_0.gguf",
+    "dimensions": 768,
+    "pooling": "mean",
+    "ctx": 2048,
+    "query_prefix": "search_query: ",
+    "document_prefix": "search_document: ",
+    "license": "Apache-2.0",
+    "notes": "Multilingual MoE (305M active). Model max context is 512 tokens; ctx here is server total across 4 slots (512/slot)."
+  },
+  {
+    "id": "qwen3-0.6b",
+    "gguf_repo": "Qwen/Qwen3-Embedding-0.6B-GGUF",
+    "gguf_file": "Qwen3-Embedding-0.6B-f16.gguf",
+    "dimensions": 1024,
+    "pooling": "last",
+    "ctx": 8192,
+    "query_prefix": "Instruct: Given a natural language query, retrieve relevant code snippets or documentation passages\nQuery: ",
+    "document_prefix": "",
+    "license": "Apache-2.0",
+    "notes": "Card template is 'Instruct: {task}\\nQuery: {q}', documents unprefixed; task wording tailored to code+docs retrieval per card guidance (custom instructions +1-5%)."
+  },
+  {
+    "id": "qwen3-4b",
+    "gguf_repo": "Qwen/Qwen3-Embedding-4B-GGUF",
+    "gguf_file": "Qwen3-Embedding-4B-Q8_0.gguf",
+    "dimensions": 2560,
+    "pooling": "last",
+    "ctx": 8192,
+    "query_prefix": "Instruct: Given a natural language query, retrieve relevant code snippets or documentation passages\nQuery: ",
+    "document_prefix": "",
+    "license": "Apache-2.0",
+    "notes": "Brief C's pick for mixed code+prose on a 5090."
+  },
+  {
+    "id": "qwen3-8b",
+    "gguf_repo": "Qwen/Qwen3-Embedding-8B-GGUF",
+    "gguf_file": "Qwen3-Embedding-8B-Q8_0.gguf",
+    "dimensions": 4096,
+    "pooling": "last",
+    "ctx": 8192,
+    "query_prefix": "Instruct: Given a natural language query, retrieve relevant code snippets or documentation passages\nQuery: ",
+    "document_prefix": "",
+    "license": "Apache-2.0",
+    "notes": "Quality-ceiling probe (~8.6 GB weights Q8_0)."
+  },
+  {
+    "id": "jina-code-1.5b",
+    "gguf_repo": "jinaai/jina-code-embeddings-1.5b-GGUF",
+    "gguf_file": "jina-code-embeddings-1.5b-Q8_0.gguf",
+    "dimensions": 1536,
+    "pooling": "last",
+    "ctx": 8192,
+    "query_prefix": "Find the most relevant code snippet given the following query:\n",
+    "document_prefix": "Candidate code snippet:\n",
+    "license": "CC-BY-NC-4.0",
+    "notes": "nl2code task prefixes; the code specialist with explicit C# coverage. Caveat: doc prefix says 'code snippet' but the corpus includes markdown — noted as a fairness caveat, the card offers no mixed-corpus task."
+  }
+]

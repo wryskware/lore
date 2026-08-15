@@ -1,0 +1,17 @@
+[
+  {
+    "name": "lore-bench",
+    "root": "C:\\Users\\perag\\bench-e2e\\lore-bench",
+    "queries": "queries/lore-bench.json"
+  },
+  {
+    "name": "terrarium-bench",
+    "root": "C:\\Users\\perag\\bench-e2e\\terrarium-bench",
+    "queries": "queries/terrarium-bench.json"
+  },
+  {
+    "name": "lexomancy",
+    "root": "C:\\Users\\perag\\Unity\\Lexomancy",
+    "queries": "queries/lexomancy.json"
+  }
+]
