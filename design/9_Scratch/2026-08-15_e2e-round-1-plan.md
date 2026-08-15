@@ -72,6 +72,12 @@ first pass, cut to T1/T2/T4 (the most retrieval-sensitive) = 36 runs.
   the most recent changeset) plus `design` and `tools`. The pin is the cm
   changeset number + the two git SHAs. design/tools are read-only during
   runs, so symlinks are safe; only the cm workspace sees T5 diffs.
+  Built 2026-08-15 as `Lexomancy-bench` (alt updated to cs:134). Caveat
+  found registering it: the walker does not follow junctions (backlogged),
+  so the retrieval arm queries `project=Lexomancy` — the main root already
+  indexes code+vault+tools at cs:134 and its project-relative paths resolve
+  identically inside the bench workspace. Freeze the main workspace while
+  runs are in flight.
 
 ## Environment constraints
 

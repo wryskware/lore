@@ -42,6 +42,15 @@ briefs; details in the cited docs.
   current binary before investigating.
 - ~~Ledger parser retired partially-superseded decisions~~ — fixed same day
   (bare-ID-list rule, Wrysk's call; see D-0010 and `authority.rs`).
+- **The walker does not follow junctions/symlinks.** A workspace assembled
+  from directory junctions (Lexomancy-bench) indexed only its 2 regular
+  files; all three junctioned trees were skipped silently. Real-world
+  layouts do this. Needs `follow_links` plus loop protection, and a think
+  about what the watcher can honestly promise across junction targets on
+  Windows (ReadDirectoryChangesW does not see through them).
+- **No `lore remove`.** A mistakenly registered project cannot be
+  unregistered from the CLI; the row lingers in status output
+  (Lexomancy-bench, 2 files, is the standing example).
 
 ## Residuals from the package-3 merge (2026-08-15)
 

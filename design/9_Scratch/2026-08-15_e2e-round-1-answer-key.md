@@ -1,0 +1,95 @@
+---
+design_status: exploration
+last_reviewed: 2026-08-15
+---
+
+# E2E round 1 — frozen prompts and answer keys
+
+Companion to [[2026-08-15_e2e-round-1-plan]]. **Never shown to benchmark
+models.** Prompts are verbatim and hint-free (Wrysk lazy style); grading
+keys live in the plan doc's per-repo task bullets — this doc is the runner's
+copy of what to paste and what to grade against.
+
+## Pins (frozen 2026-08-15)
+
+| Repo | Pin |
+| --- | --- |
+| lore | git `977364a` (re-pin if more lands before runs) |
+| latent-music-terrarium | git `3b1eacd56f` |
+| Lexomancy code | cm `cs:134` (`/main@Lexomancy/Lexomancy@lexomancy@unity`) |
+| Lexomancy design vault | git `d5e0d53310` |
+| Lexomancy tools | git `35a45a26ad` |
+
+Working trees: lore + terrarium via `git worktree` from the pin;
+Lexomancy via `C:\Users\perag\Unity\Lexomancy-bench` (junctions →
+`Lexomancy-alt` at cs:134, `design`, `tools`). **Retrieval arm for Lexomancy
+queries `project=Lexomancy`** (the main root already indexes code + vault +
+tools at cs:134; project-relative result paths resolve identically inside
+the bench workspace). Keep the main Lexomancy workspace untouched while
+runs are in flight.
+
+## Runner
+
+Both models run through opencode (OpenAI sub for luna, ollama for qwen):
+
+```
+opencode run -m openai/gpt-5.6-luna       "<prompt>"
+opencode run -m "ollama/qwen3.8:latest"   "<prompt>"
+```
+
+Retrieval on = `mcp.lore.enabled: true` in the opencode config; retrieval
+off = the `mcp.lore` block absent entirely. (Harness TODO: two config files
++ `OPENCODE_CONFIG`, and per-run token/tool-call capture — verify what
+`opencode run` exposes.) Reasoning effort high on both models. Smoke-tested
+2026-08-15: both models call `lore_search` and answer T2-terrarium
+correctly with citations.
+
+## Prompts (verbatim — do not editorialize when pasting)
+
+### Lexomancy (cwd: Lexomancy-bench)
+
+- **T1:** how does a surge cast i submit actually end up damaging an enemy?
+  walk me through the code path, files and classes at each step
+- **T2:** do axioms cost lexic residue? is there a slot limit or tiers?
+- **T3:** i thought we removed residue from the design. is it still
+  referenced in the code anywhere? list everything you find
+- **T4:** why is battle targeting rng-free? whats the pick order
+- **T5:** add a tiebreaker to enemy targeting: prefer lowest shield
+  percentage, between effective damage and hp fraction. keep it
+  deterministic and add tests
+
+### latent-music-terrarium
+
+- **T1:** how does stem loudness end up changing how bright a species is on
+  screen? trace it from the python side all the way through
+- **T2:** does the web app still use embedding.json? and is docs/handoff.md
+  still an accurate picture of what we're doing
+- **T3:** list every place in web/src that reads timeline channel or event
+  data after load
+- **T4:** why did we go with the random projection driver bank thing instead
+  of just using the raw embedding
+- **T5:** the server's track content version only hashes the timeline files
+  but we serve audio.wav too. include the wav in the version and update the
+  test
+
+### lore
+
+- **T1:** walk me through what happens when an mcp search call comes in,
+  from the proxy to the ranked results. files and functions at each hop
+- **T2:** is the fixed 50-candidate pool per search arm still how it works?
+  is that the decided design
+- **T3:** what are all the ways an index pass can get triggered? list every
+  code path
+- **T4:** why does registry reconciliation apply the whole project set
+  atomically instead of row by row
+- **T5:** headings like "# Learning C#" lose the trailing # in heading
+  paths. fix that per commonmark rules and add a test
+
+## Grading
+
+Per plan: 0 / 0.5 / 1 against the plan doc's parent- or luna-verified keys.
+Record per run: tool calls (grep/read vs lore split), tokens, wall time,
+compactions (qwen), score. T5 additionally: suite green (terrarium: `cd
+analysis; uv run --extra dev --extra server pytest -q`; lore: `cargo test
+--workspace`; Lexomancy: EditMode run by the grader against an open editor
+— the agent never touches Unity).
