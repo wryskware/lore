@@ -17,7 +17,8 @@
 //!   requires it and an agent that has to guess will guess wrong.
 
 use lore_core::{
-    DaemonStatus, EmbeddingStatus, ExpandResponse, SearchResponse, SearchResult, WatchState,
+    DaemonStatus, EmbeddingStatus, ExpandResponse, ProjectStatus, SearchResponse, SearchResult,
+    WatchState,
 };
 use std::fmt::Write as _;
 
@@ -96,15 +97,30 @@ fn push_result(out: &mut String, rank: usize, result: &SearchResult) {
         }
         (None, true) => {}
     }
-    let _ = writeln!(out, "    chunk_id: {}", result.chunk_id);
+    // Only when Lore disagreed with the document. Printing "authority:
+    // neutral" on every ordinary hit would cost tokens to say nothing; a line
+    // that appears *only* when a declaration was refused is the one an agent
+    // must not miss.
+    if let Some(note) = &result.authority_note {
+        let _ = writeln!(
+            out,
+            "    authority: {} - {note}",
+            result.effective_authority
+        );
+    }
+    let _ = writeln!(
+        out,
+        "    project_key: {}  chunk_id: {}",
+        result.project_key, result.chunk_id
+    );
 
     out.push_str(result.excerpt.trim_end_matches('\n'));
     out.push('\n');
     if result.excerpt_truncated {
         let _ = writeln!(
             out,
-            "    (excerpt truncated - expand project=\"{project}\" chunk_id=\"{chunk}\" for the full text)",
-            project = result.project,
+            "    (excerpt truncated - expand project_key=\"{key}\" chunk_id=\"{chunk}\" for the full text)",
+            key = result.project_key,
             chunk = result.chunk_id,
         );
     }
@@ -164,8 +180,35 @@ pub fn status(status: &DaemonStatus) -> String {
             root = project.root,
             watch = watch_note(project.watch),
         );
+        push_authority_violations(&mut out, project);
     }
     out
+}
+
+/// Documents that declare `decided` without citing an active decision. Silent
+/// when there are none; loud when there are, because the author believes those
+/// files are canon and Lore has quietly decided they are not.
+fn push_authority_violations(out: &mut String, project: &ProjectStatus) {
+    if project.authority_violations == 0 {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "    AUTHORITY: {n} file(s) declare `decided` without citing an active decision; \
+         they rank as neutral",
+        n = project.authority_violations,
+    );
+    for path in &project.authority_violation_paths {
+        let _ = writeln!(out, "      {path}");
+    }
+    let listed = project.authority_violation_paths.len() as u64;
+    if project.authority_violations > listed {
+        let _ = writeln!(
+            out,
+            "      ... and {} more",
+            project.authority_violations - listed
+        );
+    }
 }
 
 /// Silent when the watch is armed, loud when it is not: an agent that cannot
@@ -216,6 +259,7 @@ mod tests {
         SearchResult {
             chunk_id: "9f3a1c2b".into(),
             project: "lore".into(),
+            project_key: "lore".into(),
             path: "design/4_Interfaces/4.1_MCP_Surface.md".into(),
             line_start: 15,
             line_end: 17,
@@ -223,6 +267,8 @@ mod tests {
             symbol_path: None,
             heading_path: Some(vec!["MCP Tool Surface".into(), "v0.1 tools".into()]),
             design_status: Some("decided".into()),
+            effective_authority: "decided".into(),
+            authority_note: None,
             decision_refs: vec!["D-0007".into(), "D-0008".into()],
             score: 0.8741,
             excerpt: "- **`search`** - one unified hybrid query.\n".into(),
@@ -234,6 +280,7 @@ mod tests {
         SearchResult {
             chunk_id: "4e77ba01".into(),
             project: "lexomancy".into(),
+            project_key: "lexomancy".into(),
             path: "Assets/Scripts/Board.cs".into(),
             line_start: 120,
             line_end: 141,
@@ -241,6 +288,8 @@ mod tests {
             symbol_path: Some("Board.Update".into()),
             heading_path: None,
             design_status: None,
+            effective_authority: "neutral".into(),
+            authority_note: None,
             decision_refs: vec![],
             score: 0.612,
             excerpt: "void Update() {\n    Tick();".into(),
@@ -263,8 +312,32 @@ mod tests {
         ));
         assert!(rendered.contains("    heading: MCP Tool Surface > v0.1 tools\n"));
         assert!(rendered.contains("    status: decided  refs: D-0007, D-0008\n"));
-        assert!(rendered.contains("    chunk_id: 9f3a1c2b\n"));
+        assert!(rendered.contains("    project_key: lore  chunk_id: 9f3a1c2b\n"));
         assert!(!rendered.contains("truncated"));
+        // Declared and effective agree here, so no authority line is spent.
+        assert!(!rendered.contains("authority:"), "{rendered}");
+    }
+
+    /// The case an agent must not miss: the document says `decided`, Lore says
+    /// otherwise, and the line naming the disagreement is the whole point.
+    #[test]
+    fn a_refused_declaration_renders_the_reason() {
+        let mut demoted = vault_hit();
+        demoted.path = "design/9_Scratch/notes.md".into();
+        demoted.effective_authority = "deprecated".into();
+        demoted.authority_note = Some("9_Scratch path cap".into());
+        let rendered = search(
+            "authority",
+            &SearchResponse {
+                results: vec![demoted],
+                lexical_only: false,
+            },
+        );
+        assert!(rendered.contains("    status: decided  refs: D-0007, D-0008\n"));
+        assert!(
+            rendered.contains("    authority: deprecated - 9_Scratch path cap\n"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -281,7 +354,7 @@ mod tests {
         assert!(!rendered.contains("status:"));
         assert!(!rendered.contains("refs:"));
         assert!(rendered.contains(
-            "    (excerpt truncated - expand project=\"lexomancy\" chunk_id=\"4e77ba01\" for the full text)\n"
+            "    (excerpt truncated - expand project_key=\"lexomancy\" chunk_id=\"4e77ba01\" for the full text)\n"
         ));
     }
 
@@ -375,19 +448,27 @@ mod tests {
                 ProjectStatus {
                     id: 1,
                     name: "lexomancy".into(),
+                    key: "lexomancy".into(),
                     root: r"C:\repos\Lexomancy".into(),
+                    kind: "repo".into(),
                     files: 812,
                     chunks: 9134,
                     embedded_chunks: 0,
+                    authority_violations: 0,
+                    authority_violation_paths: Vec::new(),
                     watch: WatchState::Armed,
                 },
                 ProjectStatus {
                     id: 2,
                     name: "lore".into(),
+                    key: "lore".into(),
                     root: r"C:\repos\lore".into(),
+                    kind: "repo".into(),
                     files: 96,
                     chunks: 1204,
                     embedded_chunks: 1204,
+                    authority_violations: 0,
+                    authority_violation_paths: Vec::new(),
                     watch: WatchState::Armed,
                 },
             ],
@@ -409,10 +490,14 @@ mod tests {
             projects: vec![ProjectStatus {
                 id: 1,
                 name: "lore".into(),
+                key: "lore".into(),
                 root: r"C:\repos\lore".into(),
+                kind: "repo".into(),
                 files: 96,
                 chunks: 1204,
                 embedded_chunks: 1204,
+                authority_violations: 0,
+                authority_violation_paths: Vec::new(),
                 watch: WatchState::Armed,
             }],
             embeddings: EmbeddingStatus::Unconfigured,

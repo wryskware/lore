@@ -45,15 +45,18 @@ async fn stub_daemon() -> String {
     format!("http://{addr}/v1")
 }
 
-/// One vault hit (authority + heading path + cited decisions) and one code hit
-/// (symbol path + a truncated excerpt) — the two shapes the renderer treats
-/// differently, in one response.
+/// Three shapes the renderer treats differently, in one response: a vault hit
+/// whose `decided` declaration Lore validated, a code hit with a symbol path
+/// and a truncated excerpt, and — the case that matters most for the agent —
+/// a hit whose declaration Lore *refused*, where declared and effective
+/// authority disagree and the note says why.
 fn canned_search() -> SearchResponse {
     SearchResponse {
         results: vec![
             SearchResult {
                 chunk_id: "9f3a1c2b7e".into(),
                 project: "lore".into(),
+                project_key: "lore".into(),
                 path: "design/4_Interfaces/4.1_MCP_Surface.md".into(),
                 line_start: 15,
                 line_end: 18,
@@ -61,6 +64,8 @@ fn canned_search() -> SearchResponse {
                 symbol_path: None,
                 heading_path: Some(vec!["MCP Tool Surface".into(), "v0.1 tools".into()]),
                 design_status: Some("decided".into()),
+                effective_authority: "decided".into(),
+                authority_note: None,
                 decision_refs: vec!["D-0007".into(), "D-0008".into()],
                 score: 0.87413,
                 excerpt: "- **`search`** - one unified hybrid query. Filters: project, path \
@@ -71,6 +76,7 @@ fn canned_search() -> SearchResponse {
             SearchResult {
                 chunk_id: "4e77ba0193".into(),
                 project: "lexomancy".into(),
+                project_key: "lexomancy".into(),
                 path: "Assets/Scripts/Board.cs".into(),
                 line_start: 120,
                 line_end: 141,
@@ -78,10 +84,30 @@ fn canned_search() -> SearchResponse {
                 symbol_path: Some("Board.Update".into()),
                 heading_path: None,
                 design_status: None,
+                effective_authority: "neutral".into(),
+                authority_note: None,
                 decision_refs: vec![],
                 score: 0.61208,
                 excerpt: "void Update()\n{\n    if (!_dirty) return;\n    Rebuild();".into(),
                 excerpt_truncated: true,
+            },
+            SearchResult {
+                chunk_id: "1c0ffee042".into(),
+                project: "lore".into(),
+                project_key: "lore".into(),
+                path: "design/9_Scratch/2026-08-14_notes.md".into(),
+                line_start: 3,
+                line_end: 9,
+                language: Some("markdown".into()),
+                symbol_path: None,
+                heading_path: Some(vec!["Ranking rewrite".into()]),
+                design_status: Some("decided".into()),
+                effective_authority: "deprecated".into(),
+                authority_note: Some("9_Scratch path cap".into()),
+                decision_refs: vec!["D-0007".into()],
+                score: 0.41,
+                excerpt: "Per D-0007 the daemon owns index state, so ranking should...".into(),
+                excerpt_truncated: false,
             },
         ],
         lexical_only: false,
@@ -100,8 +126,9 @@ fn canned_expand() -> ExpandResponse {
     }
 }
 
-/// Degraded on purpose: an unreachable embedding endpoint plus a project with
-/// zero embedded chunks is the state an agent most needs to be able to name.
+/// Degraded on purpose: an unreachable embedding endpoint, a project with zero
+/// embedded chunks, and a project with refused authority declarations — the
+/// three states an agent most needs to be able to name.
 fn canned_status() -> DaemonStatus {
     DaemonStatus {
         api_version: 1,
@@ -111,19 +138,30 @@ fn canned_status() -> DaemonStatus {
             ProjectStatus {
                 id: 1,
                 name: "lexomancy".into(),
+                key: "lexomancy".into(),
                 root: r"C:\repos\Lexomancy".into(),
+                kind: "repo".into(),
                 files: 812,
                 chunks: 9134,
                 embedded_chunks: 0,
+                authority_violations: 0,
+                authority_violation_paths: Vec::new(),
                 watch: WatchState::Armed,
             },
             ProjectStatus {
                 id: 2,
                 name: "lore".into(),
+                key: "lore".into(),
                 root: r"C:\Users\wrysk\wryskware\lore".into(),
+                kind: "repo".into(),
                 files: 96,
                 chunks: 1204,
                 embedded_chunks: 1204,
+                authority_violations: 3,
+                authority_violation_paths: vec![
+                    "design/2_Memory/2.1_Memory_Model.md".into(),
+                    "design/5_Implementation/5.1_Milestones.md".into(),
+                ],
                 watch: WatchState::Armed,
             },
         ],
@@ -238,7 +276,7 @@ async fn expand_returns_a_span_header_and_the_text() {
         against_stub().await,
         "expand",
         json!({
-            "project": "lexomancy",
+            "project_key": "lexomancy",
             "chunk_id": "4e77ba0193",
             "context_lines": 3
         }),

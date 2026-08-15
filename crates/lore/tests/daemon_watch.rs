@@ -96,11 +96,7 @@ impl Env {
         };
 
         Self {
-            project: Project {
-                id,
-                root: root.clone(),
-                name: "demo".into(),
-            },
+            project: project(id, root.as_str(), "demo"),
             _dir: dir,
             root,
             data_dir,
@@ -448,6 +444,8 @@ fn project(id: ProjectId, root: &str, name: &str) -> Project {
         id,
         root: Utf8PathBuf::from(root),
         name: name.to_string(),
+        key: name.to_string(),
+        kind: lore::types::SourceKind::Repo,
     }
 }
 

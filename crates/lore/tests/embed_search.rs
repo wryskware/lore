@@ -241,22 +241,34 @@ async fn an_endpoint_that_dies_degrades_the_next_request_to_lexical_only() {
     );
 }
 
-/// The vault-authority modifier applies to the fused ranking, so a `decided`
-/// document outranks an equally-relevant exploration one.
+/// The vault-authority modifier applies to the fused ranking, so a *validated*
+/// `decided` document outranks an equally-relevant exploration one — and an
+/// unvalidated one does not. Same corpus, same query, same relevance: only the
+/// authority Lore assigns can separate these.
 #[tokio::test]
 async fn vault_authority_breaks_ties_in_the_fused_ranking() {
     let stub = Stub::start().await;
     let h = harness(Embedder::from_settings(settings(&stub.base)));
-    // Identical bodies, identical relevance to the query — only the
-    // frontmatter differs.
     let body = "Ranking of results depends on ordering.";
+    h.fixture.write(
+        "design/0_Canon/DECISIONS.md",
+        "# Ledger\n\n## D-0007 — Interfaces\n\n- **Status:** Accepted\n- **Supersedes:** None\n",
+    );
     h.fixture.write(
         "docs/explore.md",
         format!("---\ndesign_status: exploration\n---\n\n# Explore\n\n{body}\n"),
     );
     h.fixture.write(
         "docs/settled.md",
-        format!("---\ndesign_status: decided\n---\n\n# Settled\n\n{body}\n"),
+        format!(
+            "---\ndesign_status: decided\ndecision_refs: [D-0007]\n---\n\n# Settled\n\n{body}\n"
+        ),
+    );
+    // Declares the same thing, cites nothing: the declaration is refused and
+    // it ranks with plain exploration material, not above it.
+    h.fixture.write(
+        "docs/claimed.md",
+        format!("---\ndesign_status: decided\n---\n\n# Claimed\n\n{body}\n"),
     );
     h.fixture.write(
         "docs/old.md",
@@ -266,10 +278,43 @@ async fn vault_authority_breaks_ties_in_the_fused_ranking() {
     embed_everything(&h).await;
 
     let (_, response) = post(&h.router, "/v1/search", json!({ "query": QUERY })).await;
+    // The ledger itself is indexed like anything else and can match; only the
+    // four documents under test are ordered here.
+    let ranked: Vec<String> = paths(&response)
+        .into_iter()
+        .filter(|path| path.starts_with("docs/"))
+        .collect();
     assert_eq!(
-        paths(&response),
-        ["docs/settled.md", "docs/explore.md", "docs/old.md"],
+        ranked,
+        [
+            "docs/settled.md",
+            "docs/explore.md",
+            "docs/claimed.md",
+            "docs/old.md"
+        ],
         "{response:#}"
+    );
+
+    // The refusal is on the result, not only in the ranking.
+    let claimed = response["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["path"] == "docs/claimed.md")
+        .expect("the demoted document is still a result");
+    assert_eq!(claimed["design_status"], "decided", "declaration preserved");
+    assert_eq!(claimed["effective_authority"], "neutral");
+    assert_eq!(
+        claimed["authority_note"],
+        "decided declared but cites no active decision"
+    );
+
+    // …and `status` counts it, so a human sees it without running a query.
+    let (_, status_body) = get(&h.router, "/v1/status").await;
+    assert_eq!(status_body["projects"][0]["authority_violations"], 1);
+    assert_eq!(
+        status_body["projects"][0]["authority_violation_paths"][0],
+        "docs/claimed.md"
     );
     stub.shutdown().await;
 }

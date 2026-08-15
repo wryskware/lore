@@ -7,3 +7,7 @@ embeddings: UNREACHABLE - http://127.0.0.1:11434 (connection refused); search is
 projects (2):
   lexomancy  files 812  chunks 9134  embedded 0/9134 (0%)  C:\repos\Lexomancy
   lore       files 96  chunks 1204  embedded 1204/1204 (100%)  C:\Users\wrysk\wryskware\lore
+    AUTHORITY: 3 file(s) declare `decided` without citing an active decision; they rank as neutral
+      design/2_Memory/2.1_Memory_Model.md
+      design/5_Implementation/5.1_Milestones.md
+      ... and 1 more
