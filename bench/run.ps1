@@ -28,11 +28,11 @@ $benchRoot = $PSScriptRoot
 $resultsRoot = Join-Path $benchRoot 'results'
 New-Item -ItemType Directory -Force $resultsRoot | Out-Null
 
-$models = @{
+$modelMap = @{
     luna = @{ id = 'openai/gpt-5.6-luna'; variant = 'high' }
     qwen = @{ id = 'ollama/qwen3.8:latest'; variant = $null }
 }
-$repos = @{
+$repoMap = @{
     lore      = @{ dir = 'C:\Users\perag\bench-e2e\lore-bench'; vcs = 'git' }
     terrarium = @{ dir = 'C:\Users\perag\bench-e2e\terrarium-bench'; vcs = 'git' }
     lexomancy = @{ dir = 'C:\Users\perag\Unity\Lexomancy-bench'; vcs = 'cm'; cmDir = 'C:\Users\perag\Unity\Lexomancy-alt' }
@@ -46,7 +46,7 @@ function Get-CmChanged([string]$cmDir) {
 }
 
 function Invoke-Cell([string]$model, [string]$repo, [string]$arm, [string]$task) {
-    $m = $models[$model]; $r = $repos[$repo]
+    $m = $modelMap[$model]; $r = $repoMap[$repo]
     $prompt = $prompts.$repo.$task
     if (-not $prompt) { throw "no prompt for $repo/$task" }
 
