@@ -40,7 +40,7 @@ use crate::store::Project;
 
 use super::queue::IndexQueue;
 use super::store_handle::StoreHandle;
-use super::watch::{WatchCommand, WatchSender};
+use super::watch::{WatchCommand, WatchSender, WatchStatus};
 use super::{expand, paths, search};
 
 /// Request bodies are small JSON documents; a megabyte is generous for the
@@ -52,6 +52,8 @@ pub struct AppState {
     pub store: StoreHandle,
     pub queue: IndexQueue,
     pub watch: WatchSender,
+    /// Live per-project watcher coverage, written by the watcher pump.
+    pub watch_status: WatchStatus,
     pub config: Arc<Config>,
     /// Live embedding capability and health. Shared with the embed worker,
     /// which is the thing that actually probes the endpoint.
@@ -174,6 +176,9 @@ async fn status(State(state): State<AppState>) -> ApiResult<DaemonStatus> {
                 files: p.files,
                 chunks: p.chunks,
                 embedded_chunks: p.embedded_chunks,
+                // Same reasoning as `embeddings` below: a watch that is not
+                // armed degrades the daemon silently unless it is reported.
+                watch: state.watch_status.of(p.project),
             })
             .collect(),
         // Live probe result, not a guess derived from the config file: the

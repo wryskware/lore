@@ -43,6 +43,7 @@ fn harness(embedder: Embedder) -> Harness {
         store: fixture.store.clone(),
         queue: IndexQueue::new(),
         watch: watch_tx,
+        watch_status: watch::WatchStatus::new(),
         config: Arc::new(Config::default()),
         embeddings: embedder.clone(),
         data_dir: fixture.data_dir.clone(),

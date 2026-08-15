@@ -33,6 +33,9 @@ fn harness() -> Harness {
         store: fixture.store.clone(),
         queue: queue.clone(),
         watch: watch_tx,
+        // No watcher pump in this file, so every project reports `unknown`;
+        // the real per-project states are covered in `daemon_watch.rs`.
+        watch_status: watch::WatchStatus::new(),
         config: Arc::new(Config::default()),
         // No embedding endpoint: this file covers the lexical-only daemon.
         // Hybrid ranking and health transitions live in `embed_search.rs`.
@@ -115,6 +118,9 @@ async fn status_reports_the_contract_fields() {
     assert_eq!(project["files"], 3);
     assert!(project["chunks"].as_u64().unwrap() >= 3);
     assert_eq!(project["embedded_chunks"], 0);
+    // Additive field, present on every project entry. No pump runs here, so
+    // the honest answer is "no opinion" rather than a claim either way.
+    assert_eq!(project["watch"], "unknown");
 }
 
 #[tokio::test]
