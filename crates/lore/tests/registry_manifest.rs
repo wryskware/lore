@@ -8,6 +8,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use lore::registry::{self, Manifest, ManifestEntry, Reconciliation};
 use lore::store::Store;
 use lore::types::SourceKind;
+use std::collections::BTreeSet;
 use tempfile::TempDir;
 
 struct Fixture {
@@ -404,4 +405,62 @@ fn dropping_a_project_from_the_manifest_drops_its_index() {
     fixture.reconcile();
     assert!(fixture.store.status().unwrap().projects.is_empty());
     assert!(fixture.store.list_files(id).unwrap().is_empty());
+}
+
+/// Two hand-edited entries that *exchange* keys — the one manifest edit that
+/// collides with `projects.key`'s uniqueness index while both old values are
+/// still in the table.
+///
+/// This pins the invariants that must hold whichever way the collision is
+/// resolved, because the current resolution is not a good one and should be
+/// free to change:
+///
+/// - no registered project is lost, and no two end up sharing a key;
+/// - reconciliation is not fatal — `daemon::run` logs the failure and carries
+///   on with the index's own list, so a bad manifest edit cannot make the
+///   daemon unstartable.
+///
+/// What actually happens today, recorded so the gap is not rediscovered:
+/// `apply` upserts row by row with no enclosing transaction, so the swap fails
+/// on a raw `UNIQUE constraint failed: projects.key` after any earlier entries
+/// have already been committed. The registry is left half-applied — unrelated
+/// insertions in the same edit stick, removals never run — and it will fail
+/// the same way on every subsequent start rather than converging. Fixing that
+/// properly means reconciling inside one transaction (or clearing keys in a
+/// first phase), which is a store-API decision rather than a test fix.
+#[test]
+fn a_manifest_that_exchanges_two_keys_never_loses_a_project_or_duplicates_a_key() {
+    let mut fixture = Fixture::new();
+    fixture
+        .store
+        .register_project(Utf8Path::new("C:/repos/a"), "a")
+        .unwrap();
+    fixture
+        .store
+        .register_project(Utf8Path::new("C:/repos/b"), "b")
+        .unwrap();
+    fixture.reconcile();
+
+    registry::write(
+        &fixture.data_dir,
+        &Manifest {
+            projects: vec![entry("b", "a", "C:/repos/a"), entry("a", "b", "C:/repos/b")],
+        },
+    )
+    .unwrap();
+
+    // Deliberately not `.expect(...)`: the daemon treats a reconciliation
+    // failure as recoverable, and so must this test.
+    let outcome = registry::reconcile(&mut fixture.store, &fixture.data_dir);
+    let rows = fixture.rows();
+
+    let roots: Vec<&str> = rows.iter().map(|(_, _, root)| root.as_str()).collect();
+    assert_eq!(
+        roots,
+        ["C:/repos/a", "C:/repos/b"],
+        "both projects survive however the collision is resolved: {outcome:?}"
+    );
+    let keys: BTreeSet<&str> = rows.iter().map(|(_, key, _)| key.as_str()).collect();
+    assert_eq!(keys.len(), 2, "keys stay distinct: {rows:?}");
+    assert!(keys.iter().all(|key| !key.is_empty()), "{rows:?}");
 }
