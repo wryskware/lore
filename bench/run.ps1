@@ -1,0 +1,147 @@
+# E2E round 1 runner. See bench/README.md and
+# design/9_Scratch/2026-08-15_e2e-round-1-answer-key.md (the authority for
+# prompts/pins/protocol).
+#
+#   .\run.ps1 -Model luna -Repo lore -Arm on -Task T4     # one cell
+#   .\run.ps1 -Matrix                                     # everything
+#
+# Results land in bench\results\<stamp>-<model>-<repo>-<arm>-<task>\.
+param(
+    [ValidateSet('luna', 'qwen')] [string]$Model,
+    [ValidateSet('lore', 'terrarium', 'lexomancy')] [string]$Repo,
+    [ValidateSet('on', 'off')] [string]$Arm,
+    [ValidateSet('T1', 'T2', 'T3', 'T4', 'T5')] [string]$Task,
+    [switch]$Matrix
+)
+
+$ErrorActionPreference = 'Stop'
+$benchRoot = $PSScriptRoot
+$resultsRoot = Join-Path $benchRoot 'results'
+New-Item -ItemType Directory -Force $resultsRoot | Out-Null
+
+$models = @{
+    luna = @{ id = 'openai/gpt-5.6-luna'; variant = 'high' }
+    qwen = @{ id = 'ollama/qwen3.8:latest'; variant = $null }
+}
+$repos = @{
+    lore      = @{ dir = 'C:\Users\perag\bench-e2e\lore-bench'; vcs = 'git' }
+    terrarium = @{ dir = 'C:\Users\perag\bench-e2e\terrarium-bench'; vcs = 'git' }
+    lexomancy = @{ dir = 'C:\Users\perag\Unity\Lexomancy-bench'; vcs = 'cm'; cmDir = 'C:\Users\perag\Unity\Lexomancy-alt' }
+}
+$prompts = Get-Content (Join-Path $benchRoot 'prompts.json') -Raw | ConvertFrom-Json
+
+function Get-CmChanged([string]$cmDir) {
+    Push-Location $cmDir
+    try { (cm status --short 2>$null) | Where-Object { $_ -match '\S' } }
+    finally { Pop-Location }
+}
+
+function Invoke-Cell([string]$model, [string]$repo, [string]$arm, [string]$task) {
+    $m = $models[$model]; $r = $repos[$repo]
+    $prompt = $prompts.$repo.$task
+    if (-not $prompt) { throw "no prompt for $repo/$task" }
+
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $cell = "$stamp-$model-$repo-$arm-$task"
+    $outDir = Join-Path $resultsRoot $cell
+    New-Item -ItemType Directory -Force $outDir | Out-Null
+
+    # Pre-state for T5 diff capture / reset.
+    $preCm = if ($r.vcs -eq 'cm') { Get-CmChanged $r.cmDir } else { $null }
+
+    $env:OPENCODE_CONFIG = Join-Path $benchRoot "opencode-$arm.jsonc"
+    $args = @('run', '--dir', $r.dir, '-m', $m.id, '--format', 'json', '--title', $cell, '--auto')
+    if ($m.variant) { $args += @('--variant', $m.variant) }
+    $args += $prompt
+
+    Write-Host "[$cell] running..." -ForegroundColor Cyan
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    & opencode @args 1> (Join-Path $outDir 'events.jsonl') 2> (Join-Path $outDir 'stderr.log')
+    $exit = $LASTEXITCODE
+    $sw.Stop()
+    Remove-Item Env:OPENCODE_CONFIG -ErrorAction SilentlyContinue
+
+    # Parse the event stream: answer text, tokens, tool calls, session id.
+    $tokens = @{ input = 0; output = 0; reasoning = 0; cache_read = 0; cache_write = 0 }
+    $toolCalls = 0; $loreCalls = 0; $sessionId = $null
+    $answer = [System.Text.StringBuilder]::new()
+    foreach ($line in Get-Content (Join-Path $outDir 'events.jsonl') -ErrorAction SilentlyContinue) {
+        $ev = try { $line | ConvertFrom-Json } catch { continue }
+        if (-not $sessionId -and $ev.sessionID) { $sessionId = $ev.sessionID }
+        switch -Wildcard ($ev.type) {
+            'text' { [void]$answer.AppendLine($ev.part.text) }
+            'step_finish' {
+                $t = $ev.part.tokens
+                if ($t) {
+                    $tokens.input += $t.input; $tokens.output += $t.output
+                    $tokens.reasoning += $t.reasoning
+                    $tokens.cache_read += $t.cache.read; $tokens.cache_write += $t.cache.write
+                }
+            }
+            'tool*' {
+                $toolCalls++
+                $name = if ($ev.part.tool) { $ev.part.tool } else { '' }
+                if ($name -like 'lore*') { $loreCalls++ }
+            }
+        }
+    }
+    Set-Content (Join-Path $outDir 'answer.md') $answer.ToString()
+
+    # T5: capture the diff, then restore the working tree.
+    if ($task -eq 'T5') {
+        if ($r.vcs -eq 'git') {
+            git -C $r.dir add -N . 2>$null
+            git -C $r.dir diff | Set-Content (Join-Path $outDir 'diff.patch')
+            git -C $r.dir checkout -- . 2>$null
+            git -C $r.dir clean -fd 2>$null
+        } else {
+            $postCm = Get-CmChanged $r.cmDir
+            $newChanges = $postCm | Where-Object { $preCm -notcontains $_ }
+            $newChanges | Set-Content (Join-Path $outDir 'cm-changed.txt')
+            Push-Location $r.cmDir
+            try {
+                foreach ($line in $newChanges) {
+                    # cm status --short lines end in the path; undo each new one.
+                    $p = ($line -split '\s+')[-1]
+                    if ($p) { cm diff $p 2>$null | Add-Content (Join-Path $outDir 'diff.patch'); cm undo $p 2>$null | Out-Null }
+                }
+            } finally { Pop-Location }
+            if ($newChanges) { Write-Warning "[$cell] cm changes captured and undone: $($newChanges.Count) file(s). Verify with 'cm status'." }
+        }
+    }
+
+    # Compaction time from opencode's session row (qwen 128k protocol).
+    $compacting = $null
+    if ($sessionId) {
+        $compacting = python -c "import sqlite3;print(sqlite3.connect(r'C:/Users/perag/.local/share/opencode/opencode.db').execute('select time_compacting from session where id=?',('$sessionId',)).fetchone()[0])" 2>$null
+    }
+
+    $metrics = [ordered]@{
+        cell = $cell; model = $m.id; repo = $repo; arm = $arm; task = $task
+        wall_ms = $sw.ElapsedMilliseconds; exit_code = $exit
+        tokens = $tokens; tool_calls = $toolCalls; lore_calls = $loreCalls
+        session_id = $sessionId; time_compacting = $compacting
+        score = $null  # graded by hand against the answer key
+    }
+    $metrics | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $outDir 'metrics.json')
+    Write-Host ("[$cell] done in {0:n0}s  tokens in/out {1}/{2}  tools {3} (lore {4})" -f
+        ($sw.ElapsedMilliseconds / 1000), $tokens.input, $tokens.output, $toolCalls, $loreCalls)
+}
+
+if ($Matrix) {
+    foreach ($mo in 'luna', 'qwen') {
+        foreach ($re in 'lore', 'terrarium', 'lexomancy') {
+            # Off first so a warm lore index can't leak into the comparison story.
+            foreach ($ar in 'off', 'on') {
+                foreach ($ta in 'T1', 'T2', 'T3', 'T4', 'T5') {
+                    Invoke-Cell $mo $re $ar $ta
+                }
+            }
+        }
+    }
+} else {
+    if (-not ($Model -and $Repo -and $Arm -and $Task)) {
+        throw 'Provide -Model -Repo -Arm -Task, or -Matrix.'
+    }
+    Invoke-Cell $Model $Repo $Arm $Task
+}

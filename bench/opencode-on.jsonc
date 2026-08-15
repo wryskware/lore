@@ -1,0 +1,29 @@
+{
+  // E2E round 1 — retrieval-ON arm. Select via OPENCODE_CONFIG.
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Ollama (local)",
+      "options": {
+        "baseURL": "http://localhost:11434/v1"
+      },
+      "models": {
+        "qwen3.8:latest": {
+          "name": "qwen3.8 (local)",
+          "limit": {
+            "context": 128000,
+            "output": 16384
+          }
+        }
+      }
+    }
+  },
+  "mcp": {
+    "lore": {
+      "type": "local",
+      "command": ["C:\\Users\\perag\\wryskware\\lore\\target\\debug\\lore-mcp.exe"],
+      "enabled": true
+    }
+  }
+}

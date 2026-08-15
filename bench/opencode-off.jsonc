@@ -1,0 +1,30 @@
+{
+  // E2E round 1 — retrieval-OFF arm. Configs MERGE with the global one (verified
+  // 2026-08-15), so lore must be explicitly disabled here, not merely omitted.
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "lore": {
+      "type": "local",
+      "command": ["C:\\Users\\perag\\wryskware\\lore\\target\\debug\\lore-mcp.exe"],
+      "enabled": false
+    }
+  },
+  "provider": {
+    "ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Ollama (local)",
+      "options": {
+        "baseURL": "http://localhost:11434/v1"
+      },
+      "models": {
+        "qwen3.8:latest": {
+          "name": "qwen3.8 (local)",
+          "limit": {
+            "context": 128000,
+            "output": 16384
+          }
+        }
+      }
+    }
+  }
+}

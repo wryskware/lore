@@ -37,12 +37,17 @@ opencode run -m openai/gpt-5.6-luna       "<prompt>"
 opencode run -m "ollama/qwen3.8:latest"   "<prompt>"
 ```
 
-Retrieval on = `mcp.lore.enabled: true` in the opencode config; retrieval
-off = the `mcp.lore` block absent entirely. (Harness TODO: two config files
-+ `OPENCODE_CONFIG`, and per-run token/tool-call capture — verify what
-`opencode run` exposes.) Reasoning effort high on both models. Smoke-tested
-2026-08-15: both models call `lore_search` and answer T2-terrarium
-correctly with citations.
+Harness: `bench/run.ps1` (see `bench/README.md`). Arms select
+`bench/opencode-{on,off}.jsonc` via `OPENCODE_CONFIG`; configs *merge* with
+the global one, so the off arm explicitly disables lore (verified — a
+merely-omitted block leaks the global lore config into the off arm).
+Reasoning: `--variant high` for luna; qwen runs at model default. Metrics
+parsed from the `--format json` event stream + opencode's session table
+(`time_compacting` covers the qwen compaction protocol). Retrieval targets:
+`lore-bench` / `terrarium-bench` (registered pinned worktrees under
+`C:\Users\perag\bench-e2e\`) and `Lexomancy` (main root; see plan).
+Pilots 2026-08-15: luna/lore/on/T4 correct (26 s, 23.9k in, 3 lore calls);
+qwen/lore/off/T4 correct (29 s, 61.5k in, 0 lore calls).
 
 ## Prompts (verbatim — do not editorialize when pasting)
 
