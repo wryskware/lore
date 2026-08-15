@@ -225,6 +225,48 @@ mod tests {
         assert!(broken.iter().any(|c| c.text.contains("design_status")));
     }
 
+    /// A Windows editor saving a vault document as "UTF-8 with BOM" must not
+    /// silently downgrade it to unclassified: U+FEFF is not whitespace, so
+    /// nothing trims it away before the `---` fence is compared.
+    #[test]
+    fn utf8_bom_does_not_hide_frontmatter() {
+        for body in [
+            "---\ndesign_status: decided\ndecision_refs: [D-0003, D-0004]\n---\n\n# H\n\nbody\n",
+            // Same document as a Windows editor writes it: BOM + CRLF.
+            "---\r\ndesign_status: decided\r\ndecision_refs:\r\n  - D-0003\r\n  - D-0004\r\n---\r\n\r\n# H\r\n\r\nbody\r\n",
+        ] {
+            let src = format!("\u{feff}{body}");
+            let out = chunks("bom.md", &src);
+            let vault = out[0].vault.as_ref().expect("markdown carries vault meta");
+            assert_eq!(vault.design_status, Some(DesignStatus::Decided));
+            assert_eq!(vault.decision_refs, ["D-0003", "D-0004"]);
+
+            // The YAML is metadata, never body text, and the BOM is in no chunk.
+            assert!(out.iter().all(|c| !c.text.contains("design_status")));
+            assert!(out.iter().all(|c| !c.text.contains('\u{feff}')));
+            assert!(out.iter().any(|c| c.text.contains("body")));
+
+            // Spans stay relative to the *original* bytes, BOM included.
+            for chunk in &out {
+                let slice = &src[chunk.byte_start as usize..chunk.byte_end as usize];
+                assert_eq!(slice, chunk.text, "span is not the file slice");
+            }
+        }
+    }
+
+    /// The same mark in front of a plain document must not swallow the first
+    /// heading either — without the skip, `\u{feff}#` is not an ATX marker.
+    #[test]
+    fn utf8_bom_without_frontmatter_keeps_the_first_heading() {
+        let src = "\u{feff}# Title\n\nsome prose\n";
+        let out = chunks("bom2.md", &src);
+        assert!(out[0].text.starts_with("# Title"), "{:?}", out[0].text);
+        assert_eq!(
+            &src[out[0].byte_start as usize..out[0].byte_end as usize],
+            out[0].text
+        );
+    }
+
     #[test]
     fn unknown_extension_falls_back_to_windows() {
         let body = (0..10).map(|i| format!("line {i}\n")).collect::<String>();

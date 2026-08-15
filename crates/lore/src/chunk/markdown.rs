@@ -8,7 +8,8 @@
 //!   subheadings that is its intro text, which is emitted only when it is
 //!   substantial enough to be worth a vector on its own.
 //! * Text before the first heading is a chunk with an empty `heading_path`.
-//! * The frontmatter block itself is never a chunk.
+//! * The frontmatter block itself is never a chunk, and one leading UTF-8 BOM
+//!   in front of it is tolerated.
 
 use camino::Utf8PathBuf;
 
@@ -16,8 +17,15 @@ use super::common::{Emitter, FileVault, Tpl, decision_refs, trim_span};
 use crate::types::{Chunk, DesignStatus};
 
 /// A container heading's intro must be at least this many bytes (beyond the
-/// heading line) to earn its own chunk; below that it is heading noise.
+/// heading line) to earn its own chunk; below that it is folded into the
+/// first child rather than dropped.
 const MIN_SECTION_INTRO_BYTES: usize = 24;
+
+/// UTF-8 byte order mark. Windows editors write it routinely, it is *not*
+/// whitespace (U+FEFF is `Cf`, so `trim` leaves it), and it sits in front of
+/// the `---` frontmatter fence and the first `#` heading alike. Every span
+/// stays relative to the original file bytes; only the starting offset moves.
+const BOM: &str = "\u{feff}";
 
 pub(crate) fn chunk_markdown(path: &Utf8PathBuf, src: &str) -> Vec<Chunk> {
     let (vault, body_start) = parse_frontmatter(src);
@@ -118,12 +126,15 @@ fn scan_headings(src: &str, from: usize) -> Vec<Heading> {
 /// metadata and the byte offset where the document body starts.
 fn parse_frontmatter(src: &str) -> (FileVault, usize) {
     let mut vault = FileVault::default();
-    let first_break = match src.find('\n') {
-        Some(i) => i,
-        None => return (vault, 0),
+    // Step over one leading BOM before looking for the opening fence; the
+    // body then starts after it, so the mark itself is never chunk text.
+    let body = if src.starts_with(BOM) { BOM.len() } else { 0 };
+    let first_break = match src[body..].find('\n') {
+        Some(i) => body + i,
+        None => return (vault, body),
     };
-    if src[..first_break].trim_end() != "---" {
-        return (vault, 0);
+    if src[body..first_break].trim_end() != "---" {
+        return (vault, body);
     }
     let mut pos = first_break + 1;
     let mut key = String::new();
@@ -166,7 +177,7 @@ fn parse_frontmatter(src: &str) -> (FileVault, usize) {
         }
     }
     // Unterminated frontmatter: treat the file as plain Markdown.
-    (FileVault::default(), 0)
+    (FileVault::default(), body)
 }
 
 fn parse_status(value: &str) -> Option<DesignStatus> {
