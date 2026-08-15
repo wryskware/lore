@@ -638,7 +638,11 @@ fn path_prefix_filter_handles_non_ascii_and_windows_case() {
         ["données/parser.cs"]
     );
     assert_eq!(
-        paths_of(store.vector_search(&[1.0, 0.0], &accented_only, 10).unwrap()),
+        paths_of(
+            store
+                .vector_search(&[1.0, 0.0], &accented_only, 10)
+                .unwrap()
+        ),
         ["données/parser.cs"]
     );
 

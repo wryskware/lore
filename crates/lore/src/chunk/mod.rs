@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn utf8_bom_without_frontmatter_keeps_the_first_heading() {
         let src = "\u{feff}# Title\n\nsome prose\n";
-        let out = chunks("bom2.md", &src);
+        let out = chunks("bom2.md", src);
         assert!(out[0].text.starts_with("# Title"), "{:?}", out[0].text);
         assert_eq!(
             &src[out[0].byte_start as usize..out[0].byte_end as usize],

@@ -265,7 +265,9 @@ fn a_short_markdown_parent_introduction_reaches_the_index() {
     assert!(
         hits.iter().any(|h| h.chunk.text.contains("Never upload.")),
         "short parent intro is not searchable; hits = {:?}",
-        hits.iter().map(|h| h.chunk.text.as_str()).collect::<Vec<_>>()
+        hits.iter()
+            .map(|h| h.chunk.text.as_str())
+            .collect::<Vec<_>>()
     );
 }
 
