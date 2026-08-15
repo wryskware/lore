@@ -48,8 +48,11 @@ pub fn anchor_label(kind: &ChunkKind) -> String {
         ChunkKind::Code {
             symbol_kind,
             symbol_path,
+            ..
         } => format!("code[{symbol_kind}] {symbol_path}"),
-        ChunkKind::Section { heading_path } => format!("section [{}]", heading_path.join(" > ")),
+        ChunkKind::Section { heading_path, .. } => {
+            format!("section [{}]", heading_path.join(" > "))
+        }
         ChunkKind::Window { index } => format!("window {index}"),
     }
 }

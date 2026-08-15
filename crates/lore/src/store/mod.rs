@@ -1249,6 +1249,7 @@ mod tests {
     fn chunk(path: &str, symbol: &str, text: &str) -> Chunk {
         let path = Utf8PathBuf::from(path);
         let kind = ChunkKind::Code {
+            window: None,
             symbol_kind: "function".into(),
             symbol_path: symbol.into(),
         };
@@ -1346,6 +1347,7 @@ mod tests {
         let path = Utf8PathBuf::from(path);
         let kind = ChunkKind::Section {
             heading_path: vec![heading.to_string()],
+            window: None,
         };
         Chunk {
             id: Chunk::derive_id(&path, &kind, text),

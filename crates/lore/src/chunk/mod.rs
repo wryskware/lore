@@ -33,7 +33,15 @@ use crate::types::Chunk;
 /// unchanged files. The indexer mixes this into its per-file content hash,
 /// so a version bump invalidates the hash short-circuit and the next scan
 /// re-chunks (and prunes newly-skipped) files whose bytes never moved.
-pub const CHUNK_FORMAT_VERSION: u32 = 3;
+///
+/// 4: windowed chunks carry an explicit [`crate::types::WindowFamily`] instead
+/// of leaving ranking to infer membership from the `#w<n>` anchor suffix.
+/// Rows written by version 3 deserialize with no family, which makes them
+/// *uncollapsible* — duplicate windows would show up in results until the file
+/// next changed. This bump converges every file in one CPU-only re-chunk pass;
+/// because the family is deliberately absent from `ChunkKind::anchor`, chunk
+/// ids do not move and nothing is re-embedded.
+pub const CHUNK_FORMAT_VERSION: u32 = 4;
 
 /// A single line longer than this marks a file as machine text (minified
 /// bundles, ML vocab dumps, serialized blobs). Dogfooding on the Lexomancy

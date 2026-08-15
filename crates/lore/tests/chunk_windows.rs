@@ -8,7 +8,7 @@ use chunk_support::{anchor_label, chunk_fixture, render};
 use lore::chunk::{
     FileChunks, MAX_CHUNK_BYTES, TEXT_WINDOW_LINES, WINDOW_OVERLAP_LINES, chunk_file,
 };
-use lore::types::{Chunk, ChunkKind};
+use lore::types::{Chunk, ChunkKind, WindowFamily};
 
 fn chunk(name: &str, src: &str) -> Vec<Chunk> {
     match chunk_file(Utf8Path::new(name), src.as_bytes()) {
@@ -62,9 +62,19 @@ fn oversized_symbols_split_into_anchored_windows() {
             ChunkKind::Code {
                 symbol_path,
                 symbol_kind,
+                window,
             } => {
                 assert_eq!(symbol_path, &format!("big_fn#w{i}"));
                 assert_eq!(symbol_kind, "function_item");
+                // Every window of one split span shares a family; the index
+                // is the same ordinal the `#w` suffix spells.
+                assert_eq!(
+                    window,
+                    &Some(WindowFamily {
+                        family: 0,
+                        index: i as u32
+                    })
+                );
             }
             other => panic!("unexpected kind {other:?}"),
         }
@@ -93,8 +103,18 @@ fn oversized_markdown_sections_keep_their_heading_path() {
     assert!(chunks.len() > 3);
     for (i, c) in chunks.iter().enumerate() {
         match &c.kind {
-            ChunkKind::Section { heading_path } => {
+            ChunkKind::Section {
+                heading_path,
+                window,
+            } => {
                 assert_eq!(heading_path, &["Big section".to_string(), format!("#w{i}")]);
+                assert_eq!(
+                    window,
+                    &Some(WindowFamily {
+                        family: 0,
+                        index: i as u32
+                    })
+                );
             }
             other => panic!("unexpected kind {other:?}"),
         }

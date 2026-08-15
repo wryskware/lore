@@ -42,7 +42,7 @@ fn markdown_heading_paths_nest_root_to_leaf() {
     let paths: Vec<Vec<String>> = chunks
         .iter()
         .filter_map(|chunk| match &chunk.kind {
-            ChunkKind::Section { heading_path } => Some(heading_path.clone()),
+            ChunkKind::Section { heading_path, .. } => Some(heading_path.clone()),
             _ => None,
         })
         .collect();
@@ -71,7 +71,7 @@ fn markdown_vault_metadata_propagates_to_every_chunk() {
     }
     let code_section = chunks
         .iter()
-        .find(|c| matches!(&c.kind, ChunkKind::Section { heading_path } if heading_path.last().is_some_and(|h| h == "Code")))
+        .find(|c| matches!(&c.kind, ChunkKind::Section { heading_path, .. } if heading_path.last().is_some_and(|h| h == "Code")))
         .expect("### Code section");
     assert_eq!(
         code_section.vault.as_ref().unwrap().body_decision_refs,

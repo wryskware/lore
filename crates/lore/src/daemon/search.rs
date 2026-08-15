@@ -14,6 +14,29 @@
 //! that changes meaning with every corpus. RRF ignores magnitudes entirely and
 //! fuses *ranks*, which is why it is the standard answer and what 3.1 asks for.
 //!
+//! # Candidate depth is proved, not guessed
+//!
+//! Fusing ranks means a chunk both arms merely *like* can outscore a chunk one
+//! arm loves: agreement at rank 51 in both lists (`2/111`) beats a rank-1
+//! singleton (`1/61`). A fixed 50-per-arm pull therefore does not truncate the
+//! tail of the ranking, it silently omits results that belong at the top of
+//! it. Collapse makes the same pull underfill pages: one oversized symbol's
+//! windows can occupy the whole pool and leave a page of one.
+//!
+//! So acquisition loops. Each round fetches both arms at the current depth and
+//! re-runs fusion, authority and collapse *from scratch*, then asks whether
+//! anything outside the page could still get in (see [`page_is_final`]). It
+//! stops when the answer is provably no, when both arms are exhausted, or at
+//! [`MAX_CANDIDATES`]. Depth itself is nearly free in this store — the vector
+//! arm is an O(n) scan whose cost does not depend on `k`, and FTS5 scores
+//! every matching posting regardless of `LIMIT` — so what a round costs is
+//! one more scan, and the ladder is kept short for that reason.
+//!
+//! On the ordinary corpus this settles in one round: both arms run out of
+//! matching rows inside the first 50, which makes the ranking exact rather
+//! than merely unbeatable. Read [`MAX_CANDIDATES`] for what happens when they
+//! do not, and for the one thing this still does not promise.
+//!
 //! # Degradation is a first-class path
 //!
 //! `lexical_only` means exactly "vectors did not participate in *this*
@@ -26,7 +49,6 @@ use std::collections::{HashMap, HashSet};
 use lore_core::{SearchRequest, SearchResponse, SearchResult};
 
 use crate::authority::Authority;
-use crate::embed::text::{WINDOW_MARKER, is_discriminator, strip_discriminators};
 use crate::store::{Project, ProjectId, SearchFilter, SearchHit, StatusFilter, Store};
 use crate::types::{Chunk, ChunkKind, DesignStatus, SourceKind};
 
@@ -41,13 +63,42 @@ pub const MAX_LIMIT: u32 = 100;
 /// context window on one tool call.
 pub const EXCERPT_MAX_CHARS: usize = 2000;
 
-/// Candidates pulled from the lexical arm before fusion. Deeper than the
-/// default page on purpose: a chunk the vector arm loves is worth surfacing
-/// even if BM25 put it at 40, and that only works if BM25 was asked for 50.
+/// Depth of the *first* lexical fetch. Deeper than the default page on
+/// purpose: a chunk the vector arm loves is worth surfacing even if BM25 put
+/// it at 40, and that only works if BM25 was asked for 50. Later rounds grow
+/// from here — this is a floor, not a ceiling.
 pub const LEXICAL_CANDIDATES: usize = 50;
 
-/// Candidates pulled from the vector arm before fusion.
+/// Depth of the first vector fetch. See [`LEXICAL_CANDIDATES`].
 pub const VECTOR_CANDIDATES: usize = 50;
+
+/// Per-arm depth multiplier between acquisition rounds.
+///
+/// A *round*, not a row, is the unit of cost here: the vector arm is a full
+/// scan whose price does not depend on the depth requested, so four rounds of
+/// 50 cost roughly four times one round of 200. The ladder is therefore short
+/// and steep — 50 → 200 → 800 → [`MAX_CANDIDATES`], four rounds at worst —
+/// rather than the gentler doubling that would pay for six scans to reach the
+/// same place.
+pub const CANDIDATE_GROWTH: usize = 4;
+
+/// Hard ceiling on per-arm candidate depth, and the one approximation left in
+/// ranking.
+///
+/// **This cap is load-bearing, not a safety valve.** Proving a page final
+/// means bounding the candidate *just* below the cutoff, and with RRF damping
+/// `K` the gap between consecutive ranks near rank `r` is about
+/// `1/(K + r)²`, so a real proof for a 20-result page over a dense corpus
+/// needs depth on the order of `(K + 20)² = 6400` — measured, not estimated.
+/// Any query whose arms are both still open at 1000 therefore stops here.
+///
+/// What the loop buys is nonetheless real, and is what the two reported
+/// failures asked for: cross-arm agreement anywhere in the first 1000 now
+/// wins the page it deserves (rank 51 was the reported case), and collapse can
+/// no longer strand a page at one result while eligible chunks sit below the
+/// pool. What remains approximate is only the tail beyond 1000, and hitting
+/// the cap is logged so it is visible rather than assumed.
+pub const MAX_CANDIDATES: usize = 1000;
 
 /// RRF damping constant. 60 is the value from the original Cormack et al.
 /// result and the de-facto default everywhere since; it makes the top of each
@@ -135,38 +186,110 @@ pub fn execute(
 
     let limit = request.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
 
-    // Ask each arm for a candidate pool at least as deep as the page the
-    // caller wants; otherwise `limit = 100` would silently top out at 50.
-    let lexical = store.lexical_search(&request.query, &filter, limit.max(LEXICAL_CANDIDATES))?;
+    // Candidate acquisition is a loop, not one fixed pull (see the module
+    // header). Both arms are always asked for the same depth, because the stop
+    // condition is stated in terms of a single `depth`. The floor keeps a
+    // large page from being served out of a shallower pool than itself
+    // (`limit = 100` must not top out at 50); the cap governs the other end.
+    let mut depth = limit.clamp(LEXICAL_CANDIDATES.max(VECTOR_CANDIDATES), MAX_CANDIDATES);
 
-    // A vector-arm failure degrades this request instead of failing it: the
-    // usual cause is a fingerprint that moved under a live query (dimension
-    // mismatch), which the worker is already fixing by re-embedding.
-    let vector = match query_vector {
-        Some(query_vector) => {
-            match store.vector_search(query_vector, &filter, limit.max(VECTOR_CANDIDATES)) {
+    let (fusion, lexical_only) = loop {
+        let lexical = store.lexical_search(&request.query, &filter, depth)?;
+
+        // A vector-arm failure degrades this request instead of failing it:
+        // the usual cause is a fingerprint that moved under a live query
+        // (dimension mismatch), which the worker is already fixing by
+        // re-embedding.
+        let vector = match query_vector {
+            Some(query_vector) => match store.vector_search(query_vector, &filter, depth) {
                 Ok(hits) => hits,
                 Err(err) => {
                     tracing::debug!(error = %err, "vector arm failed; falling back to lexical-only");
                     Vec::new()
                 }
-            }
+            },
+            None => Vec::new(),
+        };
+
+        // An arm that returned fewer rows than it was asked for has nothing
+        // left to give, and neither has one that never ran (no query vector,
+        // a vector error, a query that sanitized to nothing). "Open" arms are
+        // the only ones a deeper round could hear from.
+        let open = u32::from(lexical.len() >= depth) | (u32::from(vector.len() >= depth) << 1);
+
+        // Honest by construction: an embedded query over a corpus with no
+        // vectors in the filtered scope contributed nothing, and says so.
+        let lexical_only = vector.is_empty();
+        let fusion = fuse_detailed(vec![lexical, vector], limit);
+
+        if open == 0 {
+            // Both arms are fully enumerated: this ranking is exact, not an
+            // approximation. Short pages here are genuinely short.
+            break (fusion, lexical_only);
         }
-        None => Vec::new(),
+        if page_is_final(&fusion, depth, open) {
+            break (fusion, lexical_only);
+        }
+        if depth >= MAX_CANDIDATES {
+            tracing::debug!(
+                depth,
+                limit,
+                query = %request.query,
+                "candidate cap reached; this page is the best of the fetched pool, not proven best"
+            );
+            break (fusion, lexical_only);
+        }
+        // `.max(depth + 1)` makes growth strictly monotonic, so the cap above
+        // is always reached and the loop always terminates.
+        depth = depth
+            .saturating_mul(CANDIDATE_GROWTH)
+            .max(depth + 1)
+            .min(MAX_CANDIDATES);
     };
 
-    // Honest by construction: an embedded query over a corpus with no vectors
-    // in the filtered scope contributed nothing, and says so.
-    let lexical_only = vector.is_empty();
-    let hits = fuse(vec![lexical, vector], limit);
-
-    let results = hits
+    let results = fusion
+        .page
         .into_iter()
         .map(|hit| to_result(&sources, hit))
         .collect();
     Ok(SearchResponse {
         results,
         lexical_only,
+    })
+}
+
+/// Can anything we have not placed on the page still reach it?
+///
+/// A candidate absent from an arm that returned a *full* `depth` rows sits at
+/// rank ≥ `depth + 1` there, so that arm can contribute at most
+/// `1 / (RRF_K + depth + 1)` to it. Bounding every reachable candidate by
+///
+/// ```text
+/// max_score(c) = authority_max(c) · (rrf_seen(c) + missing_open_arms(c) · 1/(RRF_K + depth + 1))
+/// ```
+///
+/// and comparing against the page's own minimum turns "50 per arm looked like
+/// enough" into a proof. A candidate no arm has shown us yet is the same
+/// formula with `rrf_seen = 0` and the most generous authority there is.
+///
+/// The comparison is `>=`, not `>`: equal scores break on chunk id, so a
+/// candidate that merely *ties* the cutoff can still take the slot.
+fn page_is_final(fusion: &Fusion, depth: usize, open: u32) -> bool {
+    // A short page is never final while any arm might still have rows: the
+    // missing results may be exactly the ones collapse took out of it.
+    let Some(cutoff) = fusion.cutoff else {
+        return false;
+    };
+    let arm_ceiling = 1.0 / (RRF_K + depth as f64 + 1.0);
+
+    // The unseen case: a chunk in no list yet could enter every open arm at
+    // once, at the best rank still available in each, and be `decided`.
+    if AUTHORITY_DECIDED * f64::from(open.count_ones()) * arm_ceiling >= cutoff {
+        return false;
+    }
+    fusion.outside.iter().all(|c| {
+        let missing = f64::from((open & !c.seen).count_ones());
+        c.authority * (c.rrf + missing * arm_ceiling) < cutoff
     })
 }
 
@@ -177,6 +300,31 @@ struct Candidate {
     authority: Authority,
     /// Σ over the lists this chunk appears in.
     rrf: f64,
+    /// Bit `i` set = this chunk appeared in `lists[i]`. Which arms are still
+    /// *missing* a candidate is what bounds how much better it could get.
+    seen: u32,
+}
+
+/// One fused page, plus what acquisition needs to know about everything that
+/// did not make it onto the page.
+struct Fusion {
+    page: Vec<SearchHit>,
+    /// Score of the last result on a *full* page — the bar a newcomer has to
+    /// clear. `None` when the page is short, which is never final while any
+    /// arm still has rows.
+    cutoff: Option<f64>,
+    outside: Vec<Outside>,
+}
+
+/// A candidate that could still displace something, reduced to the three
+/// numbers that bound it. Deliberately holds no chunk: acquisition may build
+/// this for a thousand rows per round.
+struct Outside {
+    /// Σ 1/(RRF_K + rank) over the arms that have already shown it.
+    rrf: f64,
+    authority: f64,
+    /// Same bitmask as [`Candidate::seen`].
+    seen: u32,
 }
 
 /// Reciprocal Rank Fusion + vault authority + window collapse.
@@ -189,16 +337,31 @@ struct Candidate {
 /// cannot tell which arms ran, so the score must not change meaning with the
 /// endpoint's health, and 3.1's authority modifier is a property of ranking
 /// rather than of hybridity.
+///
+/// Production goes through [`fuse_detailed`], which is this plus the numbers
+/// acquisition needs; this shape is what the ranking tests assert against.
+#[cfg(test)]
 fn fuse(lists: Vec<Vec<SearchHit>>, limit: usize) -> Vec<SearchHit> {
+    fuse_detailed(lists, limit).page
+}
+
+/// [`fuse`], keeping the bookkeeping acquisition needs to decide whether to
+/// go deeper. Recomputed from scratch every round — nothing here is patched
+/// incrementally, so a deeper fetch cannot leave a stale ordering behind.
+fn fuse_detailed(lists: Vec<Vec<SearchHit>>, limit: usize) -> Fusion {
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut seen: HashMap<(ProjectId, String), usize> = HashMap::new();
 
-    for list in lists {
+    for (list_index, list) in lists.into_iter().enumerate() {
+        let arm = 1u32 << list_index;
         for (rank, hit) in list.into_iter().enumerate() {
             let contribution = 1.0 / (RRF_K + (rank + 1) as f64);
             let key = (hit.project, hit.chunk.id.0.clone());
             match seen.get(&key) {
-                Some(&index) => candidates[index].rrf += contribution,
+                Some(&index) => {
+                    candidates[index].rrf += contribution;
+                    candidates[index].seen |= arm;
+                }
                 None => {
                     seen.insert(key, candidates.len());
                     candidates.push(Candidate {
@@ -206,19 +369,20 @@ fn fuse(lists: Vec<Vec<SearchHit>>, limit: usize) -> Vec<SearchHit> {
                         chunk: hit.chunk,
                         authority: hit.authority,
                         rrf: contribution,
+                        seen: arm,
                     });
                 }
             }
         }
     }
 
-    let mut scored: Vec<(f64, Candidate)> = candidates
+    // (score, authority, candidate) — authority is kept because the bound on
+    // an off-page candidate needs it separately from the product.
+    let mut scored: Vec<(f64, f64, Candidate)> = candidates
         .into_iter()
         .map(|candidate| {
-            (
-                candidate.rrf * authority_weight(candidate.authority.tier),
-                candidate,
-            )
+            let authority = authority_weight(candidate.authority.tier);
+            (candidate.rrf * authority, authority, candidate)
         })
         .collect();
     // Chunk id breaks ties so identical scores rank identically across runs;
@@ -226,59 +390,73 @@ fn fuse(lists: Vec<Vec<SearchHit>>, limit: usize) -> Vec<SearchHit> {
     scored.sort_by(|a, b| {
         b.0.partial_cmp(&a.0)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.1.chunk.id.0.cmp(&b.1.chunk.id.0))
+            .then_with(|| a.2.chunk.id.0.cmp(&b.2.chunk.id.0))
     });
 
-    let mut kept: HashSet<(ProjectId, camino::Utf8PathBuf, String)> = HashSet::new();
+    // Window collapse. The chunker splits an oversized symbol or section into
+    // overlapping windows, so a query matching the overlap hits several of
+    // them; they are one place in one file, the best-scoring one represents
+    // them, and the rest are noise the caller would have to deduplicate.
+    //
+    // The gate is *positive membership of one generated family*, never the
+    // shape of an anchor. Everything without a family stays a distinct result
+    // even when anchors collide: two C# overloads share `Parser.Parse`, two
+    // sibling `## Notes` sections share their heading path, and two
+    // independently windowed overloads both spell `#w0`/`#w1` while being
+    // different code. Rows written before `CHUNK_FORMAT_VERSION` 4 carry no
+    // family and therefore never collapse - the safe direction, showing a
+    // duplicate window rather than hiding a result, until the re-chunk pass
+    // reaches them.
+    let mut kept: HashSet<(ProjectId, camino::Utf8PathBuf, u32)> = HashSet::new();
     let mut out = Vec::with_capacity(limit.min(scored.len()));
-    for (score, candidate) in scored {
-        if out.len() >= limit {
-            break;
-        }
-        let key = (
-            candidate.project,
-            candidate.chunk.path.clone(),
-            collapse_anchor(&candidate.chunk),
-        );
-        // Window collapse: the chunker splits an oversized symbol or section
-        // into overlapping `#w0/#w1/…` windows, so a query matching the
-        // overlap hits several of them. They are one place in one file; the
-        // best-scoring window represents them and the rest are noise the
-        // caller would have to deduplicate itself.
-        if !kept.insert(key) {
+    let mut outside: Vec<Outside> = Vec::new();
+    let mut cutoff = f64::INFINITY;
+    for (score, authority, candidate) in scored {
+        let family = candidate.chunk.kind.window_family().map(|window| {
+            (
+                candidate.project,
+                candidate.chunk.path.clone(),
+                window.family,
+            )
+        });
+        if out.len() < limit {
+            if let Some(key) = family
+                && !kept.insert(key)
+            {
+                continue;
+            }
+            cutoff = score;
+            out.push(SearchHit {
+                project: candidate.project,
+                chunk: candidate.chunk,
+                authority: candidate.authority,
+                score: score as f32,
+            });
             continue;
         }
-        out.push(SearchHit {
-            project: candidate.project,
-            chunk: candidate.chunk,
-            authority: candidate.authority,
-            score: score as f32,
+        // Everything below the page is a reason to fetch deeper — with one
+        // exception. A window whose family already holds a slot cannot add a
+        // result no matter how much its score grows: at best it overtakes its
+        // own family's representative, which swaps *which window* of one span
+        // is shown and leaves the page the same size, the same set of places,
+        // and its minimum no lower. (Which window represents a split span is
+        // therefore decided at the depth reached, not proven — a deliberate,
+        // bounded approximation.) Members of a family that is entirely off the
+        // page get no such exemption: that family can still climb into it, so
+        // every one of its members is bounded here.
+        if family.is_some_and(|key| kept.contains(&key)) {
+            continue;
+        }
+        outside.push(Outside {
+            rrf: candidate.rrf,
+            authority,
+            seen: candidate.seen,
         });
     }
-    out
-}
-
-/// Identity of a chunk's *location*, ignoring which oversize window it is.
-///
-/// Only `#w` is stripped. `#s<n>` distinguishes genuinely different runs of
-/// unnamed statements and `#d<n>` distinguishes real duplicate spans; folding
-/// either would hide results rather than deduplicate them. Text-window chunks
-/// (`ChunkKind::Window`) keep their ordinal for the same reason — consecutive
-/// windows of a log file are different content, not one split symbol.
-fn collapse_anchor(chunk: &Chunk) -> String {
-    match &chunk.kind {
-        ChunkKind::Code { symbol_path, .. } => {
-            format!("code:{}", strip_discriminators(symbol_path, &WINDOW_MARKER))
-        }
-        ChunkKind::Section { heading_path } => {
-            let titles: Vec<&str> = heading_path
-                .iter()
-                .filter(|title| !is_discriminator(title, &WINDOW_MARKER))
-                .map(String::as_str)
-                .collect();
-            format!("md:{}", titles.join(" > "))
-        }
-        ChunkKind::Window { index } => format!("win:{index}"),
+    Fusion {
+        cutoff: (out.len() >= limit).then_some(cutoff),
+        page: out,
+        outside,
     }
 }
 
@@ -317,7 +495,7 @@ fn to_result(sources: &HashMap<ProjectId, Project>, hit: SearchHit) -> SearchRes
     let chunk = hit.chunk;
     let (symbol_path, heading_path) = match &chunk.kind {
         ChunkKind::Code { symbol_path, .. } => (Some(symbol_path.clone()), None),
-        ChunkKind::Section { heading_path } => (None, Some(heading_path.clone())),
+        ChunkKind::Section { heading_path, .. } => (None, Some(heading_path.clone())),
         ChunkKind::Window { .. } => (None, None),
     };
     let (design_status, decision_refs) = match &chunk.vault {
@@ -388,7 +566,7 @@ fn status_label(status: DesignStatus) -> &'static str {
 mod tests {
     use super::*;
     use crate::authority::Demotion;
-    use crate::types::{Chunk, ChunkId, VaultMeta, authority_tier};
+    use crate::types::{Chunk, ChunkId, VaultMeta, WindowFamily, authority_tier};
     use camino::Utf8PathBuf;
 
     /// `id` is what ties a chunk together across the two ranked lists, so the
@@ -434,6 +612,7 @@ mod tests {
     fn section(title: &str) -> ChunkKind {
         ChunkKind::Section {
             heading_path: vec![title.to_string()],
+            window: None,
         }
     }
 
@@ -544,52 +723,194 @@ mod tests {
         assert_eq!(authority_weight(0), AUTHORITY_DEPRECATED);
     }
 
+    /// One window of a family, as the chunker emits it: the `#w<n>` suffix
+    /// *and* the metadata that says the suffix is bookkeeping.
+    fn window(family: u32, index: u32) -> Option<WindowFamily> {
+        Some(WindowFamily { family, index })
+    }
+
     #[test]
     fn overlapping_windows_of_one_span_collapse_to_the_best_one() {
-        let code = |suffix: &str| ChunkKind::Code {
+        let code = |suffix: &str, window| ChunkKind::Code {
             symbol_kind: "method_declaration".into(),
             symbol_path: format!("Board.Update{suffix}"),
+            window,
         };
         // Both windows of `Board.Update` match; only the better one survives.
         let lexical = vec![
-            hit("w0", "Board.cs", code("#w0"), None),
-            hit("w1", "Board.cs", code("#w1"), None),
-            hit("other", "Board.cs", code("Other"), None),
+            hit("w0", "Board.cs", code("#w0", window(0, 0)), None),
+            hit("w1", "Board.cs", code("#w1", window(0, 1)), None),
+            hit("other", "Board.cs", code("Other", None), None),
         ];
         let fused = fuse(vec![lexical, Vec::new()], 10);
         assert_eq!(ids(&fused), ["w0", "other"]);
 
-        // Same anchor in a *different file* is a different place.
+        // Same anchor *and* same family ordinal in a different file is a
+        // different place: the key is per file, and families are per file too.
         let cross_file = vec![
-            hit("a", "Board.cs", code("#w0"), None),
-            hit("b", "Other.cs", code("#w0"), None),
+            hit("a", "Board.cs", code("#w0", window(0, 0)), None),
+            hit("b", "Other.cs", code("#w0", window(0, 0)), None),
         ];
         assert_eq!(ids(&fuse(vec![cross_file], 10)).len(), 2);
     }
 
     #[test]
-    fn section_windows_collapse_but_distinct_headings_do_not() {
-        let windowed = |suffix: Option<&str>| ChunkKind::Section {
+    fn section_windows_collapse_but_equal_anchors_do_not() {
+        let windowed = |suffix: Option<&str>, window| ChunkKind::Section {
             heading_path: match suffix {
                 Some(s) => vec!["Ranking".into(), s.to_string()],
                 None => vec!["Ranking".into()],
             },
+            window,
         };
         let hits = vec![
-            hit("s0", "3.1.md", windowed(Some("#w0")), None),
-            hit("s1", "3.1.md", windowed(Some("#w1")), None),
-            hit("whole", "3.1.md", windowed(None), None),
+            hit("s0", "3.1.md", windowed(Some("#w0"), window(0, 0)), None),
+            hit("s1", "3.1.md", windowed(Some("#w1"), window(0, 1)), None),
+            hit("whole", "3.1.md", windowed(None, None), None),
             hit(
                 "dup",
                 "3.1.md",
                 ChunkKind::Section {
                     heading_path: vec!["Ranking".into(), "#d1".into()],
+                    window: None,
                 },
                 None,
             ),
         ];
-        // s0/s1/whole are one location; `#d1` is a real duplicate span.
-        assert_eq!(ids(&fuse(vec![hits], 10)), ["s0", "dup"]);
+        // Only s0/s1 are two views of one span. `whole` is an unsplit section
+        // that merely shares the base heading path — a sibling `## Ranking`,
+        // as far as ranking can tell — and `#d1` is a real duplicate span;
+        // folding either would delete content the caller asked for.
+        assert_eq!(ids(&fuse(vec![hits], 10)), ["s0", "whole", "dup"]);
+    }
+
+    /// A heading a human typed as `#w0` is content, not bookkeeping: without
+    /// the family it is never folded away, whatever it is spelled.
+    #[test]
+    fn a_user_authored_window_shaped_heading_is_not_bookkeeping() {
+        let heading = |title: &str| ChunkKind::Section {
+            heading_path: vec!["Escapes".into(), title.into()],
+            window: None,
+        };
+        let hits = vec![
+            hit("a", "notes.md", heading("#w0"), None),
+            hit("b", "notes.md", heading("#w1"), None),
+        ];
+        assert_eq!(ids(&fuse(vec![hits], 10)), ["a", "b"]);
+    }
+
+    /// S3#1 / S4#4 required test. Collapse folds *membership of one generated
+    /// window family* and nothing else, so every shape of "same anchor,
+    /// different content" has to survive it.
+    ///
+    /// The four cases are the ones the reviews named: C# overloads (D-0003's
+    /// flagship language gives `Parse(string)` and `Parse(Stream)` the same
+    /// structural path), repeated Markdown headings, one real family, and two
+    /// families whose anchors are indistinguishable as strings.
+    #[test]
+    fn collapse_preserves_overloads_and_repeated_headings() {
+        /// Same helper as [`hit`], with a real span so the two chunks differ
+        /// in everything except their anchor.
+        fn spanned(id: &str, path: &str, kind: ChunkKind, line: u32) -> SearchHit {
+            let mut h = hit(id, path, kind, None);
+            h.chunk.line_start = line;
+            h.chunk.line_end = line + 20;
+            h.chunk.byte_start = line * 40;
+            h.chunk.byte_end = (line + 20) * 40;
+            h
+        }
+        let overload = |id: &str, line: u32| {
+            spanned(
+                id,
+                "Assets/Scripts/Parser.cs",
+                ChunkKind::Code {
+                    symbol_kind: "method_declaration".into(),
+                    symbol_path: "Parser.Parse".into(),
+                    window: None,
+                },
+                line,
+            )
+        };
+        let notes = |id: &str, line: u32| {
+            spanned(
+                id,
+                "docs/notes.md",
+                ChunkKind::Section {
+                    heading_path: vec!["Design".into(), "Notes".into()],
+                    window: None,
+                },
+                line,
+            )
+        };
+
+        // 1. Two overloads: one anchor, one file, two methods. Both are results.
+        assert_eq!(
+            ids(&fuse(
+                vec![vec![
+                    overload("parse-text", 10),
+                    overload("parse-stream", 90)
+                ]],
+                10
+            )),
+            ["parse-text", "parse-stream"],
+        );
+
+        // 2. Two sibling `## Notes` sections under the same parent heading.
+        assert_eq!(
+            ids(&fuse(
+                vec![vec![notes("notes-a", 4), notes("notes-b", 60)]],
+                10
+            )),
+            ["notes-a", "notes-b"],
+        );
+
+        // 3. One oversized method, split by the chunker. Its windows are three
+        //    views of one span, and the best-scoring one speaks for them.
+        let member = |id: &str, index: u32| {
+            spanned(
+                id,
+                "Assets/Scripts/Parser.cs",
+                ChunkKind::Code {
+                    symbol_kind: "method_declaration".into(),
+                    symbol_path: format!("Parser.Parse#w{index}"),
+                    window: Some(WindowFamily { family: 0, index }),
+                },
+                10 + index * 30,
+            )
+        };
+        assert_eq!(
+            ids(&fuse(
+                vec![vec![member("w0", 0), member("w1", 1), member("w2", 2)]],
+                10
+            )),
+            ["w0"],
+        );
+
+        // 4. Both overloads oversized: two families, and every string they
+        //    carry — anchor, `#w` suffix, file — is identical across them.
+        //    Only the family ordinal separates them, and it must, or two
+        //    methods become one result.
+        let of_family = |id: &str, family: u32, index: u32| {
+            spanned(
+                id,
+                "Assets/Scripts/Parser.cs",
+                ChunkKind::Code {
+                    symbol_kind: "method_declaration".into(),
+                    symbol_path: format!("Parser.Parse#w{index}"),
+                    window: Some(WindowFamily { family, index }),
+                },
+                10 + family * 100 + index * 30,
+            )
+        };
+        let both = vec![
+            of_family("text-w0", 0, 0),
+            of_family("stream-w0", 1, 0),
+            of_family("text-w1", 0, 1),
+            of_family("stream-w1", 1, 1),
+        ];
+        // One result per family, in the order the arm ranked their best
+        // members — never one total, and never all four.
+        assert_eq!(ids(&fuse(vec![both], 10)), ["text-w0", "stream-w0"]);
     }
 
     #[test]

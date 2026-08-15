@@ -24,9 +24,13 @@
 //! windows, `#d<n>` for a genuine id collision, `#s<n>` for an unnamed run of
 //! statements. They are storage identity, not meaning — an embedding model
 //! reading `Board.Update#w1` learns nothing except noise — so the header
-//! shows `Board.Update`. Ranking strips only `#w` (see
-//! [`crate::daemon::search`]), because two windows of one symbol are one
-//! result while two `#s` fillers are genuinely different code.
+//! shows `Board.Update`.
+//!
+//! Stripping here is *readability only*, and stays deliberately naive: a
+//! heading a human typed as `#w0` costs nothing to hide from an embedding
+//! header. Ranking makes the opposite choice and reads no anchor strings at
+//! all — window membership reaches it as [`crate::types::WindowFamily`]
+//! metadata, because there a wrong guess deletes a result.
 
 use crate::types::{Chunk, ChunkKind};
 
@@ -42,9 +46,6 @@ pub const MAX_EMBED_TEXT_BYTES: usize = 8 * 1024;
 /// Discriminator markers that carry no meaning for a reader: window split,
 /// duplicate disambiguation, unnamed-statement filler.
 pub const ALL_MARKERS: [char; 3] = ['w', 'd', 's'];
-
-/// Only the window split. Two windows of one symbol are one logical result.
-pub const WINDOW_MARKER: [char; 1] = ['w'];
 
 /// Text actually sent for a chunk.
 pub fn document_text(chunk: &Chunk, document_prefix: &str) -> String {
@@ -75,6 +76,7 @@ fn anchor_phrase(kind: &ChunkKind) -> Option<String> {
         ChunkKind::Code {
             symbol_kind,
             symbol_path,
+            ..
         } => {
             let symbol = strip_discriminators(symbol_path, &ALL_MARKERS);
             // "group" means the chunker merged several tiny siblings; naming
@@ -95,7 +97,7 @@ fn anchor_phrase(kind: &ChunkKind) -> Option<String> {
             };
             (!phrase.is_empty()).then_some(phrase)
         }
-        ChunkKind::Section { heading_path } => {
+        ChunkKind::Section { heading_path, .. } => {
             let titles: Vec<&str> = heading_path
                 .iter()
                 .filter(|title| !is_discriminator(title, &ALL_MARKERS))
@@ -177,6 +179,7 @@ mod tests {
         ChunkKind::Code {
             symbol_kind: symbol_kind.into(),
             symbol_path: symbol_path.into(),
+            window: None,
         }
     }
 
@@ -201,6 +204,7 @@ mod tests {
             Some("markdown"),
             ChunkKind::Section {
                 heading_path: vec!["Retrieval".into(), "Ranking".into()],
+                window: None,
             },
             "RRF fuses the two arms.",
         );
@@ -230,6 +234,10 @@ mod tests {
             Some("markdown"),
             ChunkKind::Section {
                 heading_path: vec!["Top".into(), "#w2".into()],
+                window: Some(crate::types::WindowFamily {
+                    family: 0,
+                    index: 2,
+                }),
             },
             "",
         );
@@ -261,8 +269,9 @@ mod tests {
     #[test]
     fn stripping_is_repeated_and_marker_scoped() {
         assert_eq!(strip_discriminators("A.B#w1#d2", &ALL_MARKERS), "A.B");
-        // Ranking strips only window splits: `#s0` distinguishes real chunks.
-        assert_eq!(strip_discriminators("A.#s0#w1", &WINDOW_MARKER), "A.#s0");
+        // Stripping is scoped to the markers it is handed, and stops at the
+        // first suffix outside that set.
+        assert_eq!(strip_discriminators("A.#s0#w1", &['w']), "A.#s0");
         assert_eq!(strip_discriminators("A.#s0#w1", &ALL_MARKERS), "A");
         // A `#` that is not a discriminator is left alone.
         assert_eq!(strip_discriminators("C#.Parser", &ALL_MARKERS), "C#.Parser");

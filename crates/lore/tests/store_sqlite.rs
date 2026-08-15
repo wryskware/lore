@@ -20,6 +20,7 @@ fn code_chunk(path: &str, symbol: &str, text: &str, language: &str) -> Chunk {
     let kind = ChunkKind::Code {
         symbol_kind: "function".into(),
         symbol_path: symbol.into(),
+        window: None,
     };
     Chunk {
         id: Chunk::derive_id(&path, &kind, text),
@@ -39,6 +40,7 @@ fn section_chunk(path: &str, heading: &str, text: &str, status: Option<DesignSta
     let path = Utf8PathBuf::from(path);
     let kind = ChunkKind::Section {
         heading_path: vec![heading.into()],
+        window: None,
     };
     Chunk {
         id: Chunk::derive_id(&path, &kind, text),
