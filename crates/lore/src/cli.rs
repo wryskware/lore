@@ -761,6 +761,57 @@ mod tests {
         assert_eq!(coverage(1204, 1204), "1204/1204 (100%)");
     }
 
+    /// The `status` half of "degradation is never silent" (1d). A refused
+    /// `decided` declaration is invisible everywhere else unless the author
+    /// happens to search for that exact file, so `lore status` has to name the
+    /// offenders — and say how many it did not name, or a vault with fifty
+    /// violations looks like a vault with five.
+    #[test]
+    fn status_names_the_refused_declarations_and_admits_what_it_truncated() {
+        let project = |violations: u64, paths: Vec<String>| DaemonStatus {
+            api_version: 1,
+            daemon_version: "0.1.0".into(),
+            generation: 3,
+            projects: vec![ProjectStatus {
+                id: 1,
+                name: "lore".into(),
+                key: "lore".into(),
+                root: r"C:\repos\lore".into(),
+                kind: "repo".into(),
+                files: 96,
+                chunks: 1204,
+                embedded_chunks: 1204,
+                authority_violations: violations,
+                authority_violation_paths: paths,
+                watch: WatchState::Armed,
+            }],
+            embeddings: EmbeddingStatus::Unconfigured,
+        };
+
+        // Clean vault: not a word about authority.
+        assert!(!render_status(&project(0, Vec::new())).contains("AUTHORITY"));
+
+        let rendered = render_status(&project(
+            2,
+            vec!["design/a.md".into(), "design/b.md".into()],
+        ));
+        assert!(rendered.contains("AUTHORITY: 2 file(s)"), "{rendered}");
+        assert!(rendered.contains("\n      design/a.md\n"), "{rendered}");
+        assert!(rendered.contains("\n      design/b.md\n"), "{rendered}");
+        assert!(
+            !rendered.contains("more"),
+            "nothing was truncated: {rendered}"
+        );
+
+        // The daemon caps the list; the count is the complete figure, so the
+        // difference has to be stated rather than quietly dropped.
+        let truncated = render_status(&project(
+            9,
+            vec!["design/a.md".into(), "design/b.md".into()],
+        ));
+        assert!(truncated.contains("... and 7 more"), "{truncated}");
+    }
+
     #[test]
     fn expand_renders_a_span_header_over_the_text() {
         assert_eq!(

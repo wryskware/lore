@@ -512,4 +512,38 @@ mod tests {
     fn coverage_does_not_divide_by_zero_on_an_unindexed_project() {
         assert_eq!(coverage(0, 0), "0/0");
     }
+
+    /// The agent-facing copy of the CLI's violation block. It is duplicated
+    /// code, which is exactly why it is tested separately: the two renderers
+    /// can drift, and this one is what an agent reads before deciding whether
+    /// a `decided` document is trustworthy.
+    #[test]
+    fn status_tells_the_agent_which_decided_declarations_were_refused() {
+        let body = |violations: u64, paths: Vec<String>| DaemonStatus {
+            api_version: 1,
+            daemon_version: "0.1.0".into(),
+            generation: 3,
+            projects: vec![ProjectStatus {
+                id: 1,
+                name: "lore".into(),
+                key: "lore".into(),
+                root: r"C:\repos\lore".into(),
+                kind: "repo".into(),
+                files: 96,
+                chunks: 1204,
+                embedded_chunks: 1204,
+                authority_violations: violations,
+                authority_violation_paths: paths,
+                watch: WatchState::Armed,
+            }],
+            embeddings: EmbeddingStatus::Unconfigured,
+        };
+
+        assert!(!status(&body(0, Vec::new())).contains("AUTHORITY"));
+
+        let rendered = status(&body(6, vec!["design/a.md".into()]));
+        assert!(rendered.contains("AUTHORITY: 6 file(s)"), "{rendered}");
+        assert!(rendered.contains("design/a.md"), "{rendered}");
+        assert!(rendered.contains("... and 5 more"), "{rendered}");
+    }
 }
