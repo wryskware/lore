@@ -1121,6 +1121,7 @@ fn row_to_authority(row: &Row<'_>) -> Result<Authority> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authority::UNCITED_DECIDED_TIER;
     use crate::types::ChunkKind;
 
     fn chunk(path: &str, symbol: &str, text: &str) -> Chunk {
@@ -1216,5 +1217,321 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))
             .unwrap();
         assert_eq!((chunks, indexed), (2, 2));
+    }
+
+    /// A Markdown chunk that declares something about itself.
+    fn vault_chunk(path: &str, heading: &str, text: &str, vault: VaultMeta) -> Chunk {
+        let path = Utf8PathBuf::from(path);
+        let kind = ChunkKind::Section {
+            heading_path: vec![heading.to_string()],
+        };
+        Chunk {
+            id: Chunk::derive_id(&path, &kind, text),
+            path,
+            kind,
+            language: Some("markdown".into()),
+            byte_start: 0,
+            byte_end: text.len() as u32,
+            line_start: 1,
+            line_end: 3,
+            text: text.into(),
+            vault: Some(vault),
+        }
+    }
+
+    fn declares(status: DesignStatus, refs: &[&str]) -> VaultMeta {
+        VaultMeta {
+            design_status: Some(status),
+            decision_refs: refs.iter().map(|r| (*r).to_string()).collect(),
+            body_decision_refs: Vec::new(),
+        }
+    }
+
+    /// Everything the FTS5 external-content index physically stores, as one
+    /// comparable value. A `delete`+re-insert through the sync triggers appends
+    /// new segment blocks, so this moves whenever the index churns — which is
+    /// the cost `recompute_effective_authority` claims not to pay.
+    fn fts_footprint(store: &Store) -> (i64, i64, i64) {
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(block)), 0), COALESCE(SUM(id), 0)
+                 FROM chunks_fts_data",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    /// `(rowid, chunk_id, effective_tier, demotion)` for every chunk, in
+    /// storage order. The rowid is the join key for embeddings *and* for the
+    /// FTS index, so it is the thing that must not move.
+    fn chunk_rows(store: &Store) -> Vec<(i64, String, i64, Option<String>)> {
+        let mut stmt = store
+            .conn
+            .prepare("SELECT id, chunk_id, effective_tier, demotion FROM chunks ORDER BY id")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap();
+        rows.collect::<std::result::Result<_, _>>().unwrap()
+    }
+
+    fn embedding_rows(store: &Store) -> Vec<(i64, Vec<u8>)> {
+        let mut stmt = store
+            .conn
+            .prepare("SELECT chunk_rowid, vector FROM embeddings ORDER BY chunk_rowid")
+            .unwrap();
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)));
+        rows.unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    }
+
+    /// The claim that makes effective authority affordable: a ledger edit is a
+    /// metadata pass. Not "cheap" in a hand-wavy sense — it must leave chunk
+    /// rowids, content-addressed ids, stored vectors *and* the FTS index
+    /// physically untouched, because those are what a re-index would destroy.
+    ///
+    /// Tested white-box on purpose: from outside the store, a recompute that
+    /// deleted and re-inserted every row would look identical to one that
+    /// updated them in place, right up until the embeddings were gone.
+    #[test]
+    fn a_recompute_rewrites_tiers_without_disturbing_rowids_vectors_or_the_fts_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path().join("lore.db")).unwrap();
+        let proj = store
+            .register_project(Utf8Path::new("C:/repos/x"), "x")
+            .unwrap();
+
+        let path = Utf8Path::new("design/1.1.md");
+        let chunks = [
+            vault_chunk(
+                "design/1.1.md",
+                "Overview",
+                "Alpha section about ranking.",
+                declares(DesignStatus::Decided, &["D-0001"]),
+            ),
+            vault_chunk(
+                "design/1.1.md",
+                "Detail",
+                "Beta section about ranking.",
+                declares(DesignStatus::Decided, &["D-0001"]),
+            ),
+        ];
+        store
+            .replace_file_chunks(proj, path, "h1", &chunks)
+            .unwrap();
+
+        // No ledger has been parsed yet, so the declaration is refused.
+        let before_rows = chunk_rows(&store);
+        assert_eq!(before_rows.len(), 2);
+        assert!(before_rows.iter().all(|(_, _, tier, code)| *tier
+            == i64::from(UNCITED_DECIDED_TIER)
+            && code.as_deref() == Some("uncited_decided")));
+
+        let embeddings: Vec<NewEmbedding> = chunks
+            .iter()
+            .enumerate()
+            .map(|(n, chunk)| NewEmbedding {
+                project: proj,
+                chunk_id: chunk.id.clone(),
+                vector: vec![0.25 + n as f32, 0.5, 0.75, 1.0],
+            })
+            .collect();
+        assert_eq!(store.upsert_embeddings(&embeddings).unwrap(), 2);
+
+        let before_embeddings = embedding_rows(&store);
+        let before_fts = fts_footprint(&store);
+
+        // The ledger now says D-0001 is active. Every tier in the project is
+        // wrong and has to be re-derived.
+        let active: BTreeSet<String> = ["D-0001".to_string()].into_iter().collect();
+        assert!(store.set_active_decisions(proj, &active).unwrap());
+        let summary = store.recompute_effective_authority(proj).unwrap();
+        assert_eq!(
+            (summary.files, summary.files_changed, summary.violations),
+            (1, 1, 0),
+            "{summary:?}"
+        );
+        assert_eq!(summary.chunks_changed, 2, "both chunks of the file");
+
+        let after_rows = chunk_rows(&store);
+        assert!(
+            after_rows
+                .iter()
+                .all(|(_, _, tier, code)| *tier == 3 && code.is_none()),
+            "{after_rows:?}"
+        );
+        assert_eq!(
+            before_rows
+                .iter()
+                .map(|(rowid, id, _, _)| (*rowid, id.clone()))
+                .collect::<Vec<_>>(),
+            after_rows
+                .iter()
+                .map(|(rowid, id, _, _)| (*rowid, id.clone()))
+                .collect::<Vec<_>>(),
+            "rowids and content-addressed ids are the identity embeddings hang off"
+        );
+        assert_eq!(
+            embedding_rows(&store),
+            before_embeddings,
+            "a metadata pass must not touch a single stored vector"
+        );
+        assert_eq!(
+            fts_footprint(&store),
+            before_fts,
+            "the AFTER UPDATE trigger is scoped to text/path/anchor; a tier \
+             rewrite must not churn the index"
+        );
+        store
+            .conn
+            .execute_batch("INSERT INTO chunks_fts(chunks_fts) VALUES('integrity-check')")
+            .expect("FTS index still matches its content table");
+
+        // A steady-state recompute writes nothing at all.
+        let repeat = store.recompute_effective_authority(proj).unwrap();
+        assert_eq!((repeat.files_changed, repeat.chunks_changed), (0, 0));
+        assert_eq!(fts_footprint(&store), before_fts);
+
+        // Guard against a vacuous assertion: the footprint *does* move when an
+        // indexed column changes, so its stability above means something.
+        store
+            .conn
+            .execute("UPDATE chunks SET text = text || ' addendum'", [])
+            .unwrap();
+        assert_ne!(
+            fts_footprint(&store),
+            before_fts,
+            "the detector must be sensitive to real index churn"
+        );
+    }
+
+    /// The other half of "no re-index": a recompute that lowers a tier is just
+    /// as non-destructive as one that raises it, and a project whose ledger
+    /// vanished must not lose its embeddings on the way down.
+    #[test]
+    fn a_demoting_recompute_is_as_non_destructive_as_a_promoting_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path().join("lore.db")).unwrap();
+        let proj = store
+            .register_project(Utf8Path::new("C:/repos/x"), "x")
+            .unwrap();
+        let active: BTreeSet<String> = ["D-0001".to_string()].into_iter().collect();
+        store.set_active_decisions(proj, &active).unwrap();
+
+        let path = Utf8Path::new("design/1.1.md");
+        let chunk = vault_chunk(
+            "design/1.1.md",
+            "Overview",
+            "Alpha section.",
+            declares(DesignStatus::Decided, &["D-0001"]),
+        );
+        store
+            .replace_file_chunks(proj, path, "h1", std::slice::from_ref(&chunk))
+            .unwrap();
+        store
+            .upsert_embeddings(&[NewEmbedding {
+                project: proj,
+                chunk_id: chunk.id.clone(),
+                vector: vec![1.0, 0.0, 0.0, 0.0],
+            }])
+            .unwrap();
+        assert_eq!(chunk_rows(&store)[0].2, 3);
+
+        let before_rows = chunk_rows(&store);
+        let before_embeddings = embedding_rows(&store);
+        let before_fts = fts_footprint(&store);
+
+        // The ledger is deleted: nothing is active any more.
+        assert!(store.set_active_decisions(proj, &BTreeSet::new()).unwrap());
+        let summary = store.recompute_effective_authority(proj).unwrap();
+        assert_eq!(summary.violations, 1, "{summary:?}");
+
+        let after = chunk_rows(&store);
+        assert_eq!(after[0].2, i64::from(UNCITED_DECIDED_TIER));
+        assert_eq!(after[0].3.as_deref(), Some("uncited_decided"));
+        assert_eq!(after[0].0, before_rows[0].0, "same rowid");
+        assert_eq!(after[0].1, before_rows[0].1, "same chunk id");
+        assert_eq!(embedding_rows(&store), before_embeddings);
+        assert_eq!(fts_footprint(&store), before_fts);
+    }
+
+    /// The upgrade path the review demanded be survivable (S1#3/S1#7): a
+    /// database written before V2 has no keys and no uniqueness on `name`, so
+    /// two projects can legitimately share a display name. Migration plus
+    /// startup reconciliation must give them distinct keys and must not refuse
+    /// to start over a rule that only applies to *new* registrations.
+    #[test]
+    fn a_pre_v2_database_with_duplicate_display_names_migrates_and_gets_distinct_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let db = data_dir.join("lore.db");
+
+        // A V1 database, exactly as a pre-provenance daemon left it.
+        {
+            let mut conn = Connection::open(&db).unwrap();
+            schema::migrations().to_version(&mut conn, 1).unwrap();
+            for root in ["C:/repos/a/shared", "D:/work/shared"] {
+                conn.execute(
+                    "INSERT INTO projects (root, name) VALUES (?, 'shared')",
+                    params![root],
+                )
+                .unwrap();
+            }
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, 1, "the fixture really is pre-V2");
+        }
+
+        // Opening migrates. Keys start NULL, which `list_projects` reports as
+        // empty rather than failing.
+        let mut store = Store::open(&db).unwrap();
+        assert!(
+            store
+                .list_projects()
+                .unwrap()
+                .iter()
+                .all(|p| p.key.is_empty() && p.kind == SourceKind::Repo)
+        );
+
+        // Startup reconciliation is what assigns them.
+        let outcome = crate::registry::reconcile(&mut store, &data_dir).expect("must not fail");
+        assert!(
+            matches!(
+                outcome,
+                crate::registry::Reconciliation::Bootstrapped {
+                    projects: 2,
+                    keys_assigned: 2
+                }
+            ),
+            "{outcome:?}"
+        );
+
+        let projects = store.list_projects().unwrap();
+        assert_eq!(projects[0].key, "shared");
+        assert_ne!(projects[0].key, projects[1].key, "{projects:?}");
+        assert!(projects[1].key.starts_with("shared-"), "{projects:?}");
+
+        // Documented residual, asserted rather than assumed: the pre-existing
+        // duplicate *display names* are left alone. Name enforcement guards new
+        // registrations; it does not rewrite a user's history. So name
+        // resolution stays ambiguous for these two rows — which is exactly why
+        // `project_key` exists and why search results carry it.
+        assert_eq!(projects[0].name, projects[1].name);
+        assert_eq!(
+            crate::daemon::resolve_project(&projects, "shared").map(|p| p.id),
+            Some(projects[0].id),
+            "by name, the first row silently wins"
+        );
+        for project in &projects {
+            assert_eq!(
+                crate::daemon::resolve_project_key(&projects, &project.key).map(|p| p.id),
+                Some(project.id),
+                "by key, each one is reachable"
+            );
+        }
     }
 }
