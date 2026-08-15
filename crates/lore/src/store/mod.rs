@@ -120,6 +120,28 @@ pub struct Project {
     pub kind: SourceKind,
 }
 
+/// One source as the caller wants it to exist after
+/// [`Store::apply_project_set`] — the desired end state of a row, not a delta.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectSpec {
+    /// The existing row this describes, or `None` to insert a new one.
+    ///
+    /// Resolved by the caller: deciding that a manifest root names an existing
+    /// project is a path comparison ([`crate::registry`] does it
+    /// case-insensitively on Windows), and the store does not own path
+    /// semantics. Supplying the id also lets a root be *respelled* — same
+    /// directory, different separators or case — without the store mistaking it
+    /// for a second project.
+    pub id: Option<ProjectId>,
+    pub root: Utf8PathBuf,
+    pub name: String,
+    /// The key this row must end up with. Unlike [`Store::upsert_project`]
+    /// there is no "keep whatever is there" mode: the manifest is
+    /// authoritative, so the caller always knows the answer.
+    pub key: String,
+    pub kind: SourceKind,
+}
+
 /// A file's indexing state, for change detection and orphan pruning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRecord {
@@ -379,20 +401,100 @@ impl Store {
     /// Forget a source entirely: its chunks, FTS rows, vectors, file records
     /// and parsed decision set go with it. Returns whether it was known.
     ///
-    /// Chunks are deleted explicitly rather than through the project FK
-    /// cascade so the FTS sync triggers fire on a plain `DELETE`, which is the
-    /// same discipline [`Self::remove_file`] follows.
+    /// One project on its own; [`Self::apply_project_set`] does the same
+    /// deletion as part of a larger reconciliation.
     pub fn remove_project(&mut self, project: ProjectId) -> Result<bool> {
         let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM chunks WHERE project_id = ?", params![project])?;
-        tx.execute("DELETE FROM files WHERE project_id = ?", params![project])?;
-        tx.execute(
-            "DELETE FROM project_decisions WHERE project_id = ?",
-            params![project],
-        )?;
-        let removed = tx.execute("DELETE FROM projects WHERE id = ?", params![project])?;
+        let removed = forget_project(&tx, project)?;
         tx.commit()?;
-        Ok(removed > 0)
+        Ok(removed)
+    }
+
+    /// Apply a whole registry reconciliation as **one** transaction: every
+    /// `desired` row is written and every `remove` row is forgotten, or nothing
+    /// is.
+    ///
+    /// # Why this is not a loop over [`Self::upsert_project`]
+    ///
+    /// `projects.key` is unique, and the manifest is a hand-edited file, so a
+    /// user is free to hand in a state that is perfectly legal *as a whole* but
+    /// unreachable one row at a time — most obviously two entries that
+    /// **exchange** keys. Row-at-a-time upserts hit `UNIQUE constraint failed:
+    /// projects.key` partway through, and because each one committed
+    /// separately, the registry was left half-applied and failed identically on
+    /// every subsequent start instead of converging.
+    ///
+    /// So the apply is ordered so a legal end state cannot transit through an
+    /// illegal one:
+    ///
+    /// 1. **removals first** — a key or root being handed to a surviving
+    ///    project may still be held by a project this edit deletes;
+    /// 2. **release** — every surviving row named by `desired` has its key set
+    ///    to `NULL`, which the unique index permits any number of times (SQLite
+    ///    treats NULLs as distinct), so no old key can collide with a new one;
+    /// 3. **claim** — only then are the final identities written.
+    ///
+    /// The caller supplies `id` per spec and the `remove` list because matching
+    /// a manifest root to an existing row is the *registry's* comparison to
+    /// make (it is case-insensitive on Windows); the store matches nothing and
+    /// guesses nothing.
+    ///
+    /// Uniqueness *within* `desired` is likewise the caller's to guarantee —
+    /// [`crate::registry`] repairs a manifest that violates it before calling.
+    /// A `desired` set that still collides with itself fails, and the
+    /// transaction rolls the whole reconciliation back rather than leaving a
+    /// partial one behind.
+    pub fn apply_project_set(
+        &mut self,
+        desired: &[ProjectSpec],
+        remove: &[ProjectId],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+
+        for &project in remove {
+            forget_project(&tx, project)?;
+        }
+
+        {
+            let mut release = tx.prepare("UPDATE projects SET key = NULL WHERE id = ?")?;
+            for spec in desired {
+                if let Some(id) = spec.id {
+                    release.execute(params![id])?;
+                }
+            }
+        }
+
+        {
+            let mut update = tx.prepare(
+                "UPDATE projects SET root = ?, name = ?, key = ?, kind = ? WHERE id = ?",
+            )?;
+            let mut insert =
+                tx.prepare("INSERT INTO projects (root, name, key, kind) VALUES (?, ?, ?, ?)")?;
+            for spec in desired {
+                match spec.id {
+                    Some(id) => {
+                        update.execute(params![
+                            spec.root.as_str(),
+                            spec.name,
+                            spec.key,
+                            spec.kind.as_str(),
+                            id
+                        ])?;
+                    }
+                    None => {
+                        insert.execute(params![
+                            spec.root.as_str(),
+                            spec.name,
+                            spec.key,
+                            spec.kind.as_str()
+                        ])?;
+                    }
+                }
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn list_projects(&self) -> Result<Vec<Project>> {
@@ -1058,6 +1160,26 @@ impl AuthorityContext {
             self.kind,
         )
     }
+}
+
+/// Drop a source and everything derived from it. Returns whether the row was
+/// there.
+///
+/// Chunks are deleted explicitly rather than through the project FK cascade so
+/// the FTS sync triggers fire on a plain `DELETE`, which is the same discipline
+/// [`Store::remove_file`] follows.
+///
+/// Takes the transaction rather than opening one, so it composes into a larger
+/// atomic unit ([`Store::apply_project_set`]) instead of committing on its own.
+fn forget_project(tx: &rusqlite::Transaction<'_>, project: ProjectId) -> Result<bool> {
+    tx.execute("DELETE FROM chunks WHERE project_id = ?", params![project])?;
+    tx.execute("DELETE FROM files WHERE project_id = ?", params![project])?;
+    tx.execute(
+        "DELETE FROM project_decisions WHERE project_id = ?",
+        params![project],
+    )?;
+    let removed = tx.execute("DELETE FROM projects WHERE id = ?", params![project])?;
+    Ok(removed > 0)
 }
 
 /// An unrecognized `projects.kind` reads back as `repo` rather than failing.

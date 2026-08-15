@@ -42,14 +42,14 @@
 //! renaming a project does not change it. Display names are additionally kept
 //! unique at registration so the human-facing resolver stays deterministic.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher, RandomState};
 
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 
-use crate::store::{Project, Store};
+use crate::store::{Project, ProjectId, ProjectSpec, Store};
 use crate::types::SourceKind;
 
 /// File name within the data directory.
@@ -288,13 +288,30 @@ fn bootstrap(store: &mut Store, data_dir: &Utf8Path) -> Result<Reconciliation> {
     })
 }
 
+/// Normalize the manifest, then hand the whole end state to the store in one
+/// transaction.
+///
+/// The two halves are deliberately separated. Normalization is pure — it
+/// repairs the manifest (fills in names and keys, drops a repeated root) using
+/// only the manifest's own contents, so "legal manifest" means *self*-consistent
+/// and never depends on what the database happens to hold. The apply is then a
+/// single atomic step, because the intermediate states between two legal
+/// registries need not themselves be legal: exchanging two projects' keys is
+/// the canonical example, and row-at-a-time upserts used to strand it
+/// half-applied forever (see [`Store::apply_project_set`]).
+///
+/// A failed apply therefore leaves *both* the database and the manifest exactly
+/// as they were, so the next start reconciles the same inputs rather than a
+/// torn intermediate.
 fn apply(store: &mut Store, data_dir: &Utf8Path, manifest: Manifest) -> Result<Reconciliation> {
     let before = store.list_projects()?;
-    let known: HashSet<String> = before.iter().map(|p| root_key(&p.root)).collect();
+    let known: HashMap<String, ProjectId> =
+        before.iter().map(|p| (root_key(&p.root), p.id)).collect();
     let mut taken: HashSet<String> = HashSet::new();
 
     let mut listed: HashSet<String> = HashSet::new();
     let mut normalized: Vec<ManifestEntry> = Vec::with_capacity(manifest.projects.len());
+    let mut desired: Vec<ProjectSpec> = Vec::with_capacity(manifest.projects.len());
     let (mut inserted, mut updated) = (0usize, 0usize);
 
     for mut entry in manifest.projects {
@@ -317,16 +334,23 @@ fn apply(store: &mut Store, data_dir: &Utf8Path, manifest: Manifest) -> Result<R
             taken.insert(entry.key.clone());
         }
 
-        store.upsert_project(&entry.root, &entry.name, Some(&entry.key), entry.kind)?;
-        if known.contains(&root_key(&entry.root)) {
+        let id = known.get(&root_key(&entry.root)).copied();
+        if id.is_some() {
             updated += 1;
         } else {
             inserted += 1;
         }
+        desired.push(ProjectSpec {
+            id,
+            root: entry.root.clone(),
+            name: entry.name.clone(),
+            key: entry.key.clone(),
+            kind: entry.kind,
+        });
         normalized.push(entry);
     }
 
-    let mut removed = 0usize;
+    let mut remove: Vec<ProjectId> = Vec::new();
     for project in &before {
         if !listed.contains(&root_key(&project.root)) {
             tracing::info!(
@@ -334,10 +358,12 @@ fn apply(store: &mut Store, data_dir: &Utf8Path, manifest: Manifest) -> Result<R
                 root = %project.root,
                 "project is no longer in the registry; dropping its index"
             );
-            store.remove_project(project.id)?;
-            removed += 1;
+            remove.push(project.id);
         }
     }
+    let removed = remove.len();
+
+    store.apply_project_set(&desired, &remove)?;
 
     // Rewrite whenever normalization changed anything (a filled-in key, a
     // dropped duplicate); an unchanged manifest is left alone so the file's

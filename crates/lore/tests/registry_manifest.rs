@@ -6,7 +6,7 @@
 
 use camino::{Utf8Path, Utf8PathBuf};
 use lore::registry::{self, Manifest, ManifestEntry, Reconciliation};
-use lore::store::Store;
+use lore::store::{ProjectSpec, Store};
 use lore::types::SourceKind;
 use std::collections::BTreeSet;
 use tempfile::TempDir;
@@ -412,22 +412,22 @@ fn dropping_a_project_from_the_manifest_drops_its_index() {
 /// still in the table.
 ///
 /// This pins the invariants that must hold whichever way the collision is
-/// resolved, because the current resolution is not a good one and should be
-/// free to change:
+/// resolved, and they are deliberately weaker than what the daemon now does
+/// (see `a_key_exchange_converges_on_the_first_start`): a future resolution is
+/// free to reassign rather than swap, and must still not
 ///
-/// - no registered project is lost, and no two end up sharing a key;
-/// - reconciliation is not fatal — `daemon::run` logs the failure and carries
-///   on with the index's own list, so a bad manifest edit cannot make the
-///   daemon unstartable.
+/// - lose a registered project or let two share a key;
+/// - make reconciliation fatal — `daemon::run` logs a failure and carries on
+///   with the index's own list, so a bad manifest edit cannot make the daemon
+///   unstartable.
 ///
-/// What actually happens today, recorded so the gap is not rediscovered:
-/// `apply` upserts row by row with no enclosing transaction, so the swap fails
-/// on a raw `UNIQUE constraint failed: projects.key` after any earlier entries
-/// have already been committed. The registry is left half-applied — unrelated
-/// insertions in the same edit stick, removals never run — and it will fail
-/// the same way on every subsequent start rather than converging. Fixing that
-/// properly means reconciling inside one transaction (or clearing keys in a
-/// first phase), which is a store-API decision rather than a test fix.
+/// Historical note, so the gap is not rediscovered: `apply` used to upsert row
+/// by row with no enclosing transaction, so the swap failed on a raw `UNIQUE
+/// constraint failed: projects.key` after earlier entries had already been
+/// committed — half-applied, and failing identically on every subsequent start
+/// instead of converging. `Store::apply_project_set` now does the whole
+/// reconciliation in one transaction, releasing the old keys before claiming
+/// the new ones.
 #[test]
 fn a_manifest_that_exchanges_two_keys_never_loses_a_project_or_duplicates_a_key() {
     let mut fixture = Fixture::new();
@@ -463,4 +463,201 @@ fn a_manifest_that_exchanges_two_keys_never_loses_a_project_or_duplicates_a_key(
     let keys: BTreeSet<&str> = rows.iter().map(|(_, key, _)| key.as_str()).collect();
     assert_eq!(keys.len(), 2, "keys stay distinct: {rows:?}");
     assert!(keys.iter().all(|key| !key.is_empty()), "{rows:?}");
+}
+
+/// The manifest is authoritative, so a key exchange is not merely survivable —
+/// it must *apply*, on the first start, exactly as written. Anything less means
+/// the file says one thing and the index answers another, with no error the
+/// user ever sees (reconciliation failures are logged and swallowed).
+///
+/// The same edit also removes a third project and adds a fourth, because the
+/// old row-at-a-time apply lost precisely those: it aborted at the colliding
+/// upsert, so insertions before it stuck and every removal after it was
+/// skipped.
+#[test]
+fn a_key_exchange_converges_on_the_first_start() {
+    let mut fixture = Fixture::new();
+    for (root, name) in [
+        ("C:/repos/a", "a"),
+        ("C:/repos/b", "b"),
+        ("C:/repos/gone", "gone"),
+    ] {
+        fixture
+            .store
+            .register_project(Utf8Path::new(root), name)
+            .unwrap();
+    }
+    fixture.reconcile();
+
+    registry::write(
+        &fixture.data_dir,
+        &Manifest {
+            projects: vec![
+                entry("b", "a", "C:/repos/a"),
+                entry("a", "b", "C:/repos/b"),
+                entry("new", "new", "C:/repos/new"),
+            ],
+        },
+    )
+    .unwrap();
+
+    let outcome = registry::reconcile(&mut fixture.store, &fixture.data_dir).expect("reconcile");
+    assert_eq!(
+        outcome,
+        Reconciliation::Applied {
+            inserted: 1,
+            updated: 2,
+            removed: 1
+        }
+    );
+    assert_eq!(
+        fixture.rows(),
+        [
+            ("a".into(), "b".into(), "C:/repos/a".into()),
+            ("b".into(), "a".into(), "C:/repos/b".into()),
+            ("new".into(), "new".into(), "C:/repos/new".into()),
+        ],
+        "the database matches the manifest exactly, keys included"
+    );
+
+    // Converged: a second start is a no-op that changes nothing and reassigns
+    // nothing.
+    let outcome = fixture.reconcile();
+    assert_eq!(
+        outcome,
+        Reconciliation::Applied {
+            inserted: 0,
+            updated: 3,
+            removed: 0
+        }
+    );
+    assert_eq!(
+        fixture.rows(),
+        [
+            ("a".into(), "b".into(), "C:/repos/a".into()),
+            ("b".into(), "a".into(), "C:/repos/b".into()),
+            ("new".into(), "new".into(), "C:/repos/new".into()),
+        ]
+    );
+}
+
+/// A three-way key rotation, which no ordering of one-row-at-a-time writes can
+/// perform: whichever row you write first wants a key another still holds. It
+/// only works because the transaction releases all three before claiming any.
+#[test]
+fn a_three_way_key_rotation_applies() {
+    let mut fixture = Fixture::new();
+    for name in ["a", "b", "c"] {
+        fixture
+            .store
+            .register_project(Utf8Path::new(&format!("C:/repos/{name}")), name)
+            .unwrap();
+    }
+    fixture.reconcile();
+
+    registry::write(
+        &fixture.data_dir,
+        &Manifest {
+            projects: vec![
+                entry("b", "a", "C:/repos/a"),
+                entry("c", "b", "C:/repos/b"),
+                entry("a", "c", "C:/repos/c"),
+            ],
+        },
+    )
+    .unwrap();
+
+    registry::reconcile(&mut fixture.store, &fixture.data_dir).expect("reconcile");
+    assert_eq!(
+        fixture
+            .rows()
+            .into_iter()
+            .map(|(name, key, _)| (name, key))
+            .collect::<Vec<_>>(),
+        [
+            ("a".to_string(), "b".to_string()),
+            ("b".to_string(), "c".to_string()),
+            ("c".to_string(), "a".to_string()),
+        ]
+    );
+}
+
+/// A key the manifest hands to a surviving project may still be held by one the
+/// same edit *deletes* — so removals have to run before any key is claimed.
+/// Handing `b`'s key to `a` while `b` is on its way out is the smallest case.
+#[test]
+fn a_key_freed_by_a_removal_can_be_claimed_in_the_same_edit() {
+    let mut fixture = Fixture::new();
+    fixture
+        .store
+        .register_project(Utf8Path::new("C:/repos/a"), "a")
+        .unwrap();
+    fixture
+        .store
+        .register_project(Utf8Path::new("C:/repos/b"), "b")
+        .unwrap();
+    fixture.reconcile();
+
+    registry::write(
+        &fixture.data_dir,
+        &Manifest {
+            projects: vec![entry("b", "a", "C:/repos/a")],
+        },
+    )
+    .unwrap();
+
+    registry::reconcile(&mut fixture.store, &fixture.data_dir).expect("reconcile");
+    assert_eq!(
+        fixture.rows(),
+        [("a".into(), "b".into(), "C:/repos/a".into())]
+    );
+}
+
+/// Atomicity, proved through the one illegal input the store cannot repair: a
+/// `desired` set that collides with *itself*. `registry::apply` never produces
+/// one, so this drives `Store::apply_project_set` directly — the point is that
+/// a failure partway through leaves nothing behind, not that this particular
+/// input is reachable.
+///
+/// Without the enclosing transaction the first spec's insert and the removal
+/// would both have stuck; with it, the failing third spec rolls the whole
+/// reconciliation back to the state the previous start left.
+#[test]
+fn a_failed_apply_leaves_the_database_untouched() {
+    let mut fixture = Fixture::new();
+    let stale = fixture
+        .store
+        .register_project(Utf8Path::new("C:/repos/stale"), "stale")
+        .unwrap();
+    fixture.reconcile();
+    let before = fixture.rows();
+
+    let spec = |key: &str, name: &str, root: &str| ProjectSpec {
+        id: None,
+        root: Utf8PathBuf::from(root),
+        name: name.to_string(),
+        key: key.to_string(),
+        kind: SourceKind::Repo,
+    };
+    let err = fixture
+        .store
+        .apply_project_set(
+            &[
+                spec("fresh", "fresh", "C:/repos/fresh"),
+                spec("dup", "one", "C:/repos/one"),
+                spec("dup", "two", "C:/repos/two"),
+            ],
+            &[stale],
+        )
+        .expect_err("a self-colliding desired set cannot be applied");
+    assert!(
+        err.to_string().contains("UNIQUE"),
+        "the store reports the real conflict: {err}"
+    );
+
+    assert_eq!(
+        fixture.rows(),
+        before,
+        "no insert and no removal survived the rollback"
+    );
 }
