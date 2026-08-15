@@ -613,6 +613,46 @@ fn a_key_freed_by_a_removal_can_be_claimed_in_the_same_edit() {
     );
 }
 
+/// The same root spelled differently — backslashes, a trailing separator,
+/// different case — is the same project, and `root_key` already says so. It has
+/// to reach the database that way too: treating the respelling as a *new* root
+/// would insert a rival row still wanting the key the original holds, which is
+/// the non-convergence this fix exists to remove. The row is rewritten in
+/// place, keeping its id and therefore its index.
+#[test]
+fn a_respelled_root_updates_the_existing_row_rather_than_rivalling_it() {
+    let mut fixture = Fixture::new();
+    fixture
+        .store
+        .register_project(Utf8Path::new("C:/repos/lore"), "lore")
+        .unwrap();
+    fixture.reconcile();
+
+    registry::write(
+        &fixture.data_dir,
+        &Manifest {
+            projects: vec![entry("lore", "lore", r"C:\repos\lore\")],
+        },
+    )
+    .unwrap();
+
+    let outcome = registry::reconcile(&mut fixture.store, &fixture.data_dir).expect("reconcile");
+    assert_eq!(
+        outcome,
+        Reconciliation::Applied {
+            inserted: 0,
+            updated: 1,
+            removed: 0
+        },
+        "a respelling is an update, not a registration"
+    );
+    assert_eq!(
+        fixture.rows(),
+        [("lore".into(), "lore".into(), r"C:\repos\lore\".into())],
+        "one row, respelled as the manifest asked"
+    );
+}
+
 /// Atomicity, proved through the one illegal input the store cannot repair: a
 /// `desired` set that collides with *itself*. `registry::apply` never produces
 /// one, so this drives `Store::apply_project_set` directly — the point is that
