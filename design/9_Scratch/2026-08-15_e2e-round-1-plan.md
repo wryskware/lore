@@ -73,11 +73,14 @@ first pass, cut to T1/T2/T4 (the most retrieval-sensitive) = 36 runs.
 
 ## Environment constraints
 
-- **No Unity editor.** Lexomancy tasks are read/trace/audit plus at most
-  compile-and-test; headless preferred. Prerequisite: verify which test
-  assemblies (EncounterKernel, BattleKernel, Axioms) actually run without
-  the editor (`dotnet test` vs Unity batchmode). If BattleKernel tests need
-  the editor, swap T5 to an EncounterKernel-scoped change.
+- **No Unity editor GUI.** Lexomancy tasks are read/trace/audit plus at most
+  compile-and-test. Parent-verified: every csproj (including
+  `EncounterKernel.csproj`, `Lexomancy.BattleKernel.Tests.csproj`) is
+  Unity-generated (SDK-style, Unity analyzers), so plain `dotnet test` is
+  unlikely to work; the realistic headless route is Unity batchmode via the
+  `unity test` CLI (compiles + runs tests, no GUI). Prerequisite: confirm
+  that command empirically at harness setup; if even batchmode is
+  objectionable, T5 grading falls back to compile-only plus parent review.
 - **No browser.** qwen/opencode has no Chrome access (and codex runs won't
   get it either, for parity). No task may require visual verification or a
   running web app; terrarium grading is headless tests + CLI output only.
@@ -138,22 +141,35 @@ vault under `design/` (ledger: `design/0_Canon/DECISIONS.md`, D-0001–D-0016).
   `EncounterKernel/Effects/Payloads/PayloadExecutor.cs` →
   `BattleKernel/BattleUnit.cs`.)
 - T2: "What is the decided design for axiom capacity — do axioms cost Lexic
-  Residue, and are there slots/tiers?" (Key: D-0006 — unlimited acquisition,
-  fixed/unique, no slot machinery; D-0002 — Residue does not exist.
-  `design/1_GameSystems/1.6.5_Axioms.md` says the opposite and is
-  unclassified/historical; an agent citing 1.6.5 as authority fails. Bonus
-  trap: `2.4_GuardianBattle_Surge.md` is `exploration`, partially superseded
-  by D-0015/D-0016 via inline callouts.)
+  Residue, and are there slots/tiers?" (Key, parent-verified: D-0006 —
+  unlimited acquisition, fixed/unique, no capped-capacity machinery; D-0002 —
+  "Lexic Residue does not exist … no residue currency anywhere in the
+  design." `design/1_GameSystems/1.6_Forging/1.6.5_Axioms.md` has NO
+  frontmatter, states residue costs (line 20) and slots/tiers (§3), and both
+  ledger entries *explicitly* supersede those sections ("Supersedes:
+  [[1.6.5_Axioms]] §2 … §3–4"). Full credit = citing the ledger supersession;
+  citing 1.6.5 as authority fails. Bonus trap:
+  `2.4_GuardianBattle_Surge.md` is `exploration`, partially superseded by
+  D-0015/D-0016 via inline callouts.)
 - T3: "D-0002 says Lexic Residue does not exist. Audit the codebase: list
-  every place that still references residue." (Scout-known hits:
-  `Loot/LootApplicator.cs` ~55–58, `LootRewardDefinitionSO.cs`
-  `LexonicResidueRewardDefinitionSO`; full key established during answer-key
-  freeze. Grades precision/recall plus correctly framing it as code
-  contradicting canon.)
+  every place that still references residue." (Key, parent-verified, 7
+  files: `State/PlayerStats.cs` (full `Spend/GainLexonicResidue` API),
+  `State/RunState.cs:252`, `Loot/LootApplicator.cs:55–58,91–108`,
+  `Loot/LootTypes.cs`, `Loot/LootTableSO.cs`,
+  `Loot/LootRewardDefinitionSO.cs:64–73` (comment calls it "forge currency
+  (future feature)" — direct canon contradiction),
+  `UI/LootPanelController.cs:154`. Note: code says "Lexonic", the ledger
+  says "Lexic" — the naming mismatch is part of the test; a single literal
+  grep misses one side.)
 - T4: "Why is the battle targeting heuristic RNG-free, and what is its
-  ranked ladder?" (Key: D-0016 — kill-secure → max effective damage →
-  lowest HP fraction → lane order, deterministic by design; rationale in the
-  ledger entry, implementation `BattleKernel/TargetHeuristic.cs`.)
+  ranked ladder?" (Key, parent-verified against D-0016: ranked on the hit
+  that will actually land, post tier/counter scaling — kill-secure (lowest
+  CurrentHP among killable) → max effective damage → lowest HP fraction →
+  lane order; heals keep lowest-HP-ally; rationale: `enemies[0]` defaulted
+  every attack onto the Lexomancer, and lanes were rejected as complexity.
+  Implementation `BattleKernel/TargetHeuristic.cs`, tests
+  `BattleKernel/Tests/AimAndTargetHeuristicTests.cs` — both verified to
+  exist.)
 - T5: Add one intermediate tiebreaker to `BattleKernel/TargetHeuristic.cs`
   (e.g. lowest shield percentage) between effective damage and HP fraction,
   RNG-free, no per-unit taunt state (D-0016 reserves that), with new cases
