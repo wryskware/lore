@@ -100,7 +100,9 @@ function Invoke-Cell([string]$model, [string]$repo, [string]$arm, [string]$task)
     if ($task -eq 'T5') {
         if ($r.vcs -eq 'git') {
             git -C $r.dir add -N . 2>$null
-            git -C $r.dir diff | Set-Content (Join-Path $outDir 'diff.patch')
+            # git writes the file itself — piping through Set-Content rewrites
+            # line endings and breaks `git apply`.
+            git -C $r.dir diff --output=(Join-Path $outDir 'diff.patch')
             git -C $r.dir checkout -- . 2>$null
             git -C $r.dir clean -fd 2>$null
         } else {
@@ -120,7 +122,12 @@ function Invoke-Cell([string]$model, [string]$repo, [string]$arm, [string]$task)
                     $base = Join-Path ([IO.Path]::GetTempPath()) ("t5base-" + [IO.Path]::GetFileName($p))
                     cm getfile "$p#$($r.cmPin)" --file="$base" 2>$null | Out-Null
                     if (-not (Test-Path $base)) { Set-Content $base '' }  # added file: empty base
-                    git diff --no-index -- $base $p 2>$null | Add-Content (Join-Path $outDir 'diff.patch')
+                    $tmpDiff = Join-Path ([IO.Path]::GetTempPath()) 't5hunks.patch'
+                    git diff --no-index --output=$tmpDiff -- $base $p 2>$null
+                    if (Test-Path $tmpDiff) {
+                        [IO.File]::AppendAllText((Join-Path $outDir 'diff.patch'), [IO.File]::ReadAllText($tmpDiff))
+                        Remove-Item $tmpDiff
+                    }
                     Remove-Item $base -ErrorAction SilentlyContinue
                     cm undo $p 2>$null | Out-Null
                 }
