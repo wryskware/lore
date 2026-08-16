@@ -253,7 +253,13 @@ async fn index_queues_the_named_project_or_all_of_them() {
 
     let (status, body) = post(&h.router, "/v1/index", json!({ "project": "nope" })).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert!(body["message"].as_str().unwrap().contains("nope"));
+    let message = body["message"].as_str().unwrap();
+    assert!(message.contains("nope"), "{message}");
+    // The last refusal on this surface that named no remedy. Every other
+    // "which project?" answer points at the same two ways out, and a caller
+    // should not have to learn which endpoint is the terse one.
+    assert!(message.contains("lore status"), "{message}");
+    assert!(message.contains("lore add <path>"), "{message}");
 }
 
 #[tokio::test]

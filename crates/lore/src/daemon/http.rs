@@ -562,10 +562,9 @@ async fn index(
 ) -> ApiResult<IndexResponse> {
     let projects = projects_of(&state).await?;
     let targets: Vec<&Project> = match &request.project {
-        Some(key) => vec![
-            super::resolve_project(&projects, key)
-                .ok_or_else(|| ApiErr::not_found(format!("unknown project `{key}`")))?,
-        ],
+        Some(key) => vec![super::resolve_project(&projects, key).ok_or_else(|| {
+            ApiErr::not_found(format!("unknown project `{key}`; {NAME_A_PROJECT}"))
+        })?],
         None => projects.iter().collect(),
     };
 
