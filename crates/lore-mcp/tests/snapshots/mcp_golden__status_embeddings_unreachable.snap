@@ -1,12 +1,15 @@
 ---
 source: crates/lore-mcp/tests/mcp_golden.rs
+assertion_line: 302
 expression: rendered
 ---
 lore daemon 0.1.0  api v1  generation 42
 embeddings: UNREACHABLE - http://127.0.0.1:11434 (connection refused); search is lexical-only until it answers
 projects (2):
   lexomancy  files 812  chunks 9134  embedded 0/9134 (0%)  C:\repos\Lexomancy
+    authority: lore-v1 (rank)  decisions 14/16 active
   lore       files 96  chunks 1204  embedded 1204/1204 (100%)  C:\Users\wrysk\wryskware\lore
+    authority: lore-v1 (rank)  decisions 13/13 active
     AUTHORITY: 3 file(s) declare `decided` without citing an active decision; they rank as neutral
       design/2_Memory/2.1_Memory_Model.md
       design/5_Implementation/5.1_Milestones.md

@@ -27,7 +27,26 @@ pub struct Fixture {
 }
 
 impl Fixture {
+    /// A project that has opted into `lore-v1` authority-aware ranking, by
+    /// committing the `.lore.toml` a real vault commits (D-0012).
+    ///
+    /// This is the default because it is what every assertion in this suite
+    /// predates: authority used to be unconditional, and a fixture that
+    /// silently opted out would leave those tests passing while testing
+    /// nothing. [`Fixture::neutral`] is the other side of the switch.
     pub fn new(name: &str) -> Self {
+        let fixture = Self::neutral(name);
+        fixture.write(
+            lore::repo_config::REPO_CONFIG_FILE,
+            "[authority]\nprofile = \"lore-v1\"\nbehavior = \"rank\"\n",
+        );
+        fixture
+    }
+
+    /// A project with no `.lore.toml` at all: neutral retrieval, no
+    /// `design_status`/`decision_refs` parsing, no path ceilings, no authority
+    /// metadata and no authority weights.
+    pub fn neutral(name: &str) -> Self {
         let project_dir = tempfile::tempdir().expect("project tempdir");
         let data_dir = tempfile::tempdir().expect("data tempdir");
         // Canonicalized exactly as the daemon does, so paths compare equal.

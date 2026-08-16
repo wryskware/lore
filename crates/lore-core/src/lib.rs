@@ -59,7 +59,14 @@ pub struct EndpointLatency {
     pub max_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One project's index state.
+///
+/// `Default` is derived because this struct is deliberately *additive* — every
+/// new field carries `#[serde(default)]` — and constructing one field by field
+/// in a client or a test makes every addition a mechanical edit of code that
+/// does not care about the new field. `..Default::default()` is the shape that
+/// keeps those sites honest about what they are actually asserting.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectStatus {
     pub id: i64,
     pub name: String,
@@ -89,6 +96,37 @@ pub struct ProjectStatus {
     /// the daemon; the count above is the complete figure.
     #[serde(default)]
     pub authority_violation_paths: Vec<String>,
+    /// Authority profile this repository opted into via its committed
+    /// `.lore.toml` (D-0012), e.g. "lore-v1". Absent = a neutral repository:
+    /// no `design_status`/`decision_refs` parsing, no path ceilings, no
+    /// authority metadata and no authority weights.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_profile: Option<String>,
+    /// How far the declared profile reaches: "off", "annotate" or "rank".
+    /// Present exactly when [`Self::authority_profile`] is; "off" means the
+    /// profile is declared but suspended, which is reported rather than hidden
+    /// so it is distinguishable from never having configured anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_behavior: Option<String>,
+    /// The repository's `.lore.toml` could not be used — unknown profile,
+    /// unknown key, malformed TOML. The repository still indexes, neutrally;
+    /// D-0012 requires that be loud rather than silently a different authority
+    /// model, which is what this field is for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_config_error: Option<String>,
+    /// Decisions that are accepted and not retired.
+    #[serde(default)]
+    pub decisions_active: u64,
+    /// Decisions that exist at all, whatever their status. Records excluded
+    /// for an identity defect are not counted here — they are in
+    /// [`Self::decision_violations`].
+    #[serde(default)]
+    pub decisions_total: u64,
+    /// Defects in the decision corpus itself (D-0013): a per-file record whose
+    /// heading disagrees with its filename, or two records claiming one id.
+    /// One human-readable line each, path included.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decision_violations: Vec<String>,
     /// Live filesystem-watch coverage. Added after 0.1.0, so it is optional
     /// on the wire: a daemon that predates it simply reports nothing and the
     /// client sees [`WatchState::Unknown`].
@@ -244,12 +282,17 @@ pub struct SearchResult {
     /// or source ceiling applied, and `neutral` is reported rather than a
     /// status word because tier 1 covers exploration, unclassified, plain code
     /// and demoted declarations alike.
-    #[serde(default)]
-    pub effective_authority: String,
+    ///
+    /// **Absent** when the result's repository has no authority profile in
+    /// force (D-0012). That is not "neutral": neutral is a verdict, and a
+    /// repository that never opted in has not been judged at all. Also absent
+    /// from a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_authority: Option<String>,
     /// Why the effective authority is below the declared one. Present *only*
     /// when the document was demoted, e.g. "decided declared but cites no
     /// active decision" or "9_Scratch path cap".
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority_note: Option<String>,
     /// Decision IDs cited by the file's frontmatter plus this chunk's body.
     /// Metadata only: citing a decision carries no ranking weight, because

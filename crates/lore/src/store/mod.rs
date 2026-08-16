@@ -42,7 +42,8 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 
-use crate::authority::{Authority, Declared, Demotion};
+use crate::authority::{Authority, DecisionViolation, Decisions, Declared, Demotion};
+use crate::repo_config::{Behavior, Profile, RepoAuthority};
 use crate::types::{
     Chunk, ChunkId, ChunkKind, DesignStatus, SourceKind, VaultMeta, authority_tier,
 };
@@ -118,6 +119,11 @@ pub struct Project {
     /// [`crate::registry`]). Never recomputed, unchanged by a rename.
     pub key: String,
     pub kind: SourceKind,
+    /// The repo's `.lore.toml` authority configuration as of the last index
+    /// pass (D-0012). Neutral for a source that has never been scanned, for
+    /// one with no config, and for one whose config is broken — the last of
+    /// which carries its error here so `status` can shout about it.
+    pub authority: RepoAuthority,
 }
 
 /// One source as the caller wants it to exist after
@@ -301,6 +307,17 @@ pub struct ProjectStatus {
     /// The first [`MAX_VIOLATION_PATHS`] offending paths, so the report is
     /// actionable without being a file dump.
     pub authority_violation_paths: Vec<Utf8PathBuf>,
+    /// The repo's `.lore.toml` verdict (D-0012), including a config error to
+    /// shout about.
+    pub authority: RepoAuthority,
+    /// Decisions that are accepted and unretired.
+    pub decisions_active: u64,
+    /// Decisions that exist at all, whatever their status. Excluded records
+    /// are not counted here; they are in [`Self::decision_violations`].
+    pub decisions_total: u64,
+    /// Identity defects in the decision corpus itself (D-0013): a record whose
+    /// heading and filename disagree, or a duplicated id.
+    pub decision_violations: Vec<DecisionViolation>,
 }
 
 /// The SQLite-backed SearchStore.
@@ -508,9 +525,11 @@ impl Store {
     }
 
     pub fn list_projects(&self) -> Result<Vec<Project>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, root, name, key, kind FROM projects ORDER BY id")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, root, name, key, kind,
+                    authority_profile, authority_behavior, authority_error
+             FROM projects ORDER BY id",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok(Project {
                 id: r.get(0)?,
@@ -518,12 +537,72 @@ impl Store {
                 name: r.get(2)?,
                 key: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
                 kind: read_kind(r.get::<_, Option<String>>(4)?.as_deref()),
+                authority: read_authority(r.get(5)?, r.get(6)?, r.get(7)?),
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     // ---- authority --------------------------------------------------------
+
+    /// Record the repo's resolved `.lore.toml` (D-0012). Returns whether it
+    /// changed — which is the **profile fingerprint** the index pass compares
+    /// on every refresh, and therefore the signal that every effective tier in
+    /// the project may now be wrong.
+    ///
+    /// The error string is part of the comparison on purpose: a `.lore.toml`
+    /// edited from one broken state to a differently broken one has still
+    /// changed what the user needs to be told.
+    pub fn set_project_authority(
+        &mut self,
+        project: ProjectId,
+        authority: &RepoAuthority,
+    ) -> Result<bool> {
+        let current: Option<(Option<String>, Option<String>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT authority_profile, authority_behavior, authority_error
+                 FROM projects WHERE id = ?",
+                params![project],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((profile, behavior, error)) = current else {
+            return Ok(false);
+        };
+        if &read_authority(profile, behavior, error) == authority {
+            return Ok(false);
+        }
+        self.conn.execute(
+            "UPDATE projects
+                SET authority_profile = ?, authority_behavior = ?, authority_error = ?
+              WHERE id = ?",
+            params![
+                authority.profile.map(Profile::as_str),
+                authority.profile.map(|_| authority.behavior.as_str()),
+                authority.error,
+                project,
+            ],
+        )?;
+        Ok(true)
+    }
+
+    /// The stored `.lore.toml` verdict for one project.
+    pub fn project_authority(&self, project: ProjectId) -> Result<RepoAuthority> {
+        let row: Option<(Option<String>, Option<String>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT authority_profile, authority_behavior, authority_error
+                 FROM projects WHERE id = ?",
+                params![project],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        Ok(match row {
+            Some((profile, behavior, error)) => read_authority(profile, behavior, error),
+            None => RepoAuthority::default(),
+        })
+    }
 
     /// The project's active decision set, as last parsed from its ledger.
     pub fn active_decisions(&self, project: ProjectId) -> Result<BTreeSet<String>> {
@@ -537,29 +616,73 @@ impl Store {
     /// Replace the project's active decision set. Returns whether it changed —
     /// which is exactly the signal that every effective tier in the project
     /// may now be wrong and a recompute is owed.
+    ///
+    /// Convenience over [`Self::set_decisions`] for callers that only have the
+    /// active set: the reported total follows it and no corpus violations are
+    /// recorded.
     pub fn set_active_decisions(
         &mut self,
         project: ProjectId,
         decisions: &BTreeSet<String>,
     ) -> Result<bool> {
+        self.set_decisions(
+            project,
+            &Decisions {
+                active: decisions.clone(),
+                total: decisions.len(),
+                violations: Vec::new(),
+            },
+        )
+    }
+
+    /// Replace the project's whole decision corpus summary: the active set,
+    /// how many decisions exist at all, and the identity defects found while
+    /// parsing them (D-0013).
+    ///
+    /// Returns whether the **active set** changed. The total and the violation
+    /// list are reporting; only the active set can move an effective tier, so
+    /// only it triggers a recompute.
+    pub fn set_decisions(&mut self, project: ProjectId, decisions: &Decisions) -> Result<bool> {
         let current = self.active_decisions(project)?;
-        if &current == decisions {
-            return Ok(false);
-        }
+        let changed = current != decisions.active;
         let tx = self.conn.transaction()?;
-        tx.execute(
-            "DELETE FROM project_decisions WHERE project_id = ?",
-            params![project],
-        )?;
-        {
+        if changed {
+            tx.execute(
+                "DELETE FROM project_decisions WHERE project_id = ?",
+                params![project],
+            )?;
             let mut ins = tx
                 .prepare("INSERT INTO project_decisions (project_id, decision_id) VALUES (?, ?)")?;
-            for decision in decisions {
+            for decision in &decisions.active {
                 ins.execute(params![project, decision])?;
             }
         }
+        let violations = (!decisions.violations.is_empty())
+            .then(|| serde_json::to_string(&decisions.violations))
+            .transpose()?;
+        tx.execute(
+            "UPDATE projects SET decisions_total = ?, decision_violations = ? WHERE id = ?",
+            params![decisions.total as i64, violations, project],
+        )?;
         tx.commit()?;
-        Ok(true)
+        Ok(changed)
+    }
+
+    /// Decision-corpus defects recorded by the last refresh.
+    pub fn decision_violations(&self, project: ProjectId) -> Result<Vec<DecisionViolation>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT decision_violations FROM projects WHERE id = ?",
+                params![project],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        match raw {
+            Some(json) => Ok(serde_json::from_str(&json)?),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Re-derive every chunk's effective tier from persisted state.
@@ -629,17 +752,25 @@ impl Store {
     /// Everything the effective-tier policy needs that is not on the chunk
     /// row: the project's active decisions and its source kind.
     fn authority_context(&self, project: ProjectId) -> Result<AuthorityContext> {
-        let kind: Option<String> = self
+        let row: Option<(
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = self
             .conn
             .query_row(
-                "SELECT kind FROM projects WHERE id = ?",
+                "SELECT kind, authority_profile, authority_behavior, authority_error
+                 FROM projects WHERE id = ?",
                 params![project],
-                |r| r.get::<_, String>(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
+        let (kind, profile, behavior, error) = row.unwrap_or_default();
         Ok(AuthorityContext {
             active: self.active_decisions(project)?,
             kind: read_kind(kind.as_deref()),
+            profile: read_authority(profile, behavior, error).active(),
         })
     }
 
@@ -855,7 +986,10 @@ impl Store {
                     (SELECT COUNT(*) FROM chunks c WHERE c.project_id = p.id),
                     (SELECT COUNT(*) FROM embeddings e WHERE e.project_id = p.id),
                     (SELECT COUNT(DISTINCT c.path) FROM chunks c
-                       WHERE c.project_id = p.id AND c.demotion = ?)
+                       WHERE c.project_id = p.id AND c.demotion = ?),
+                    (SELECT COUNT(*) FROM project_decisions d WHERE d.project_id = p.id),
+                    p.decisions_total, p.decision_violations,
+                    p.authority_profile, p.authority_behavior, p.authority_error
              FROM projects p ORDER BY p.id",
         )?;
         let violation = Demotion::UncitedDecided.code();
@@ -871,6 +1005,15 @@ impl Store {
                 embedded_chunks: r.get::<_, i64>(7)? as u64,
                 authority_violations: r.get::<_, i64>(8)? as u64,
                 authority_violation_paths: Vec::new(),
+                decisions_active: r.get::<_, i64>(9)? as u64,
+                decisions_total: r.get::<_, i64>(10)? as u64,
+                // A corrupt blob degrades to "no violations reported" rather
+                // than failing `status`; the counts around it are still true.
+                decision_violations: r
+                    .get::<_, Option<String>>(11)?
+                    .and_then(|json| serde_json::from_str(&json).ok())
+                    .unwrap_or_default(),
+                authority: read_authority(r.get(12)?, r.get(13)?, r.get(14)?),
             })
         })?;
         let mut projects: Vec<ProjectStatus> = rows.collect::<std::result::Result<_, _>>()?;
@@ -1153,6 +1296,8 @@ pub struct Recompute {
 struct AuthorityContext {
     active: BTreeSet<String>,
     kind: SourceKind,
+    /// The profile in force, or `None` for a neutral repo (D-0012).
+    profile: Option<Profile>,
 }
 
 impl AuthorityContext {
@@ -1168,7 +1313,41 @@ impl AuthorityContext {
             },
             &self.active,
             self.kind,
+            self.profile,
         )
+    }
+}
+
+/// Rebuild a [`RepoAuthority`] from its three stored columns.
+///
+/// Unrecognized spellings degrade to neutral rather than failing, on the same
+/// reasoning as [`read_kind`]: a database written by a newer daemon that knows
+/// a profile this build does not must not make the store unopenable — and
+/// neutral is the *safe* direction, since the alternative is applying a policy
+/// this build does not actually implement.
+fn read_authority(
+    profile: Option<String>,
+    behavior: Option<String>,
+    error: Option<String>,
+) -> RepoAuthority {
+    let stored = profile;
+    let profile = stored.as_deref().and_then(Profile::parse);
+    let error = match (&stored, profile) {
+        // Written by a daemon that knows a profile this one does not. Neutral
+        // *and* loud: silently ranking as if nothing were configured is the
+        // exact failure D-0012 names.
+        (Some(name), None) => Some(error.unwrap_or_else(|| {
+            format!("stored authority profile `{name}` is not known to this build of lore")
+        })),
+        _ => error,
+    };
+    RepoAuthority {
+        profile,
+        behavior: behavior
+            .as_deref()
+            .and_then(Behavior::parse)
+            .unwrap_or_default(),
+        error,
     }
 }
 
@@ -1305,7 +1484,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2, "every shipped migration applied");
+        assert_eq!(version, 3, "every shipped migration applied");
     }
 
     /// The external-content FTS5 table can drift from its content table if a
@@ -1383,6 +1562,22 @@ mod tests {
         }
     }
 
+    /// Authority semantics are repository-opt-in (D-0012), so a store test
+    /// about the effective-tier machinery has to say that the repository opted
+    /// in — exactly as a committed `.lore.toml` would.
+    fn opt_into_lore_v1(store: &mut Store, project: ProjectId) {
+        store
+            .set_project_authority(
+                project,
+                &RepoAuthority {
+                    profile: Some(Profile::LoreV1),
+                    behavior: Behavior::Rank,
+                    error: None,
+                },
+            )
+            .unwrap();
+    }
+
     fn declares(status: DesignStatus, refs: &[&str]) -> VaultMeta {
         VaultMeta {
             design_status: Some(status),
@@ -1447,6 +1642,7 @@ mod tests {
         let proj = store
             .register_project(Utf8Path::new("C:/repos/x"), "x")
             .unwrap();
+        opt_into_lore_v1(&mut store, proj);
 
         let path = Utf8Path::new("design/1.1.md");
         let chunks = [
@@ -1562,6 +1758,7 @@ mod tests {
         let proj = store
             .register_project(Utf8Path::new("C:/repos/x"), "x")
             .unwrap();
+        opt_into_lore_v1(&mut store, proj);
         let active: BTreeSet<String> = ["D-0001".to_string()].into_iter().collect();
         store.set_active_decisions(proj, &active).unwrap();
 

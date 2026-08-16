@@ -51,7 +51,7 @@ fn populated_search_result() -> SearchResult {
         symbol_path: None,
         heading_path: Some(vec!["Notes".into()]),
         design_status: Some("decided".into()),
-        effective_authority: "deprecated".into(),
+        effective_authority: Some("deprecated".into()),
         authority_note: Some("9_Scratch path cap".into()),
         decision_refs: vec!["D-0007".into()],
         score: 0.8741,
@@ -72,6 +72,18 @@ fn populated_project_status() -> ProjectStatus {
         embedded_chunks: 40,
         authority_violations: 2,
         authority_violation_paths: vec!["design/a.md".into(), "design/b.md".into()],
+        authority_profile: Some("lore-v1".into()),
+        authority_behavior: Some("rank".into()),
+        // Populated even though a real project would not report a profile and
+        // a config error at once: this fixture exists to pin the *maximal*
+        // serialized shape, and a field left `None` is a field a
+        // `skip_serializing_if` would hide from the golden list.
+        authority_config_error: Some("unknown authority profile `adr`".into()),
+        decisions_active: 11,
+        decisions_total: 13,
+        decision_violations: vec![
+            "design/0_Canon/decisions/D-0004-a.md: duplicate decision id D-0004".into(),
+        ],
         watch: WatchState::Armed,
     }
 }
@@ -126,10 +138,19 @@ fn every_pre_existing_wire_field_survives_and_the_additions_are_the_specified_on
                 "watch",
             ],
             added: &[
+                // Package 3 (authority + provenance).
                 "authority_violation_paths",
                 "authority_violations",
                 "key",
                 "kind",
+                // D-0012/D-0013: which profile a repository opted into, how
+                // healthy its config and its decision corpus are.
+                "authority_behavior",
+                "authority_config_error",
+                "authority_profile",
+                "decision_violations",
+                "decisions_active",
+                "decisions_total",
             ],
         },
         Shape {
@@ -226,7 +247,7 @@ fn a_response_from_a_daemon_that_predates_this_change_still_deserializes() {
     assert_eq!(parsed.chunk_id, "9f3a1c2b");
     assert_eq!(parsed.design_status.as_deref(), Some("decided"));
     assert_eq!(parsed.project_key, "", "no key from a daemon without keys");
-    assert_eq!(parsed.effective_authority, "");
+    assert_eq!(parsed.effective_authority, None);
     assert_eq!(parsed.authority_note, None);
 
     let old_status = json!({
@@ -244,6 +265,14 @@ fn a_response_from_a_daemon_that_predates_this_change_still_deserializes() {
     assert_eq!(parsed.authority_violations, 0);
     assert!(parsed.authority_violation_paths.is_empty());
     assert_eq!(parsed.watch, WatchState::Unknown);
+    // A daemon that predates profiles reports none — which reads exactly like
+    // a repository that opted out, and is the honest degradation: the old
+    // daemon genuinely cannot say which profile is in force.
+    assert_eq!(parsed.authority_profile, None);
+    assert_eq!(parsed.authority_behavior, None);
+    assert_eq!(parsed.authority_config_error, None);
+    assert_eq!((parsed.decisions_active, parsed.decisions_total), (0, 0));
+    assert!(parsed.decision_violations.is_empty());
 
     // The request direction: an old client sends no `sources` and no
     // `project_key`, and a new daemon must accept both bodies.

@@ -398,13 +398,10 @@ fn push_result(out: &mut String, rank: usize, result: &SearchResult) {
         (None, true) => {}
     }
     // Printed only when Lore refused the document's own declaration — see
-    // the same rule in `lore-mcp/src/render.rs`.
-    if let Some(note) = &result.authority_note {
-        let _ = writeln!(
-            out,
-            "    authority: {} - {note}",
-            result.effective_authority
-        );
+    // the same rule in `lore-mcp/src/render.rs`. Absent for a repository with
+    // no authority profile: there was no declaration to refuse (D-0012).
+    if let (Some(note), Some(authority)) = (&result.authority_note, &result.effective_authority) {
+        let _ = writeln!(out, "    authority: {authority} - {note}");
     }
     let _ = writeln!(out, "    chunk_id: {}", result.chunk_id);
 
@@ -479,9 +476,46 @@ fn render_status(status: &DaemonStatus) -> String {
             root = project.root,
             watch = watch_note(project.watch),
         );
+        push_authority(&mut out, project);
         push_authority_violations(&mut out, project);
     }
     out
+}
+
+/// The repository's authority profile, its health, and its decision corpus.
+///
+/// Always printed, including the "none" case: which repositories participate
+/// in authority semantics at all is now a per-repository choice (D-0012), and
+/// a reader who cannot see the choice cannot tell an opted-out repo from a
+/// broken one. A config error is shouted about on its own line, because the
+/// repo is indexing under a *different model* than its file asked for.
+fn push_authority(out: &mut String, project: &ProjectStatus) {
+    if let Some(error) = &project.authority_config_error {
+        let _ = writeln!(
+            out,
+            "    AUTHORITY CONFIG: {error}; this project indexes with no authority semantics"
+        );
+    }
+    let Some(profile) = &project.authority_profile else {
+        if project.authority_config_error.is_none() {
+            let _ = writeln!(out, "    authority: none (no .lore.toml profile)");
+        }
+        return;
+    };
+    let behavior = project.authority_behavior.as_deref().unwrap_or("annotate");
+    let _ = writeln!(
+        out,
+        "    authority: {profile} ({behavior})  decisions {active}/{total} active{violations}",
+        active = project.decisions_active,
+        total = project.decisions_total,
+        violations = match project.decision_violations.len() {
+            0 => String::new(),
+            n => format!("  {n} record violation(s)"),
+        },
+    );
+    for violation in &project.decision_violations {
+        let _ = writeln!(out, "      {violation}");
+    }
 }
 
 /// Documents declaring `decided` that Lore refused to honor. Silent when there
@@ -711,7 +745,7 @@ mod tests {
             symbol_path: None,
             heading_path: Some(vec!["MCP Tool Surface".into(), "v0.1 tools".into()]),
             design_status: Some("decided".into()),
-            effective_authority: "decided".into(),
+            effective_authority: Some("decided".into()),
             authority_note: None,
             decision_refs: vec!["D-0007".into()],
             score: 0.8741,
@@ -732,7 +766,7 @@ mod tests {
             symbol_path: Some("Board.Update".into()),
             heading_path: None,
             design_status: None,
-            effective_authority: "neutral".into(),
+            effective_authority: Some("neutral".into()),
             authority_note: None,
             decision_refs: vec![],
             score: 0.612,
@@ -854,7 +888,10 @@ mod tests {
                 embedded_chunks: 1204,
                 authority_violations: violations,
                 authority_violation_paths: paths,
+                authority_profile: Some("lore-v1".into()),
+                authority_behavior: Some("rank".into()),
                 watch: WatchState::Armed,
+                ..ProjectStatus::default()
             }],
             embeddings: EmbeddingStatus::Unconfigured,
             latency: Vec::new(),

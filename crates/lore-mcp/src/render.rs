@@ -100,13 +100,10 @@ fn push_result(out: &mut String, rank: usize, result: &SearchResult) {
     // Only when Lore disagreed with the document. Printing "authority:
     // neutral" on every ordinary hit would cost tokens to say nothing; a line
     // that appears *only* when a declaration was refused is the one an agent
-    // must not miss.
-    if let Some(note) = &result.authority_note {
-        let _ = writeln!(
-            out,
-            "    authority: {} - {note}",
-            result.effective_authority
-        );
+    // must not miss. A repository with no authority profile has no reading to
+    // report at all (D-0012), so it never reaches this line either.
+    if let (Some(note), Some(authority)) = (&result.authority_note, &result.effective_authority) {
+        let _ = writeln!(out, "    authority: {authority} - {note}");
     }
     let _ = writeln!(
         out,
@@ -180,9 +177,46 @@ pub fn status(status: &DaemonStatus) -> String {
             root = project.root,
             watch = watch_note(project.watch),
         );
+        push_authority(&mut out, project);
         push_authority_violations(&mut out, project);
     }
     out
+}
+
+/// Which authority profile this repository opted into, and how healthy it is.
+///
+/// Always printed, "none" included: an agent deciding how much to trust a
+/// `design_status: decided` document needs to know whether that vocabulary
+/// means anything in this repository at all (D-0012). A config error gets its
+/// own shout, because the repository is running a *different* model than its
+/// committed file asked for.
+fn push_authority(out: &mut String, project: &ProjectStatus) {
+    if let Some(error) = &project.authority_config_error {
+        let _ = writeln!(
+            out,
+            "    AUTHORITY CONFIG: {error}; this project indexes with no authority semantics"
+        );
+    }
+    let Some(profile) = &project.authority_profile else {
+        if project.authority_config_error.is_none() {
+            let _ = writeln!(out, "    authority: none (no .lore.toml profile)");
+        }
+        return;
+    };
+    let behavior = project.authority_behavior.as_deref().unwrap_or("annotate");
+    let _ = writeln!(
+        out,
+        "    authority: {profile} ({behavior})  decisions {active}/{total} active{violations}",
+        active = project.decisions_active,
+        total = project.decisions_total,
+        violations = match project.decision_violations.len() {
+            0 => String::new(),
+            n => format!("  {n} record violation(s)"),
+        },
+    );
+    for violation in &project.decision_violations {
+        let _ = writeln!(out, "      {violation}");
+    }
 }
 
 /// Documents that declare `decided` without citing an active decision. Silent
@@ -267,7 +301,7 @@ mod tests {
             symbol_path: None,
             heading_path: Some(vec!["MCP Tool Surface".into(), "v0.1 tools".into()]),
             design_status: Some("decided".into()),
-            effective_authority: "decided".into(),
+            effective_authority: Some("decided".into()),
             authority_note: None,
             decision_refs: vec!["D-0007".into(), "D-0008".into()],
             score: 0.8741,
@@ -288,7 +322,7 @@ mod tests {
             symbol_path: Some("Board.Update".into()),
             heading_path: None,
             design_status: None,
-            effective_authority: "neutral".into(),
+            effective_authority: Some("neutral".into()),
             authority_note: None,
             decision_refs: vec![],
             score: 0.612,
@@ -324,7 +358,7 @@ mod tests {
     fn a_refused_declaration_renders_the_reason() {
         let mut demoted = vault_hit();
         demoted.path = "design/9_Scratch/notes.md".into();
-        demoted.effective_authority = "deprecated".into();
+        demoted.effective_authority = Some("deprecated".into());
         demoted.authority_note = Some("9_Scratch path cap".into());
         let rendered = search(
             "authority",
@@ -458,6 +492,7 @@ mod tests {
                     authority_violations: 0,
                     authority_violation_paths: Vec::new(),
                     watch: WatchState::Armed,
+                    ..ProjectStatus::default()
                 },
                 ProjectStatus {
                     id: 2,
@@ -471,6 +506,7 @@ mod tests {
                     authority_violations: 0,
                     authority_violation_paths: Vec::new(),
                     watch: WatchState::Armed,
+                    ..ProjectStatus::default()
                 },
             ],
             embeddings: EmbeddingStatus::Unconfigured,
@@ -501,6 +537,7 @@ mod tests {
                 authority_violations: 0,
                 authority_violation_paths: Vec::new(),
                 watch: WatchState::Armed,
+                ..ProjectStatus::default()
             }],
             embeddings: EmbeddingStatus::Unconfigured,
             latency: Vec::new(),
@@ -538,6 +575,7 @@ mod tests {
                 authority_violations: violations,
                 authority_violation_paths: paths,
                 watch: WatchState::Armed,
+                ..ProjectStatus::default()
             }],
             embeddings: EmbeddingStatus::Unconfigured,
             latency: Vec::new(),

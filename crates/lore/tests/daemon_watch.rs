@@ -446,6 +446,8 @@ fn project(id: ProjectId, root: &str, name: &str) -> Project {
         name: name.to_string(),
         key: name.to_string(),
         kind: lore::types::SourceKind::Repo,
+        // Routing is what these tests are about; the profile never reaches it.
+        authority: lore::repo_config::RepoAuthority::default(),
     }
 }
 

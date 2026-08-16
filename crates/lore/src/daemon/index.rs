@@ -28,8 +28,9 @@ use camino::{Utf8Path, Utf8PathBuf};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::authority::{Demotion, is_ledger_path, parse_ledger};
+use crate::authority::{DecisionIndex, Decisions, Demotion, is_decision_source, is_ledger_path};
 use crate::chunk::{FileChunks, chunk_file};
+use crate::repo_config::{Profile, RepoAuthority};
 use crate::store::{FileWrite, Project, Recompute, StoreError};
 
 use super::queue::{IndexQueue, ProjectWork};
@@ -86,6 +87,14 @@ pub struct PassSummary {
     /// Files declaring `decided` without citing an active decision, as of the
     /// end of this pass.
     pub authority_violations: usize,
+    /// Decision records excluded for an identity defect — a heading that
+    /// disagrees with its filename, or a duplicated id (D-0013).
+    pub decision_violations: usize,
+    /// The repo's `.lore.toml` verdict differs from the stored one, so this
+    /// pass re-chunks the project's Markdown (D-0012).
+    pub profile_changed: bool,
+    /// The repo has a `.lore.toml` Lore cannot use; it indexed neutrally.
+    pub config_error: bool,
     /// True when the pass stopped early because shutdown was requested.
     pub cancelled: bool,
 }
@@ -113,6 +122,8 @@ pub fn full_scan(ctx: &IndexContext, project: &Project) -> PassSummary {
     // back to the walker's built-in exclusions instead of aborting the scan.
     super::ignorefile::ensure(&project.root);
 
+    let profile = refresh_profile(ctx, project, &mut summary);
+
     let files = walk::walk_files(
         &project.root,
         &project.root,
@@ -132,7 +143,7 @@ pub fn full_scan(ctx: &IndexContext, project: &Project) -> PassSummary {
             summary.cancelled = true;
             break;
         }
-        index_one(ctx, project, rel, &mut summary);
+        index_one(ctx, project, rel, profile, &mut summary);
     }
 
     if !summary.cancelled {
@@ -141,7 +152,7 @@ pub fn full_scan(ctx: &IndexContext, project: &Project) -> PassSummary {
         // backfill path, where the stored effective tiers may be the V2
         // migration's declared-tier approximation and the active-decision set
         // may never have been parsed at all.
-        refresh_authority(ctx, project, true, &mut summary);
+        refresh_authority(ctx, project, profile, true, &mut summary);
     }
 
     finish(ctx, project, "full_scan", started, &summary);
@@ -170,6 +181,7 @@ pub fn index_paths(
 ) -> PassSummary {
     let started = Instant::now();
     let mut summary = PassSummary::default();
+    let profile = refresh_profile(ctx, project, &mut summary);
 
     let mut missing: Vec<&Utf8Path> = Vec::new();
     let mut to_index: BTreeSet<Utf8PathBuf> = BTreeSet::new();
@@ -236,20 +248,21 @@ pub fn index_paths(
             summary.cancelled = true;
             break;
         }
-        index_one(ctx, project, rel, &mut summary);
+        index_one(ctx, project, rel, profile, &mut summary);
     }
 
     if !summary.cancelled {
         remove_paths_and_subtrees(ctx, project, &to_remove, &mut summary);
-        // Only when this batch touched a ledger. Every *other* file already
-        // got its effective tier stamped on write; re-deriving the whole
-        // project because one source file changed would be pure waste.
-        let ledger_touched = to_index
+        // Only when this batch touched a decision source — a mono ledger or a
+        // per-file record (D-0013). Every *other* file already got its
+        // effective tier stamped on write; re-deriving the whole project
+        // because one source file changed would be pure waste.
+        let decisions_touched = to_index
             .iter()
             .chain(to_remove.iter())
-            .any(|rel| is_ledger_path(rel));
-        if ledger_touched {
-            refresh_authority(ctx, project, false, &mut summary);
+            .any(|rel| is_decision_source(rel));
+        if decisions_touched {
+            refresh_authority(ctx, project, profile, false, &mut summary);
         }
     }
 
@@ -257,72 +270,168 @@ pub fn index_paths(
     summary
 }
 
-/// Re-read the project's ledger, and rebuild every effective tier if that
-/// changed what counts as canon (or if `force`, which is how a full scan
+/// Re-read the repo's `.lore.toml` and persist the verdict (D-0012).
+///
+/// Runs at the top of **every** pass, before a single file is hashed, because
+/// the profile decides how the files in this pass are chunked. The stored
+/// verdict doubles as the profile fingerprint: `set_project_authority`
+/// reporting a change is how "someone added, edited or deleted `.lore.toml`"
+/// reaches the rest of the pipeline, and the change is loud in the log because
+/// it silently alters what every document in the repo means.
+///
+/// Config problems do not stop the pass. The repo indexes neutrally and the
+/// error is stored where `lore status` will put it in front of the user —
+/// visible failure, not fatal failure.
+fn refresh_profile(
+    ctx: &IndexContext,
+    project: &Project,
+    summary: &mut PassSummary,
+) -> Option<Profile> {
+    let authority = RepoAuthority::load(&project.root);
+    let id = project.id;
+    let stored = {
+        let authority = authority.clone();
+        ctx.store
+            .blocking(move |store| store.set_project_authority(id, &authority))
+    };
+    match stored {
+        Ok(true) => {
+            tracing::info!(
+                project = %project.name,
+                profile = authority.profile.map(Profile::as_str).unwrap_or("none"),
+                behavior = authority.behavior.as_str(),
+                "authority profile changed; the project's Markdown will re-chunk"
+            );
+            summary.profile_changed = true;
+        }
+        Ok(false) => {}
+        Err(err) => {
+            tracing::warn!(project = %project.name, error = %err, "storing the authority profile failed");
+            summary.errors += 1;
+        }
+    }
+    // Loud on every pass, not only when it changed: a broken `.lore.toml` that
+    // is broken again tomorrow is still a repo silently running neutral.
+    if let Some(error) = &authority.error {
+        tracing::warn!(
+            project = %project.name,
+            error = %error,
+            "{} is not usable; the project indexes with no authority semantics (see `lore status`)",
+            crate::repo_config::REPO_CONFIG_FILE,
+        );
+        summary.config_error = true;
+    }
+    authority.active()
+}
+
+/// Re-read the project's decision corpus, and rebuild every effective tier if
+/// that changed what counts as canon (or if `force`, which is how a full scan
 /// doubles as the migration/startup backfill).
 ///
-/// The ledger is read from **disk**, not reassembled from its chunks: chunk
+/// Sources are read from **disk**, not reassembled from their chunks: chunk
 /// text is a verbatim slice but the chunker splits and trims, and parsing a
 /// reassembly of the thing that defines canon is exactly where a subtle
 /// mis-parse would be least visible.
 ///
+/// Two shapes feed one corpus (D-0013): the mono ledger
+/// `**/0_Canon/DECISIONS.md` and per-file records
+/// `**/0_Canon/decisions/D-NNNN-<slug>.md`. They are resolved *together*,
+/// because either may supersede the other.
+///
 /// A project may legitimately have more than one ledger (two vaults in one
 /// repo); their active sets are unioned, because a document citing either
-/// ledger is citing an active decision *of this project*.
+/// ledger is citing an active decision *of this project*. Two vaults that
+/// number their decisions independently therefore share one `D-NNNN`
+/// namespace and can collide — a known limitation, deliberately left here:
+/// D-0012 defers multi-root ID-namespace resolution.
+///
+/// With no profile in force there is no decision corpus at all: the stored set
+/// is emptied so nothing lingers from a repo's configured past, and the
+/// recompute flattens every tier back to neutral.
 fn refresh_authority(
     ctx: &IndexContext,
     project: &Project,
+    profile: Option<Profile>,
     force: bool,
     summary: &mut PassSummary,
 ) {
-    let files = match ctx.store.blocking(|store| store.list_files(project.id)) {
-        Ok(files) => files,
-        Err(err) => {
-            tracing::warn!(project = %project.name, error = %err, "listing files for the ledger scan failed");
-            summary.errors += 1;
-            return;
-        }
-    };
+    let mut sources = 0usize;
+    let decisions = match profile {
+        None => Decisions::default(),
+        Some(_) => {
+            let files = match ctx.store.blocking(|store| store.list_files(project.id)) {
+                Ok(files) => files,
+                Err(err) => {
+                    tracing::warn!(project = %project.name, error = %err, "listing files for the ledger scan failed");
+                    summary.errors += 1;
+                    return;
+                }
+            };
 
-    let mut active: BTreeSet<String> = BTreeSet::new();
-    let mut ledgers = 0usize;
-    for record in files.iter().filter(|f| is_ledger_path(&f.path)) {
-        ledgers += 1;
-        match std::fs::read_to_string(project.root.join(&record.path)) {
-            Ok(text) => active.extend(parse_ledger(&text)),
-            Err(err) => {
-                // The set stays as-is for this ledger rather than collapsing:
-                // an unreadable file is a transient condition, and treating it
-                // as "no decisions are active" would mass-demote the vault.
-                tracing::warn!(
-                    project = %project.name,
-                    path = %record.path,
-                    error = %err,
-                    "decision ledger is unreadable; leaving its decisions active"
-                );
-                summary.errors += 1;
+            let mut index = DecisionIndex::default();
+            let mut unreadable = false;
+            for record in files.iter().filter(|f| is_decision_source(&f.path)) {
+                sources += 1;
+                match std::fs::read_to_string(project.root.join(&record.path)) {
+                    Ok(text) if is_ledger_path(&record.path) => {
+                        index.add_ledger(&record.path, &text);
+                    }
+                    Ok(text) => index.add_record(&record.path, &text),
+                    Err(err) => {
+                        // An unreadable file is a transient condition, and
+                        // treating it as "no decisions are active" would
+                        // mass-demote the vault. The previously stored set is
+                        // folded back in below.
+                        tracing::warn!(
+                            project = %project.name,
+                            path = %record.path,
+                            error = %err,
+                            "decision source is unreadable; leaving its decisions active"
+                        );
+                        summary.errors += 1;
+                        unreadable = true;
+                    }
+                }
+            }
+            let mut decisions = index.resolve();
+            if unreadable {
                 match ctx
                     .store
                     .blocking(|store| store.active_decisions(project.id))
                 {
-                    Ok(previous) => active.extend(previous),
+                    Ok(previous) => decisions.active.extend(previous),
                     Err(err) => {
                         tracing::warn!(project = %project.name, error = %err, "reading the stored decision set failed")
                     }
                 }
+                decisions.total = decisions.total.max(decisions.active.len());
             }
+            decisions
         }
-    }
+    };
 
-    let changed = match ctx
-        .store
-        .blocking(|store| store.set_active_decisions(project.id, &active))
-    {
-        Ok(changed) => changed,
-        Err(err) => {
-            tracing::warn!(project = %project.name, error = %err, "storing the active decision set failed");
-            summary.errors += 1;
-            return;
+    for violation in &decisions.violations {
+        tracing::warn!(
+            project = %project.name,
+            path = %violation.path,
+            detail = %violation.detail,
+            "decision record excluded from the active set"
+        );
+    }
+    summary.decision_violations = decisions.violations.len();
+
+    let changed = {
+        let decisions = decisions.clone();
+        match ctx
+            .store
+            .blocking(move |store| store.set_decisions(project.id, &decisions))
+        {
+            Ok(changed) => changed,
+            Err(err) => {
+                tracing::warn!(project = %project.name, error = %err, "storing the active decision set failed");
+                summary.errors += 1;
+                return;
+            }
         }
     };
     if !changed && !force {
@@ -333,7 +442,9 @@ fn refresh_authority(
         .store
         .blocking(|store| store.recompute_effective_authority(project.id))
     {
-        Ok(recompute) => record_recompute(project, ledgers, &active, changed, recompute, summary),
+        Ok(recompute) => {
+            record_recompute(project, sources, &decisions, changed, recompute, summary)
+        }
         Err(err) => {
             tracing::warn!(project = %project.name, error = %err, "recomputing effective authority failed");
             summary.errors += 1;
@@ -343,8 +454,8 @@ fn refresh_authority(
 
 fn record_recompute(
     project: &Project,
-    ledgers: usize,
-    active: &BTreeSet<String>,
+    sources: usize,
+    decisions: &Decisions,
     ledger_changed: bool,
     recompute: Recompute,
     summary: &mut PassSummary,
@@ -354,8 +465,9 @@ fn record_recompute(
     if ledger_changed || recompute.files_changed > 0 {
         tracing::info!(
             project = %project.name,
-            ledgers,
-            active_decisions = active.len(),
+            decision_sources = sources,
+            active_decisions = decisions.active.len(),
+            total_decisions = decisions.total,
             files_changed = recompute.files_changed,
             chunks_changed = recompute.chunks_changed,
             violations = recompute.violations,
@@ -373,7 +485,13 @@ fn record_recompute(
 
 /// Read, hash, chunk and store one file. All error paths are logged and
 /// counted, never fatal: one unreadable file must not abort a scan.
-fn index_one(ctx: &IndexContext, project: &Project, rel: &Utf8Path, summary: &mut PassSummary) {
+fn index_one(
+    ctx: &IndexContext,
+    project: &Project,
+    rel: &Utf8Path,
+    profile: Option<Profile>,
+    summary: &mut PassSummary,
+) {
     let abs = project.root.join(rel);
     let content = match std::fs::read(&abs) {
         Ok(content) => content,
@@ -390,9 +508,20 @@ fn index_one(ctx: &IndexContext, project: &Project, rel: &Utf8Path, summary: &mu
     };
 
     // The format version rides in the stored hash so a chunking-policy bump
-    // invalidates the short-circuit below and unchanged bytes re-chunk.
+    // invalidates the short-circuit below and unchanged bytes re-chunk. The
+    // active profile rides along for the same reason and by the same mechanism
+    // (D-0012): the same Markdown bytes chunk to different *metadata* under a
+    // different profile, so adding, changing or removing `.lore.toml` has to
+    // invalidate the hash or the old vault fields would survive forever.
+    //
+    // Markdown only. Nothing about a code chunk depends on the profile, so
+    // code keeps its hash — and therefore its vectors — across a profile flip.
+    let profile_tag = match profile {
+        Some(profile) if crate::chunk::is_markdown(rel) => profile.chunk_tag(),
+        _ => "",
+    };
     let hash = format!(
-        "v{}-{}",
+        "v{}{profile_tag}-{}",
         crate::chunk::CHUNK_FORMAT_VERSION,
         blake3::hash(&content).to_hex()
     );
@@ -410,7 +539,7 @@ fn index_one(ctx: &IndexContext, project: &Project, rel: &Utf8Path, summary: &mu
         }
     }
 
-    match chunk_file(rel, &content) {
+    match chunk_file(rel, &content, profile) {
         FileChunks::Chunked(chunks) => {
             let written = ctx
                 .store
@@ -578,6 +707,9 @@ fn finish(
         chunks_deleted = summary.chunks_deleted,
         authority_recomputed = summary.authority_recomputed,
         authority_violations = summary.authority_violations,
+        decision_violations = summary.decision_violations,
+        profile_changed = summary.profile_changed,
+        config_error = summary.config_error,
         errors = summary.errors,
         duration_ms = started.elapsed().as_millis() as u64,
         "index pass complete"

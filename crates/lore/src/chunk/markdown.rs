@@ -1,8 +1,18 @@
 //! Markdown chunker: heading-tree leaves with `heading_path` provenance and
 //! vault-schema awareness (3.1; D-0004).
 //!
-//! * Every chunk of a `.md` file carries [`VaultMeta`]; a file without
-//!   frontmatter is *unclassified*, i.e. `design_status: None`.
+//! * Every chunk of a `.md` file in a repo with an active authority profile
+//!   carries [`crate::types::VaultMeta`]; a file without frontmatter is
+//!   *unclassified*, i.e. `design_status: None`. In a **neutral** repo
+//!   (D-0012: no `.lore.toml`, a broken one, or `behavior = "off"`) no vault
+//!   metadata is attached at all and no `design_status`/`decision_refs`/
+//!   `D-NNNN` scanning happens — those fields are the profile's vocabulary,
+//!   not Markdown's.
+//! * The frontmatter *block* is skipped either way. Where a document's
+//!   metadata header stops and its prose starts is a Markdown convention that
+//!   predates any of this; a neutral repo should not suddenly start indexing
+//!   YAML as body text, and treating it as prose would move every chunk id in
+//!   every repo that has a header for some other tool.
 //! * A heading's chunk runs from its own line to the next heading of any
 //!   level. For a leaf that is the whole section; for a heading with
 //!   subheadings that is its intro text, which earns its own chunk only when
@@ -15,6 +25,7 @@
 use camino::Utf8PathBuf;
 
 use super::common::{Emitter, FileVault, Tpl, decision_refs, trim_span};
+use crate::repo_config::Profile;
 use crate::types::{Chunk, DesignStatus};
 
 /// A container heading's intro must be at least this many bytes (beyond the
@@ -28,10 +39,17 @@ const MIN_SECTION_INTRO_BYTES: usize = 24;
 /// stays relative to the original file bytes; only the starting offset moves.
 const BOM: &str = "\u{feff}";
 
-pub(crate) fn chunk_markdown(path: &Utf8PathBuf, src: &str) -> Vec<Chunk> {
-    let (vault, body_start) = parse_frontmatter(src);
+pub(crate) fn chunk_markdown(
+    path: &Utf8PathBuf,
+    src: &str,
+    profile: Option<Profile>,
+) -> Vec<Chunk> {
+    let (vault, body_start) = parse_frontmatter(src, profile.is_some());
     let headings = scan_headings(src, body_start);
-    let mut emitter = Emitter::new(path, Some("markdown"), src).with_vault(vault);
+    let mut emitter = Emitter::new(path, Some("markdown"), src);
+    if profile.is_some() {
+        emitter = emitter.with_vault(vault);
+    }
 
     let first = headings.first().map_or(src.len(), |h| h.start);
     emitter.push(body_start, first, Tpl::Section { heading_path: &[] });
@@ -137,7 +155,11 @@ fn scan_headings(src: &str, from: usize) -> Vec<Heading> {
 /// and inline sequences (`[a, b]`). Enough for `design_status` and
 /// `decision_refs`; anything else in the block is ignored. Returns the vault
 /// metadata and the byte offset where the document body starts.
-fn parse_frontmatter(src: &str) -> (FileVault, usize) {
+///
+/// `interpret` is the D-0012 gate. With it false the block is still *located*
+/// — the body has to start somewhere — but not a single field is read, so a
+/// neutral repo pays no parsing cycles and acquires no frontmatter semantics.
+fn parse_frontmatter(src: &str, interpret: bool) -> (FileVault, usize) {
     let mut vault = FileVault::default();
     // Step over one leading BOM before looking for the opening fence; the
     // body then starts after it, so the mark itself is never chunk text.
@@ -167,7 +189,7 @@ fn parse_frontmatter(src: &str) -> (FileVault, usize) {
             continue;
         }
         if let Some(item) = body.strip_prefix("- ") {
-            if key == "decision_refs" {
+            if interpret && key == "decision_refs" {
                 push_refs(&mut vault.decision_refs, item);
             }
             continue;
@@ -180,7 +202,7 @@ fn parse_frontmatter(src: &str) -> (FileVault, usize) {
         }
         key = name.trim().to_string();
         let value = value.trim();
-        if value.is_empty() {
+        if !interpret || value.is_empty() {
             continue;
         }
         match key.as_str() {

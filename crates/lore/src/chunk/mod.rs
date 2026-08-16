@@ -25,6 +25,7 @@ pub use common::{
 
 /// `D-NNNN` extraction, shared with [`crate::authority`]'s ledger parser so
 /// the two agree on what a decision reference looks like.
+use crate::repo_config::Profile;
 use crate::types::Chunk;
 
 /// Bump whenever chunking policy changes in a way that should re-chunk
@@ -85,9 +86,27 @@ impl FileChunks {
     }
 }
 
+/// Does this path go down the Markdown path (and therefore care which
+/// authority profile is in force)?
+///
+/// Exposed because the indexer needs the answer *before* reading the file, to
+/// decide whether the profile belongs in the file's content hash.
+pub fn is_markdown(rel_path: &Utf8Path) -> bool {
+    rel_path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+}
+
 /// Chunks one file. `rel_path` is project-relative; it participates in every
 /// derived ID, so it is normalized to forward slashes first.
-pub fn chunk_file(rel_path: &Utf8Path, content: &[u8]) -> FileChunks {
+///
+/// `profile` is the repository's active authority profile (D-0012). It reaches
+/// only the Markdown path, where it decides whether frontmatter is a schema or
+/// just a header: `None` means no `design_status`, no `decision_refs`, no
+/// `D-NNNN` body scan, and no [`crate::types::VaultMeta`] on any chunk. Chunk
+/// *text*, spans and ids are identical either way — only the metadata differs
+/// — so flipping a profile costs a re-chunk, never a re-embed.
+pub fn chunk_file(rel_path: &Utf8Path, content: &[u8], profile: Option<Profile>) -> FileChunks {
     if content.len() > MAX_FILE_BYTES {
         return FileChunks::Skipped(SkipReason::TooLarge);
     }
@@ -106,7 +125,7 @@ pub fn chunk_file(rel_path: &Utf8Path, content: &[u8]) -> FileChunks {
         .unwrap_or_default();
 
     if extension == "md" {
-        return FileChunks::Chunked(markdown::chunk_markdown(&path, src));
+        return FileChunks::Chunked(markdown::chunk_markdown(&path, src, profile));
     }
     if let Some(spec) = language_tag(&extension).and_then(code::spec_for) {
         if let Some(chunks) = code::chunk_code(&spec, &path, src) {
@@ -150,8 +169,12 @@ mod tests {
     use super::*;
     use crate::types::DesignStatus;
 
+    /// The vault-aware profile, which is what every assertion here predates
+    /// and therefore what keeps them testing the same thing (D-0012).
+    const LORE_V1: Option<Profile> = Some(Profile::LoreV1);
+
     fn chunks(name: &str, body: &str) -> Vec<Chunk> {
-        match chunk_file(Utf8Path::new(name), body.as_bytes()) {
+        match chunk_file(Utf8Path::new(name), body.as_bytes(), LORE_V1) {
             FileChunks::Chunked(chunks) => chunks,
             other => panic!("unexpected skip: {other:?}"),
         }
@@ -159,15 +182,40 @@ mod tests {
 
     #[test]
     fn skips_binary_and_oversize() {
-        let binary = chunk_file(Utf8Path::new("a.bin"), b"abc\0def");
+        let binary = chunk_file(Utf8Path::new("a.bin"), b"abc\0def", LORE_V1);
         assert_eq!(binary.skip_reason(), Some(SkipReason::Binary));
         let big = vec![b'a'; MAX_FILE_BYTES + 1];
         assert_eq!(
-            chunk_file(Utf8Path::new("a.txt"), &big).skip_reason(),
+            chunk_file(Utf8Path::new("a.txt"), &big, LORE_V1).skip_reason(),
             Some(SkipReason::TooLarge)
         );
-        let invalid = chunk_file(Utf8Path::new("a.txt"), &[0xf0, 0x28, 0x8c, 0x28]);
+        let invalid = chunk_file(Utf8Path::new("a.txt"), &[0xf0, 0x28, 0x8c, 0x28], LORE_V1);
         assert_eq!(invalid.skip_reason(), Some(SkipReason::InvalidUtf8));
+    }
+
+    /// D-0012: a repository that did not opt in gets the same chunks with none
+    /// of the vocabulary. Same ids, same text, same spans — only the metadata
+    /// disappears, which is what makes enabling a profile a re-chunk rather
+    /// than a re-embed.
+    #[test]
+    fn a_neutral_repo_gets_markdown_without_the_vault_vocabulary() {
+        let src = "---\ndesign_status: decided\ndecision_refs: [D-0003]\n---\n\n\
+                   # H\n\nbody citing D-0004\n";
+        let vault = chunks("a.md", src);
+        let FileChunks::Chunked(neutral) = chunk_file(Utf8Path::new("a.md"), src.as_bytes(), None)
+        else {
+            panic!("markdown is still chunked without a profile")
+        };
+
+        assert!(vault[0].vault.is_some());
+        assert!(neutral.iter().all(|c| c.vault.is_none()));
+        assert_eq!(
+            vault.iter().map(|c| &c.id).collect::<Vec<_>>(),
+            neutral.iter().map(|c| &c.id).collect::<Vec<_>>(),
+            "ids must not move, or a profile flip would discard every vector"
+        );
+        // The YAML header is still a header, not prose.
+        assert!(neutral.iter().all(|c| !c.text.contains("design_status")));
     }
 
     #[test]
@@ -177,7 +225,7 @@ mod tests {
         let vocab = format!("{{\"vocab\":{}}}", "\"word\",".repeat(2000));
         assert!(vocab.len() > MAX_TEXT_LINE_BYTES);
         assert_eq!(
-            chunk_file(Utf8Path::new("tokenizer.json"), vocab.as_bytes()).skip_reason(),
+            chunk_file(Utf8Path::new("tokenizer.json"), vocab.as_bytes(), LORE_V1).skip_reason(),
             Some(SkipReason::MachineText)
         );
         // ...but the same line inside Markdown or parseable code is kept:

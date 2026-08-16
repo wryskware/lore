@@ -7,7 +7,7 @@ use rusqlite_migration::{M, Migrations};
 
 /// Ordered migration list. Index + 1 == `user_version` after application.
 pub(crate) fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(V1), M::up(V2)])
+    Migrations::new(vec![M::up(V1), M::up(V2), M::up(V3)])
 }
 
 /// v1 — initial schema.
@@ -187,4 +187,37 @@ ALTER TABLE projects ADD COLUMN key TEXT;
 CREATE UNIQUE INDEX projects_by_key ON projects(key);
 
 ALTER TABLE files ADD COLUMN source_ts INTEGER;
+"#;
+
+/// v3 — authority is repository-opt-in (D-0012) and decision records are a
+/// corpus with its own health (D-0013).
+///
+/// The resolved `.lore.toml` lives on the project row rather than being
+/// re-read per query, for two reasons. Ranking needs it *per hit* (the weights
+/// apply only to `behavior = "rank"` projects) and `lore status` needs it for
+/// projects it is not otherwise touching; re-reading a file from disk on either
+/// path would put IO inside the store lock. Persisting it also makes the
+/// column the natural **profile fingerprint**: the index pass compares what it
+/// just read against what is stored, and a difference is exactly the signal
+/// that every effective tier in the project is now wrong.
+///
+/// `authority_profile IS NULL` is the neutral state, which is what every row
+/// migrating from v2 starts as — correct rather than merely safe, because a
+/// repo that has not been scanned since the upgrade genuinely has no known
+/// profile yet, and the first scan writes one.
+///
+/// `authority_error` is stored, not just logged: a repo whose `.lore.toml` is
+/// broken indexes neutrally, and D-0012 requires that be loud in `lore status`
+/// even when nothing has re-scanned since.
+///
+/// `decisions_total` and `decision_violations` are per project rather than a
+/// table, because they are a summary that is rewritten whole on every ledger
+/// refresh and only ever read whole.
+const V3: &str = r#"
+ALTER TABLE projects ADD COLUMN authority_profile  TEXT;
+ALTER TABLE projects ADD COLUMN authority_behavior TEXT;
+ALTER TABLE projects ADD COLUMN authority_error    TEXT;
+ALTER TABLE projects ADD COLUMN decisions_total    INTEGER NOT NULL DEFAULT 0;
+-- serde_json array of authority::DecisionViolation; NULL == none.
+ALTER TABLE projects ADD COLUMN decision_violations TEXT;
 "#;
