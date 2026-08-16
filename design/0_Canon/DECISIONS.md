@@ -138,3 +138,15 @@ Append-only. Newest entries at the bottom. Schema per [[README]].
 - **Consequences:** `design/9_Scratch/2026-08-15_e2e-round-1-plan.md` is the round-1 protocol; the bench harness lives in `bench/`.
 - **Supersedes:** D-0009's fixture-corpora clause only ("a few mid-size repos from established OSS projects"); its early-benchmarks posture and driving-model choices stand.
 - **Canonical sources:** [[../9_Scratch/2026-08-15_e2e-round-1-plan]]
+
+## D-0014 — Default embedding stack: Qwen3-Embedding-4B on standalone llama-server
+
+- **Date:** 2026-08-16
+- **Status:** Accepted
+- **Scope:** Embedding model + serving stack for the reference setup (D-0003's local-embeddings constraint made concrete). D-0012/D-0013 are reserved by the authority-profiles branch, hence the gap.
+- **Decided by:** Wrysk (verdict after the embed-model retrieval bench and the indexing-throughput session)
+- **Decision:** The default embedding model is **Qwen3-Embedding-4B (Q8_0 GGUF, 2560 dims, last pooling, Apache-2.0)** served by a **standalone llama.cpp `llama-server` CUDA build** — not Ollama, which was only ever the ambient convenience default and was never canon. Documents embed unprefixed; queries use the card-sanctioned instruct prefix ("Given a natural language query, retrieve relevant code snippets or documentation passages"). `max_embed_bytes = 3584` under a 16384-token server context. Serving flags that are load-bearing for throughput: `--kv-unified` (without it llama.cpp shreds pooled variable-length batches into ~one-sequence decodes), `--no-cache-prompt`, `-b/-ub 2048`, `--parallel 16`.
+- **Rationale:** Bench (2026-08-15, `bench/embed/`, three corpora, hand-verified answer keys): hit@10 .92/.92/.87 and C#-semantic 0.69 vs the nomic incumbent's 0.15 — the flagship-language gap is the decision. jina-code-1.5b was the C# runner-up but is CC-BY-NC and weak on design docs; qwen3-8b adds ~nothing for 2x cost. Throughput session (2026-08-16) root-caused the drain cost and settled the flags: ~11.4k tok/s honest steady-state on the 5090.
+- **Consequences:** Fingerprint change forces a one-off full re-embed (~15-16 min for ~40k chunks at the tuned flags). Costs accepted: ~8.2 GB resident VRAM while the server runs, 2560-dim vectors (~2.6x vector-scan cost, ~265 ms search p50 at 34k chunks, +7 ms query-embed p50). The daemon still never manages the server process (D-0007); the launcher script and flags live in the repo as operational defaults, not frozen canon — retune freely without a new decision, but a *model* change is a new decision.
+- **Supersedes:** None
+- **Canonical sources:** [[../7_Research/raw/C_embeddings]]; `bench/embed/README.md`; bench summary artifact (claude.ai/code/artifact/72ce25a8-661f-4885-a94d-42f84951fb06)
