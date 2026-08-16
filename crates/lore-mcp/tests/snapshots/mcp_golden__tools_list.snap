@@ -11,7 +11,7 @@ expression: rendered
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
           "chunk_id": {
-            "description": "chunk_id from the search result you want to read.",
+            "description": "chunk_id from the search result you want to read. Search prints a shortened id; pass it exactly as shown - any prefix of at least 8 hexadecimal characters resolves, and an ambiguous one is answered with the candidates.",
             "type": "string"
           },
           "context_lines": {

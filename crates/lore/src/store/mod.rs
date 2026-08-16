@@ -256,6 +256,38 @@ pub struct NewEmbedding {
     pub vector: Vec<f32>,
 }
 
+/// What [`Store::find_chunk_by_prefix`] made of a chunk id or id prefix.
+///
+/// Ambiguity is its own answer rather than a `None` or an arbitrary first row:
+/// the caller has to be able to tell "no such chunk" (re-run search) from
+/// "several such chunks" (type more characters), and only one of those is the
+/// caller's fault.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChunkLookup {
+    /// Exactly one chunk in this project starts with the prefix.
+    Found(Box<Chunk>),
+    /// None does.
+    Unknown,
+    /// Several do; full ids, capped by the caller's `max_candidates`.
+    Ambiguous(Vec<String>),
+}
+
+/// Exclusive upper bound of the range of strings starting with `prefix`:
+/// `prefix` with its last byte incremented.
+///
+/// `None` for an empty prefix, and for the (unreachable for hex input)
+/// all-`0xFF` case where no such bound exists.
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut bytes = prefix.as_bytes().to_vec();
+    while let Some(last) = bytes.pop() {
+        if last < u8::MAX {
+            bytes.push(last + 1);
+            return String::from_utf8(bytes).ok();
+        }
+    }
+    None
+}
+
 /// Identity of the embedding space every stored vector belongs to.
 ///
 /// Stored opaquely (serialized whole). A mismatch means the vectors in the
@@ -1183,6 +1215,53 @@ impl Store {
         match rows.next()? {
             Some(row) => Ok(Some(row_to_chunk(row)?)),
             None => Ok(None),
+        }
+    }
+
+    /// Resolve a chunk id **or a prefix of one** within a project.
+    ///
+    /// A half-open range scan (`chunk_id >= prefix AND chunk_id < prefix⁺`)
+    /// rather than `LIKE`/`GLOB`, so the query is a bounded seek on the
+    /// existing `UNIQUE (project_id, chunk_id)` index whatever SQLite's
+    /// pattern-optimizer feels like doing that day. A full-length id is the
+    /// same scan over a range that can hold exactly one row.
+    ///
+    /// `max_candidates` caps how many ids an ambiguous prefix reports; the
+    /// caller phrases the answer as "several", not "exactly these", because a
+    /// full listing is not what the caller needs to type a longer prefix.
+    pub fn find_chunk_by_prefix(
+        &self,
+        project: ProjectId,
+        prefix: &str,
+        max_candidates: usize,
+    ) -> Result<ChunkLookup> {
+        let Some(upper) = prefix_upper_bound(prefix) else {
+            return Ok(ChunkLookup::Unknown);
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {CHUNK_COLS}, c.chunk_id FROM chunks c
+             WHERE c.project_id = ? AND c.chunk_id >= ? AND c.chunk_id < ?
+             ORDER BY c.chunk_id
+             LIMIT ?"
+        ))?;
+        // One more than the cap is fetched only to know that the first row is
+        // not alone; the extra row is never reported.
+        let limit = max_candidates.max(2) as i64;
+        let mut rows = stmt.query(params![project, prefix, upper, limit])?;
+
+        let Some(row) = rows.next()? else {
+            return Ok(ChunkLookup::Unknown);
+        };
+        let first = row_to_chunk(row)?;
+        let mut ids = vec![first.id.0.clone()];
+        while let Some(row) = rows.next()? {
+            ids.push(row.get(CHUNK_COL_COUNT)?);
+        }
+        if ids.len() == 1 {
+            Ok(ChunkLookup::Found(Box::new(first)))
+        } else {
+            ids.truncate(max_candidates);
+            Ok(ChunkLookup::Ambiguous(ids))
         }
     }
 

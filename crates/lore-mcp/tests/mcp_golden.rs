@@ -111,7 +111,7 @@ fn canned_search() -> SearchResponse {
     SearchResponse {
         results: vec![
             SearchResult {
-                chunk_id: "9f3a1c2b7e".into(),
+                chunk_id: "9f3a1c2b7e4d0123456789abcdef0123456789abcdef0123456789abcdef0123".into(),
                 project: "lore".into(),
                 project_key: "lore".into(),
                 path: "design/4_Interfaces/4.1_MCP_Surface.md".into(),
@@ -131,7 +131,7 @@ fn canned_search() -> SearchResponse {
                 excerpt_truncated: false,
             },
             SearchResult {
-                chunk_id: "4e77ba0193".into(),
+                chunk_id: "4e77ba0193ab0123456789abcdef0123456789abcdef0123456789abcdef0123".into(),
                 project: "lexomancy".into(),
                 project_key: "lexomancy".into(),
                 path: "Assets/Scripts/Board.cs".into(),
@@ -149,7 +149,7 @@ fn canned_search() -> SearchResponse {
                 excerpt_truncated: true,
             },
             SearchResult {
-                chunk_id: "1c0ffee042".into(),
+                chunk_id: "1c0ffee042ab0123456789abcdef0123456789abcdef0123456789abcdef0123".into(),
                 project: "lore".into(),
                 project_key: "lore".into(),
                 path: "design/9_Scratch/2026-08-14_notes.md".into(),
@@ -406,6 +406,9 @@ async fn a_pinned_project_replaces_working_directory_resolution() {
     );
 }
 
+/// The `chunk_id` here is the *shortened* id the search snapshot prints, not
+/// the full one the wire carried — that round trip is the whole point of
+/// shortening, and the daemon resolves the prefix (this stub answers anything).
 #[tokio::test]
 async fn expand_returns_a_span_header_and_the_text() {
     let rendered = call_tool(
@@ -413,7 +416,7 @@ async fn expand_returns_a_span_header_and_the_text() {
         "expand",
         json!({
             "project_key": "lexomancy",
-            "chunk_id": "4e77ba0193",
+            "chunk_id": "4e77ba0193ab",
             "context_lines": 3
         }),
     )

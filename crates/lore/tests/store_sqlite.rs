@@ -272,6 +272,79 @@ fn get_chunk_and_get_file_chunks_are_ordered() {
     );
 }
 
+/// Prefix lookup, the half of issue #7 that makes a shortened chunk id safe to
+/// print. Ids are hand-written here because two blake3 hashes sharing a prefix
+/// cannot be arranged, and the ambiguous case is the one that must not be
+/// answered by quietly taking the first row.
+#[test]
+fn a_chunk_id_prefix_resolves_uniquely_or_reports_its_candidates() {
+    use lore::store::ChunkLookup;
+    use lore::types::ChunkId;
+
+    let dir = TempDir::new().unwrap();
+    let mut store = open(&dir);
+    let proj = store.register_project(p("C:/repos/x"), "x").unwrap();
+    let other = store.register_project(p("C:/repos/y"), "y").unwrap();
+
+    let mut alone = code_chunk("src/lib.rs", "a", "fn a() {}", "rust");
+    alone.id = ChunkId("0f0f0f0f0f0f0f0f".into());
+    let mut twin_a = code_chunk("src/lib.rs", "b", "fn b() {}", "rust");
+    twin_a.id = ChunkId("abcd1234aaaa".into());
+    let mut twin_b = code_chunk("src/lib.rs", "c", "fn c() {}", "rust");
+    twin_b.id = ChunkId("abcd1234bbbb".into());
+    store
+        .replace_file_chunks(
+            proj,
+            p("src/lib.rs"),
+            "h",
+            &[alone.clone(), twin_a.clone(), twin_b.clone()],
+        )
+        .unwrap();
+
+    // A prefix that reaches exactly one chunk, and the full id, agree.
+    for id in ["0f0f0f0f", "0f0f0f0f0f0f0f0f"] {
+        assert_eq!(
+            store.find_chunk_by_prefix(proj, id, 8).unwrap(),
+            ChunkLookup::Found(Box::new(alone.clone())),
+            "{id}"
+        );
+    }
+
+    // A shared prefix names both, in id order, rather than picking one.
+    assert_eq!(
+        store.find_chunk_by_prefix(proj, "abcd1234", 8).unwrap(),
+        ChunkLookup::Ambiguous(vec![twin_a.id.0.clone(), twin_b.id.0.clone()])
+    );
+    // …and one more character settles it.
+    assert_eq!(
+        store.find_chunk_by_prefix(proj, "abcd1234b", 8).unwrap(),
+        ChunkLookup::Found(Box::new(twin_b.clone()))
+    );
+
+    // The range is half-open, so a neighbouring id outside the prefix is not
+    // swept in, and an unrelated prefix finds nothing.
+    for miss in ["abcd1235", "ffffffff"] {
+        assert_eq!(
+            store.find_chunk_by_prefix(proj, miss, 8).unwrap(),
+            ChunkLookup::Unknown,
+            "{miss}"
+        );
+    }
+
+    // Disambiguation is per project: another project's chunks are invisible,
+    // which is what makes twelve characters enough to print.
+    assert_eq!(
+        store.find_chunk_by_prefix(other, "0f0f0f0f", 8).unwrap(),
+        ChunkLookup::Unknown
+    );
+
+    // The candidate list is capped by the caller, not by the corpus.
+    assert!(matches!(
+        store.find_chunk_by_prefix(proj, "abcd1234", 1).unwrap(),
+        ChunkLookup::Ambiguous(ids) if ids.len() == 1
+    ));
+}
+
 /// What `lore remove` actually destroys, pinned so the CLI's promise ("dropped
 /// N file(s) and M chunk(s)") is not larger than the deletion behind it.
 ///

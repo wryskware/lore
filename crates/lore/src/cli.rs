@@ -506,6 +506,24 @@ impl Client {
 const LEXICAL_ONLY_NOTE: &str = "note: embeddings are unavailable, so these are lexical matches only; \
      semantically related chunks may be missing (run `lore status`)\n";
 
+/// Displayed chunk-id length, git-style, and the same twelve `lore-mcp` uses.
+///
+/// A full blake3 id is 64 hex characters whose only job is to be handed back
+/// to `expand`, which resolves any prefix at least
+/// [`lore_core::MIN_CHUNK_ID_PREFIX`] long — so a shortened id still
+/// round-trips, and the wire keeps carrying the whole one.
+const SHORT_CHUNK_ID: usize = 12;
+const _: () = assert!(SHORT_CHUNK_ID >= lore_core::MIN_CHUNK_ID_PREFIX);
+
+/// The leading [`SHORT_CHUNK_ID`] characters of an id, sliced on a character
+/// boundary so an unexpected id shape renders short rather than panicking.
+fn short_id(chunk_id: &str) -> &str {
+    match chunk_id.char_indices().nth(SHORT_CHUNK_ID) {
+        Some((at, _)) => &chunk_id[..at],
+        None => chunk_id,
+    }
+}
+
 fn render_search(query: &str, response: &SearchResponse) -> String {
     let mut out = String::new();
     let mode = if response.lexical_only {
@@ -582,7 +600,7 @@ fn push_result(out: &mut String, rank: usize, result: &SearchResult) {
     if let (Some(note), Some(authority)) = (&result.authority_note, &result.effective_authority) {
         let _ = writeln!(out, "    authority: {authority} - {note}");
     }
-    let _ = writeln!(out, "    chunk_id: {}", result.chunk_id);
+    let _ = writeln!(out, "    chunk_id: {}", short_id(&result.chunk_id));
 
     out.push_str(result.excerpt.trim_end_matches('\n'));
     out.push('\n');
@@ -1098,9 +1116,21 @@ mod tests {
     // Kept in step with `lore-mcp/src/render.rs`; the assertions below are the
     // shape the two are agreed on.
 
+    /// A realistic 64-character chunk id starting with `head` — the same
+    /// helper `lore-mcp`'s renderer tests use, and for the same reason: a
+    /// fixture shorter than what is printed would test nothing.
+    fn full_id(head: &str) -> String {
+        let mut id = head.to_string();
+        while id.len() < 64 {
+            id.push_str("0123456789abcdef");
+        }
+        id.truncate(64);
+        id
+    }
+
     fn vault_hit() -> SearchResult {
         SearchResult {
-            chunk_id: "9f3a1c2b".into(),
+            chunk_id: full_id("9f3a1c2b7e4d"),
             project: "lore".into(),
             project_key: "lore".into(),
             path: "design/4_Interfaces/4.1_MCP_Surface.md".into(),
@@ -1121,7 +1151,7 @@ mod tests {
 
     fn code_hit() -> SearchResult {
         SearchResult {
-            chunk_id: "4e77ba01".into(),
+            chunk_id: full_id("4e77ba0193ab"),
             project: "lexomancy".into(),
             project_key: "lexomancy".into(),
             path: "Assets/Scripts/Board.cs".into(),
@@ -1155,7 +1185,25 @@ mod tests {
         ));
         assert!(rendered.contains("    heading: MCP Tool Surface > v0.1 tools\n"));
         assert!(rendered.contains("    status: decided  refs: D-0007\n"));
-        assert!(rendered.contains("    chunk_id: 9f3a1c2b\n"));
+        assert!(rendered.contains("    chunk_id: 9f3a1c2b7e4d\n"));
+    }
+
+    /// Same rule as `lore-mcp`'s renderer: twelve characters, never sixty-four,
+    /// and what is printed is a prefix `expand` accepts.
+    #[test]
+    fn chunk_ids_print_short_enough_to_read_and_long_enough_to_use() {
+        let hit = vault_hit();
+        let rendered = render_search(
+            "authority",
+            &SearchResponse {
+                results: vec![hit.clone()],
+                lexical_only: false,
+            },
+        );
+        assert!(!rendered.contains(&hit.chunk_id), "{rendered}");
+        assert_eq!(short_id(&hit.chunk_id).len(), SHORT_CHUNK_ID);
+        assert!(short_id(&hit.chunk_id).len() >= lore_core::MIN_CHUNK_ID_PREFIX);
+        assert_eq!(short_id("abc"), "abc");
     }
 
     #[test]
@@ -1168,7 +1216,7 @@ mod tests {
             },
         );
         assert!(rendered.contains("    symbol: Board.Update\n"));
-        assert!(rendered.contains("    chunk_id: 4e77ba01\n"));
+        assert!(rendered.contains("    chunk_id: 4e77ba0193ab\n"));
         assert!(rendered.contains("    (excerpt truncated)\n"));
         // Vault fields are omitted, not rendered empty.
         assert!(!rendered.contains("status:"));

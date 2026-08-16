@@ -13,8 +13,9 @@
 //!   whether to read further: project, path, span, score, language;
 //! - indented metadata lines only when the field exists (no `symbol: none`);
 //! - the excerpt verbatim and unindented, so code keeps its own indentation;
-//! - `chunk_id` always present and always spelled out, because `expand`
-//!   requires it and an agent that has to guess will guess wrong.
+//! - `chunk_id` always present, because `expand` requires it and an agent that
+//!   has to guess will guess wrong — but shortened, because the full id is 64
+//!   hex characters of pure handle (see [`SHORT_CHUNK_ID`]).
 
 use lore_core::{
     DaemonStatus, EmbeddingStatus, ExpandResponse, ProjectStatus, SearchResponse, SearchResult,
@@ -25,6 +26,29 @@ use std::fmt::Write as _;
 /// Degradation must be visible, never silent (D-0007).
 const LEXICAL_ONLY_NOTE: &str = "note: embeddings are unavailable, so these are lexical matches only; \
      semantically related chunks may be missing (call `status` for why)\n";
+
+/// Displayed chunk-id length, git-style.
+///
+/// A full blake3 id is 64 hex characters — roughly sixteen tokens spent twice
+/// on every truncated hit, for a string whose only job is to be handed back.
+/// Twelve keeps a collision inside one project a curiosity rather than a plan,
+/// and `expand` resolves any prefix at least [`lore_core::MIN_CHUNK_ID_PREFIX`]
+/// long, so what is printed is always enough to pass straight back. The wire
+/// still carries the id whole.
+const SHORT_CHUNK_ID: usize = 12;
+const _: () = assert!(SHORT_CHUNK_ID >= lore_core::MIN_CHUNK_ID_PREFIX);
+
+/// The leading [`SHORT_CHUNK_ID`] characters of an id.
+///
+/// Sliced on a character boundary rather than a byte offset: an id from a
+/// future daemon that is not 64 hex characters must render short, not panic
+/// mid-line.
+fn short_id(chunk_id: &str) -> &str {
+    match chunk_id.char_indices().nth(SHORT_CHUNK_ID) {
+        Some((at, _)) => &chunk_id[..at],
+        None => chunk_id,
+    }
+}
 
 /// Rendered `search` result set.
 pub fn search(query: &str, response: &SearchResponse) -> String {
@@ -108,7 +132,8 @@ fn push_result(out: &mut String, rank: usize, result: &SearchResult) {
     let _ = writeln!(
         out,
         "    project_key: {}  chunk_id: {}",
-        result.project_key, result.chunk_id
+        result.project_key,
+        short_id(&result.chunk_id)
     );
 
     out.push_str(result.excerpt.trim_end_matches('\n'));
@@ -118,7 +143,7 @@ fn push_result(out: &mut String, rank: usize, result: &SearchResult) {
             out,
             "    (excerpt truncated - expand project_key=\"{key}\" chunk_id=\"{chunk}\" for the full text)",
             key = result.project_key,
-            chunk = result.chunk_id,
+            chunk = short_id(&result.chunk_id),
         );
     }
 }
@@ -289,9 +314,21 @@ mod tests {
     use super::*;
     use lore_core::ProjectStatus;
 
+    /// A realistic 64-character chunk id starting with `head`. The fixtures
+    /// carry full ids on purpose: a short one would let the shortening pass
+    /// every assertion by doing nothing.
+    fn full_id(head: &str) -> String {
+        let mut id = head.to_string();
+        while id.len() < 64 {
+            id.push_str("0123456789abcdef");
+        }
+        id.truncate(64);
+        id
+    }
+
     fn vault_hit() -> SearchResult {
         SearchResult {
-            chunk_id: "9f3a1c2b".into(),
+            chunk_id: full_id("9f3a1c2b7e4d"),
             project: "lore".into(),
             project_key: "lore".into(),
             path: "design/4_Interfaces/4.1_MCP_Surface.md".into(),
@@ -312,7 +349,7 @@ mod tests {
 
     fn code_hit() -> SearchResult {
         SearchResult {
-            chunk_id: "4e77ba01".into(),
+            chunk_id: full_id("4e77ba0193ab"),
             project: "lexomancy".into(),
             project_key: "lexomancy".into(),
             path: "Assets/Scripts/Board.cs".into(),
@@ -346,7 +383,7 @@ mod tests {
         ));
         assert!(rendered.contains("    heading: MCP Tool Surface > v0.1 tools\n"));
         assert!(rendered.contains("    status: decided  refs: D-0007, D-0008\n"));
-        assert!(rendered.contains("    project_key: lore  chunk_id: 9f3a1c2b\n"));
+        assert!(rendered.contains("    project_key: lore  chunk_id: 9f3a1c2b7e4d\n"));
         assert!(!rendered.contains("truncated"));
         // Declared and effective agree here, so no authority line is spent.
         assert!(!rendered.contains("authority:"), "{rendered}");
@@ -388,8 +425,33 @@ mod tests {
         assert!(!rendered.contains("status:"));
         assert!(!rendered.contains("refs:"));
         assert!(rendered.contains(
-            "    (excerpt truncated - expand project_key=\"lexomancy\" chunk_id=\"4e77ba01\" for the full text)\n"
+            "    (excerpt truncated - expand project_key=\"lexomancy\" chunk_id=\"4e77ba0193ab\" for the full text)\n"
         ));
+    }
+
+    /// The whole point of the shortening: the id an agent reads is twelve
+    /// characters, never sixty-four, and it is the same twelve in both places
+    /// a truncated hit prints it — so what it copies back is a legal prefix.
+    #[test]
+    fn chunk_ids_are_shortened_everywhere_they_appear() {
+        let hit = code_hit();
+        let rendered = search(
+            "board update",
+            &SearchResponse {
+                results: vec![hit.clone()],
+                lexical_only: false,
+            },
+        );
+        assert!(!rendered.contains(&hit.chunk_id), "{rendered}");
+        assert_eq!(rendered.matches("4e77ba0193ab").count(), 2, "{rendered}");
+        assert_eq!(short_id(&hit.chunk_id).len(), SHORT_CHUNK_ID);
+        // A shorter id than we would print is left whole rather than padded,
+        // and a non-hex one does not panic the renderer.
+        assert_eq!(short_id("abc"), "abc");
+        assert_eq!(
+            short_id("日本語のなにかとても長い識別子"),
+            "日本語のなにかとても長い"
+        );
     }
 
     #[test]

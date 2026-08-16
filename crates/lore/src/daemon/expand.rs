@@ -12,12 +12,17 @@
 //! it already has a citation for than by a 404 it cannot act on. The response
 //! is still self-describing: `file_lines` equals the returned span's end, so
 //! a caller can see that no wider context was available.
+//!
+//! The chunk is named by a full id **or a prefix of one** (git-style). A
+//! 64-character blake3 id costs a search hit ~16 tokens it spends twice, and
+//! the id is only ever a handle to hand back — so renderers print a short one
+//! and this is the half that makes that safe.
 
 use camino::Utf8Path;
-use lore_core::ExpandResponse;
+use lore_core::{ExpandResponse, MIN_CHUNK_ID_PREFIX};
 
-use crate::store::{Project, Store, StoreError};
-use crate::types::{Chunk, ChunkId};
+use crate::store::{ChunkLookup, Project, Store, StoreError};
+use crate::types::Chunk;
 
 /// Context lines applied when the request does not say.
 pub const DEFAULT_CONTEXT_LINES: u32 = 20;
@@ -26,21 +31,85 @@ pub const DEFAULT_CONTEXT_LINES: u32 = 20;
 /// past a couple hundred lines the caller should ask for the file.
 pub const MAX_CONTEXT_LINES: u32 = 200;
 
-/// `Ok(None)` means the chunk id is unknown in this project.
+/// How many colliding ids an ambiguous prefix reports. Enough to pick from,
+/// few enough that an error message stays an error message.
+pub const MAX_PREFIX_CANDIDATES: usize = 8;
+
+/// Why a chunk could not be read. Every variant's `Display` ends in the thing
+/// the caller should do next, because these all reach an agent verbatim.
+#[derive(Debug, thiserror::Error)]
+pub enum ExpandError {
+    #[error(
+        "`{prefix}` is not a chunk id: chunk ids are hexadecimal; pass the chunk_id from a search result"
+    )]
+    NotHex { prefix: String },
+    #[error(
+        "chunk id prefix `{prefix}` is too short: expand needs at least {MIN_CHUNK_ID_PREFIX} \
+         hexadecimal characters; pass the chunk_id from a search result"
+    )]
+    TooShort { prefix: String },
+    #[error(
+        "chunk id prefix `{prefix}` matches several chunks in `{project}`: {}; pass one of \
+         them in full", candidates.join(", ")
+    )]
+    Ambiguous {
+        prefix: String,
+        project: String,
+        candidates: Vec<String>,
+    },
+    #[error(
+        "unknown chunk `{prefix}` in project `{project}`; chunk ids change when the file \
+         changes, so run search again to get a current one"
+    )]
+    Unknown { prefix: String, project: String },
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+/// Read a chunk named by a full id or by any prefix of at least
+/// [`MIN_CHUNK_ID_PREFIX`] characters.
+///
+/// Disambiguation is scoped to the request's project, which is what makes a
+/// short prefix workable at all: the collision space is one repository's
+/// chunks, not the machine's.
 pub fn execute(
     store: &mut Store,
     project: &Project,
     chunk_id: &str,
     context_lines: Option<u32>,
-) -> Result<Option<ExpandResponse>, StoreError> {
-    let Some(chunk) = store.get_chunk(project.id, &ChunkId(chunk_id.to_string()))? else {
-        return Ok(None);
+) -> Result<ExpandResponse, ExpandError> {
+    // Lowercased rather than refused: ids are printed lowercase, and a
+    // capitalized paste is a copy artifact, not a different chunk.
+    let prefix = chunk_id.trim().to_ascii_lowercase();
+    if !prefix.chars().all(|c| c.is_ascii_hexdigit()) || prefix.is_empty() {
+        return Err(ExpandError::NotHex { prefix });
+    }
+    if prefix.len() < MIN_CHUNK_ID_PREFIX {
+        return Err(ExpandError::TooShort { prefix });
+    }
+
+    let chunk = match store.find_chunk_by_prefix(project.id, &prefix, MAX_PREFIX_CANDIDATES)? {
+        ChunkLookup::Found(chunk) => *chunk,
+        ChunkLookup::Unknown => {
+            return Err(ExpandError::Unknown {
+                prefix,
+                project: project.name.clone(),
+            });
+        }
+        ChunkLookup::Ambiguous(candidates) => {
+            return Err(ExpandError::Ambiguous {
+                prefix,
+                project: project.name.clone(),
+                candidates,
+            });
+        }
     };
+
     let context = context_lines
         .unwrap_or(DEFAULT_CONTEXT_LINES)
         .min(MAX_CONTEXT_LINES);
     let absolute = project.root.join(&chunk.path);
-    Ok(Some(widen(&chunk, &absolute, context)))
+    Ok(widen(&chunk, &absolute, context))
 }
 
 fn widen(chunk: &Chunk, absolute: &Utf8Path, context: u32) -> ExpandResponse {

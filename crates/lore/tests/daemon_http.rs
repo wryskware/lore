@@ -806,7 +806,137 @@ async fn expand_rejects_unknown_projects_and_unknown_chunks() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert!(body["message"].as_str().unwrap().contains("chunk"));
+    let message = body["message"].as_str().unwrap();
+    assert!(message.contains("chunk"), "{message}");
+    // The remedy for a stale id is a fresh search, and only the message can
+    // say so — nothing else tells the caller ids move when files change.
+    assert!(message.contains("search again"), "{message}");
+}
+
+/// Issue #7: search prints a shortened id, so `expand` has to accept one.
+/// The prefix is resolved *within the request's project*, which is what keeps
+/// twelve characters comfortable.
+#[tokio::test]
+async fn expand_accepts_the_shortened_id_search_actually_prints() {
+    let h = harness();
+    h.fixture
+        .write("notes.md", "# Heading\n\nA line about ranking.\n");
+    full_scan(&h.fixture.context(), &h.fixture.project);
+
+    let (_, search) = search(&h.router, json!({ "query": "ranking" })).await;
+    let chunk_id = search["results"][0]["chunk_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(chunk_id.len(), 64, "the wire still carries the whole id");
+
+    // Twelve characters — what the renderers print — and eight, the floor.
+    for prefix in [&chunk_id[..12], &chunk_id[..8], chunk_id.as_str()] {
+        let (status, body) = post(
+            &h.router,
+            "/v1/expand",
+            json!({ "project": "demo", "chunk_id": prefix }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{prefix} -> {body:#}");
+        assert_eq!(body["path"], "notes.md");
+    }
+
+    // Upper case is a copy artifact, not a different chunk.
+    let (status, body) = post(
+        &h.router,
+        "/v1/expand",
+        json!({ "project": "demo", "chunk_id": chunk_id[..12].to_uppercase() }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+}
+
+#[tokio::test]
+async fn expand_refuses_a_prefix_too_short_to_mean_anything() {
+    let h = harness();
+    for (given, expected) in [
+        ("abc123", "at least 8"),
+        ("zzzzzzzzzz", "hexadecimal"),
+        ("", "hexadecimal"),
+    ] {
+        let (status, body) = post(
+            &h.router,
+            "/v1/expand",
+            json!({ "project": "demo", "chunk_id": given }),
+        )
+        .await;
+        // A 400, not a 404: nothing was looked up, because the argument could
+        // not be one.
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{given} -> {body:#}");
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains(expected), "{given} -> {message}");
+        assert!(message.contains("search result"), "{given} -> {message}");
+    }
+}
+
+/// Two chunks sharing an id prefix cannot be produced by hashing, so they are
+/// written straight into the store. The point is that an ambiguous prefix is
+/// answered with the candidates rather than with whichever row sorted first.
+#[tokio::test]
+async fn an_ambiguous_prefix_names_the_candidates_instead_of_guessing() {
+    use lore::types::{Chunk, ChunkId, ChunkKind};
+
+    let h = harness();
+    let project = h.fixture.project.id;
+    let chunk = |id: &str, text: &str| {
+        let path = camino::Utf8PathBuf::from("twins.rs");
+        let kind = ChunkKind::Code {
+            symbol_kind: "function".into(),
+            symbol_path: text.into(),
+            window: None,
+        };
+        Chunk {
+            id: ChunkId(id.into()),
+            path,
+            kind,
+            language: Some("rust".into()),
+            byte_start: 0,
+            byte_end: text.len() as u32,
+            line_start: 1,
+            line_end: 1,
+            text: text.into(),
+            vault: None,
+        }
+    };
+    let twins = [
+        chunk("dead1234aaaaaaaa", "fn a() {}"),
+        chunk("dead1234bbbbbbbb", "fn b() {}"),
+    ];
+    h.fixture
+        .store
+        .blocking(move |store| {
+            store.replace_file_chunks(project, camino::Utf8Path::new("twins.rs"), "h", &twins)
+        })
+        .expect("write colliding chunks");
+
+    let (status, body) = post(
+        &h.router,
+        "/v1/expand",
+        json!({ "project": "demo", "chunk_id": "dead1234" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:#}");
+    let message = body["message"].as_str().unwrap();
+    assert!(message.contains("dead1234aaaaaaaa"), "{message}");
+    assert!(message.contains("dead1234bbbbbbbb"), "{message}");
+    assert!(message.contains("in full"), "{message}");
+
+    // One more character is all it takes, and that is the remedy the message
+    // names rather than describes.
+    let (status, body) = post(
+        &h.router,
+        "/v1/expand",
+        json!({ "project": "demo", "chunk_id": "dead1234b" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    assert_eq!(body["path"], "twins.rs");
 }
 
 // ---------------------------------------------------------------------------

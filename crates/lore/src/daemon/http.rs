@@ -667,13 +667,16 @@ async fn expand_route(
         .store
         .with(move |store| expand::execute(store, &project, &chunk_id, context_lines))
         .await
-        .map_err(|err| ApiErr::internal("expand", err))?
         .map_err(|err| ApiErr::internal("expand", err))?;
     state.latency.record("expand", started.elapsed());
 
-    found
-        .map(Json)
-        .ok_or_else(|| ApiErr::not_found(format!("unknown chunk `{}`", request.chunk_id)))
+    // The id the caller sent is theirs to fix in three of these four cases,
+    // and each message already says how; only a store failure is ours.
+    found.map(Json).map_err(|err| match err {
+        expand::ExpandError::Unknown { .. } => ApiErr::not_found(err.to_string()),
+        expand::ExpandError::Store(err) => ApiErr::internal("expand", err),
+        err => ApiErr::bad_request(err.to_string()),
+    })
 }
 
 async fn projects_of(state: &AppState) -> Result<Vec<Project>, ApiErr> {

@@ -19,6 +19,16 @@ pub mod discovery;
 /// API version negotiated on every request; bump on breaking changes.
 pub const API_VERSION: u32 = 1;
 
+/// Shortest chunk-id prefix [`ExpandRequest::chunk_id`] will resolve.
+///
+/// Eight hex characters is 32 bits. Within the one project an `expand` is
+/// scoped to — tens of thousands of chunks, not the whole machine — that is a
+/// collision probability small enough that a prefix is a handle rather than a
+/// gamble, and an ambiguous one is answered with the candidates rather than a
+/// guess. It is also short enough to type from a terminal, which is the only
+/// reason to accept anything below what `search` actually prints.
+pub const MIN_CHUNK_ID_PREFIX: usize = 8;
+
 /// Error body for non-2xx responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiError {
@@ -281,6 +291,10 @@ pub struct SearchResponse {
 /// One ranked chunk with provenance and authority at a glance (4.1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
+    /// Full content-addressed chunk id. The wire always carries it whole;
+    /// shortening for display is a renderer's decision, and `expand` accepts
+    /// any prefix of at least [`MIN_CHUNK_ID_PREFIX`] characters so a
+    /// shortened one still round-trips.
     pub chunk_id: String,
     /// Project display name — for humans and log lines only. It is not
     /// guaranteed unique across daemons that predate name enforcement, which
@@ -351,6 +365,11 @@ pub struct ExpandRequest {
     /// precedence over [`Self::project`] when both are given.
     #[serde(default)]
     pub project_key: Option<String>,
+    /// The chunk to read, as a full id **or any prefix of it** of at least
+    /// [`MIN_CHUNK_ID_PREFIX`] hex characters — renderers print a shortened id
+    /// to keep the search surface token-lean, and it is meant to be passed
+    /// straight back. A prefix matching more than one chunk in the scoped
+    /// project is a 400 listing the candidates, never a guess.
     pub chunk_id: String,
     /// Extra context lines around the chunk (daemon default/clamp applies).
     pub context_lines: Option<u32>,

@@ -144,7 +144,12 @@ pub struct ExpandParams {
                        is given, and ambiguous if two indexed projects share a name."
     )]
     pub project: Option<String>,
-    #[schemars(description = "chunk_id from the search result you want to read.")]
+    #[schemars(
+        description = "chunk_id from the search result you want to read. Search prints a \
+                       shortened id; pass it exactly as shown - any prefix of at least 8 \
+                       hexadecimal characters resolves, and an ambiguous one is answered with \
+                       the candidates."
+    )]
     pub chunk_id: String,
     #[schemars(
         description = "Extra lines of context on each side of the chunk. The daemon applies \
