@@ -297,6 +297,11 @@ fn prefix_upper_bound(prefix: &str) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmbeddingFingerprint {
     pub model_id: String,
+    /// Vector width this space produces: the configured `dimensions` when the
+    /// config declares one, otherwise the width the endpoint was first
+    /// observed to answer with. `0` only in a record written before the
+    /// observed width was folded in — see [`Store::embedding_widths`], which
+    /// is how such a record is adopted rather than re-embedded.
     pub dimensions: u32,
     pub query_prefix: String,
     pub document_prefix: String,
@@ -1380,6 +1385,28 @@ impl Store {
             params![serde_json::to_string(fp)?],
         )?;
         Ok(())
+    }
+
+    /// The distinct vector widths actually present, at most a handful.
+    ///
+    /// Empty means there are no vectors. More than one entry means the store
+    /// already holds mixed spaces, which is the corruption a fingerprint
+    /// exists to prevent — so a caller deciding whether an unwidthed
+    /// fingerprint may simply be adopted must treat that as "no".
+    ///
+    /// Deliberately not indexed and deliberately a scan: it is called only
+    /// when a fingerprint has *changed*, which is once per model change, not
+    /// once per pass.
+    pub fn embedding_widths(&self) -> Result<Vec<usize>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT dims FROM embeddings ORDER BY dims LIMIT 8")?;
+        let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        Ok(rows
+            .collect::<std::result::Result<Vec<i64>, _>>()?
+            .into_iter()
+            .map(|dims| dims as usize)
+            .collect())
     }
 
     /// Drop every stored vector. Leaves the fingerprint alone — the caller

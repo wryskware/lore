@@ -45,7 +45,7 @@ use crate::daemon::store_handle::StoreHandle;
 
 pub use client::{EmbedClient, EmbedError, EmbedSettings, RetryPolicy};
 pub use health::{Health, Ticket};
-pub use worker::{EmbedWorker, fingerprint};
+pub use worker::{EmbedWorker, fingerprint, fingerprint_of};
 
 /// Ceiling on embedding a *query*. Search is interactive: past this,
 /// lexical-only results now beat hybrid results later (D-0007's degradation is

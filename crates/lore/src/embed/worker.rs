@@ -5,8 +5,9 @@
 //!
 //! ```text
 //! start ─▶ reconcile fingerprint ─▶ ┌─▶ probe (backoff while unreachable)
-//!                                   │        │ ready
-//!                                   │        ▼
+//!                                   │        │ ready — and, when the config
+//!                                   │        │ declared no width, the
+//!                                   │        ▼ probed one is folded in
 //!                                   │      drain: chunks_missing_embeddings
 //!                                   │             → embed → upsert_embeddings
 //!                                   │        │ nothing left
@@ -138,6 +139,18 @@ pub const PAGE_ROWS: usize = 512;
 /// every vector on write, so cosine is a dot product thereafter.
 pub const NORMALIZATION: &str = "l2";
 
+/// What reconciling the stored embedding identity against the wanted one did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reconciled {
+    /// The stored identity already was the wanted one.
+    Unchanged,
+    /// The stored identity predates recording a vector width; the observed
+    /// width was written into it and the vectors kept.
+    AdoptedWidth,
+    /// A genuinely different space: this many vectors were discarded.
+    Cleared(usize),
+}
+
 /// What one drain pass ended on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Drained {
@@ -217,6 +230,9 @@ impl EmbedWorker {
     }
 
     pub async fn run(mut self) {
+        // Everything knowable from configuration alone, now. When the config
+        // declares no width, the rest of the identity is still checked here
+        // and the width is filled in by the first probe (see [`Self::probe`]).
         if let Err(err) = self.reconcile_fingerprint().await {
             tracing::error!(error = %err, "could not reconcile the embedding fingerprint; embed worker will not run");
             return;
@@ -265,6 +281,11 @@ impl EmbedWorker {
     }
 
     /// Probe the endpoint and publish the result. Returns readiness.
+    ///
+    /// A successful probe is also the only place the *observed* vector width
+    /// is available, so it is where a config that declares no `dimensions`
+    /// gets its fingerprint settled. Settling before publishing readiness
+    /// matters: nothing may embed into a space whose identity is still open.
     pub async fn probe(&self) -> bool {
         let ticket = self.health.ticket();
         match self.client.probe().await {
@@ -274,6 +295,13 @@ impl EmbedWorker {
                     endpoint = self.client.endpoint(),
                     "embedding probe ok"
                 );
+                if self.client.settings().dimensions.is_none()
+                    && let Err(err) = self.reconcile(Some(dims)).await
+                {
+                    tracing::error!(error = %err, "could not reconcile the embedding fingerprint against the probed width; not embedding");
+                    ticket.set_unreachable(self.client.endpoint(), err.to_string());
+                    return false;
+                }
                 ticket.set_ready(self.client.endpoint(), self.client.model());
                 true
             }
@@ -291,27 +319,63 @@ impl EmbedWorker {
     /// vectors from two different models in one index produce ranking that is
     /// wrong in a way nothing downstream can detect.
     pub async fn reconcile_fingerprint(&self) -> anyhow::Result<()> {
-        let want = fingerprint(self.client.settings());
+        self.reconcile(None).await
+    }
+
+    /// [`Self::reconcile_fingerprint`], with the width the endpoint was
+    /// observed to answer with when the config declares none.
+    ///
+    /// Learning a width that the stored identity does not have is *not*
+    /// destructive: those vectors came from this model id with these prefixes,
+    /// and if they are all the newly observed width, discarding them would buy
+    /// a full re-embed and no safety — the fingerprint that wrote them never
+    /// distinguished same-width models either. A store already holding several
+    /// widths is mixed, and takes the destructive path like any other
+    /// mismatch.
+    async fn reconcile(&self, probed: Option<usize>) -> anyhow::Result<()> {
+        let want = fingerprint_of(self.client.settings(), probed);
         let target = want.clone();
-        let cleared = self
+        let outcome = self
             .store
-            .with(move |store| -> crate::store::Result<Option<usize>> {
-                if store.embedding_fingerprint()?.as_ref() == Some(&target) {
-                    return Ok(None);
+            .with(move |store| -> crate::store::Result<Reconciled> {
+                let stored = store.embedding_fingerprint()?;
+                let matched = stored.as_ref().is_some_and(|fp| same_space(fp, &target));
+                let widthless = stored.as_ref().is_some_and(|fp| fp.dimensions == 0);
+
+                if matched && !(widthless && target.dimensions != 0) {
+                    // Same space, and nothing new to record about it. In
+                    // particular a widthless *target* never overwrites a
+                    // stored width: forgetting is not reconciling.
+                    return Ok(Reconciled::Unchanged);
+                }
+                if matched
+                    && store
+                        .embedding_widths()?
+                        .iter()
+                        .all(|width| *width == target.dimensions as usize)
+                {
+                    store.set_embedding_fingerprint(&target)?;
+                    return Ok(Reconciled::AdoptedWidth);
                 }
                 let cleared = store.clear_all_embeddings()?;
                 store.set_embedding_fingerprint(&target)?;
-                Ok(Some(cleared))
+                Ok(Reconciled::Cleared(cleared))
             })
             .await??;
 
-        if let Some(cleared) = cleared {
-            tracing::warn!(
+        match outcome {
+            Reconciled::Unchanged => {}
+            Reconciled::AdoptedWidth => tracing::info!(
+                model = %want.model_id,
+                dimensions = want.dimensions,
+                "the stored embedding identity never recorded a vector width; adopting the observed one, vectors kept"
+            ),
+            Reconciled::Cleared(cleared) => tracing::warn!(
                 model = %want.model_id,
                 dimensions = want.dimensions,
                 discarded_vectors = cleared,
                 "embedding fingerprint changed; every stored vector was discarded and will be re-embedded"
-            );
+            ),
         }
         Ok(())
     }
@@ -657,17 +721,56 @@ async fn store_vectors(
     }
 }
 
-/// The identity of the embedding space implied by configuration.
+/// The identity of the embedding space implied by configuration alone.
+///
+/// Only honest when the config declares `dimensions`; otherwise the width is
+/// unknown until something asks the endpoint, which is what
+/// [`fingerprint_of`] is for.
 pub fn fingerprint(settings: &super::client::EmbedSettings) -> EmbeddingFingerprint {
+    fingerprint_of(settings, None)
+}
+
+/// The identity of the embedding space, using `probed` as the width when the
+/// config declines to declare one.
+///
+/// A config that *does* declare `dimensions` is unaffected: the declaration
+/// wins, and a mismatch between it and what the endpoint returns is already a
+/// hard error in the client. The observed width matters for the config that
+/// says nothing — where model identity would otherwise rest on the model id
+/// alone, and a GGUF swapped behind the same name would mix two vector spaces
+/// silently (#9). It does not catch a *same-width* swap; nothing available
+/// locally does, and a fingerprint that is right about the cases it can see
+/// beats one that is right about none of them.
+pub fn fingerprint_of(
+    settings: &super::client::EmbedSettings,
+    probed: Option<usize>,
+) -> EmbeddingFingerprint {
     EmbeddingFingerprint {
         model_id: settings.model.clone(),
-        // 0 means "config did not declare a width"; the model id is then the
-        // only thing distinguishing two spaces, which is why changing models
-        // without declaring dimensions is still caught.
-        dimensions: settings.dimensions.unwrap_or(0),
+        // 0 only until something has observed a width: `reconcile` defers to
+        // the first successful probe rather than recording a zero.
+        dimensions: settings
+            .dimensions
+            .or(probed.map(|dims| dims as u32))
+            .unwrap_or(0),
         query_prefix: settings.query_prefix.clone(),
         document_prefix: settings.document_prefix.clone(),
         normalization: NORMALIZATION.to_string(),
         max_embed_bytes: settings.max_embed_bytes as u32,
     }
+}
+
+/// Do two identities describe the same embedding space?
+///
+/// Every field but the width must match exactly. The width is compared only
+/// when *both* records carry one: `0` means "nobody has observed a width yet",
+/// which is not evidence of a different space. Treating it as one would make
+/// every start before the first probe discard the whole index.
+fn same_space(stored: &EmbeddingFingerprint, want: &EmbeddingFingerprint) -> bool {
+    let widthless = |fp: &EmbeddingFingerprint| EmbeddingFingerprint {
+        dimensions: 0,
+        ..fp.clone()
+    };
+    widthless(stored) == widthless(want)
+        && (stored.dimensions == 0 || want.dimensions == 0 || stored.dimensions == want.dimensions)
 }

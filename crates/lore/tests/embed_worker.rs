@@ -7,10 +7,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use daemon_support::{Fixture, populate_standard_tree};
-use embed_support::{POISON, Reply, Stub, settings, until};
+use embed_support::{DIMS, POISON, Reply, Stub, settings, until};
 use lore::daemon::index::full_scan;
 use lore::embed::worker::Drained;
-use lore::embed::{EmbedSettings, Embedder, fingerprint};
+use lore::embed::{EmbedSettings, Embedder, fingerprint_of};
 use lore::store::EmbeddingFingerprint;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -797,14 +797,27 @@ async fn a_changed_fingerprint_discards_every_stored_vector() {
     worker.drain().await;
     let (chunks, embedded) = rig.counts();
     assert_eq!(embedded, chunks);
+    // The stub declares no `dimensions`, so the identity carries the width the
+    // probe observed — not the `0` that would leave model id alone to tell two
+    // spaces apart (#9).
     assert_eq!(
         rig.stored_fingerprint().as_ref(),
-        Some(&fingerprint(rig.embedder.client().unwrap().settings()))
+        Some(&fingerprint_of(
+            rig.embedder.client().unwrap().settings(),
+            Some(DIMS)
+        ))
     );
 
-    // Same configuration ⇒ the vectors survive.
+    // Same configuration ⇒ the vectors survive. Including through a reconcile
+    // that has not probed yet: an unobserved width must not read as a changed
+    // one, or every start before the first probe would empty the index.
     worker.reconcile_fingerprint().await.unwrap();
     assert_eq!(rig.counts().1, embedded, "an unchanged space keeps vectors");
+    assert_eq!(
+        rig.stored_fingerprint().unwrap().dimensions as usize,
+        DIMS,
+        "and the recorded width is not forgotten"
+    );
 
     // A different prefix is a different embedding space, so every vector goes.
     let mut changed = settings(&rig.stub.base);
@@ -825,6 +838,90 @@ async fn a_changed_fingerprint_discards_every_stored_vector() {
         .expect("a new identity was recorded");
     assert_eq!(stored.query_prefix, "query: ");
     assert_eq!(stored.normalization, "l2");
+    rig.stub.shutdown().await;
+}
+
+/// Issue #9: with no `dimensions` in the config, model identity used to rest
+/// on the model id alone — so a GGUF swapped in behind the same name mixed two
+/// vector spaces in one index, silently. The probed width is folded into the
+/// fingerprint, which makes the swap visible whenever it changes the width.
+#[tokio::test]
+async fn a_model_swapped_behind_the_same_name_is_caught_by_its_width() {
+    let rig = Rig::new("demo").await;
+    populate_standard_tree(&rig.fixture);
+    full_scan(&rig.fixture.context(), &rig.fixture.project);
+    assert!(
+        rig.embedder
+            .client()
+            .unwrap()
+            .settings()
+            .dimensions
+            .is_none(),
+        "this is the undeclared-width case"
+    );
+
+    let mut worker = rig.worker();
+    worker.reconcile_fingerprint().await.unwrap();
+    assert!(worker.probe().await);
+    worker.drain().await;
+    let (chunks, embedded) = rig.counts();
+    assert_eq!(embedded, chunks);
+    assert_eq!(rig.stored_fingerprint().unwrap().dimensions as usize, DIMS);
+
+    // Same endpoint, same model id, different weights: the next probe answers
+    // with a wider vector. Nothing else about the configuration moved.
+    rig.stub
+        .state
+        .script([Reply::Vectors(vec![vec![0.5; DIMS * 2]])]);
+    assert!(worker.probe().await);
+
+    assert_eq!(
+        rig.counts(),
+        (chunks, 0),
+        "vectors from the old space must not survive the swap"
+    );
+    assert_eq!(
+        rig.stored_fingerprint().unwrap().dimensions as usize,
+        DIMS * 2
+    );
+    rig.stub.shutdown().await;
+}
+
+/// The upgrade path for a store embedded before widths were recorded: its
+/// fingerprint says `dimensions: 0`, its vectors are all one width, and the
+/// only honest reading of that is "this is the same space, now described
+/// properly". Re-embedding a whole corpus to learn nothing would be a tax on
+/// every existing user.
+#[tokio::test]
+async fn a_stored_identity_with_no_width_adopts_the_probed_one_and_keeps_its_vectors() {
+    let rig = Rig::new("demo").await;
+    populate_standard_tree(&rig.fixture);
+    full_scan(&rig.fixture.context(), &rig.fixture.project);
+
+    let mut worker = rig.worker();
+    worker.reconcile_fingerprint().await.unwrap();
+    assert!(worker.probe().await);
+    worker.drain().await;
+    let (chunks, embedded) = rig.counts();
+    assert_eq!(embedded, chunks);
+
+    // Rewind the stored identity to what a pre-#9 daemon would have written.
+    let legacy = EmbeddingFingerprint {
+        dimensions: 0,
+        ..rig.stored_fingerprint().unwrap()
+    };
+    rig.fixture
+        .store
+        .blocking(|store| store.set_embedding_fingerprint(&legacy))
+        .unwrap();
+
+    assert!(worker.probe().await);
+    assert_eq!(
+        rig.counts(),
+        (chunks, embedded),
+        "an identity that merely gained a width keeps its vectors"
+    );
+    assert_eq!(rig.stored_fingerprint().unwrap().dimensions as usize, DIMS);
     rig.stub.shutdown().await;
 }
 
