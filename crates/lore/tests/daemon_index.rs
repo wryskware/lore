@@ -200,12 +200,22 @@ fn deleted_files_are_pruned_by_the_next_scan() {
     let fixture = Fixture::new("demo");
     populate_standard_tree(&fixture);
     full_scan(&fixture.context(), &fixture.project);
+    let chunks_before = fixture.chunk_count();
 
     fixture.remove("README.md");
     let summary = full_scan(&fixture.context(), &fixture.project);
 
     assert_eq!(summary.removed, 1);
     assert_eq!(fixture.indexed_paths(), ["docs/design.md", "src/lib.rs"]);
+    // Issue #9: a prune deletes chunks, and the summary used to report zero of
+    // them because only `replace_file_chunks` was counted. The index has to
+    // have shrunk by exactly what the pass says it deleted.
+    assert!(summary.chunks_deleted > 0, "{summary:?}");
+    assert_eq!(
+        fixture.chunk_count() + summary.chunks_deleted as u64,
+        chunks_before,
+        "{summary:?}"
+    );
 }
 
 /// A source file replaced by a binary blob (a build step clobbering it, a bad

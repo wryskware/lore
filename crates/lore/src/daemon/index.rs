@@ -595,11 +595,15 @@ fn remove_one(ctx: &IndexContext, project: &Project, rel: &Utf8Path, summary: &m
         .store
         .blocking(|store| store.remove_file(project.id, rel))
     {
-        Ok(true) => {
-            tracing::debug!(project = %project.name, path = %rel, "removed file from index");
+        Ok(Some(chunks)) => {
+            tracing::debug!(project = %project.name, path = %rel, chunks, "removed file from index");
             summary.removed += 1;
+            // Deletions through this path are chunk deletions too. Counting
+            // only the ones `replace_file_chunks` reports made a prune look
+            // like it touched nothing (issue #9: removed=19, deleted=0).
+            summary.chunks_deleted += chunks;
         }
-        Ok(false) => {}
+        Ok(None) => {}
         Err(err) => {
             log_store_error(project, rel, &err);
             summary.errors += 1;

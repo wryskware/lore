@@ -450,9 +450,12 @@ fn remove_file_cascades_chunks_fts_and_embeddings() {
         }])
         .unwrap();
 
-    assert!(store.remove_file(proj, p("src/lib.rs")).unwrap());
-    assert!(
-        !store.remove_file(proj, p("src/lib.rs")).unwrap(),
+    // The chunk count comes back with the removal: it is what the index
+    // pass reports as `chunks_deleted`, and nothing else can tell it.
+    assert_eq!(store.remove_file(proj, p("src/lib.rs")).unwrap(), Some(1));
+    assert_eq!(
+        store.remove_file(proj, p("src/lib.rs")).unwrap(),
+        None,
         "second removal is a no-op"
     );
 

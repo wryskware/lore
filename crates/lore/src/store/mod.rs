@@ -969,11 +969,17 @@ impl Store {
 
     /// Forget a file entirely: chunks, FTS rows and embeddings go with it.
     /// Returns whether the file was known.
-    pub fn remove_file(&mut self, project: ProjectId, path: &Utf8Path) -> Result<bool> {
+    /// `Ok(None)` when the file was not indexed here; `Ok(Some(n))` when it
+    /// was, carrying the chunks that went with it.
+    ///
+    /// The count is returned rather than discarded because a pass that removes
+    /// files is deleting chunks, and a summary reporting `removed = 19,
+    /// chunks_deleted = 0` describes a different pass than the one that ran.
+    pub fn remove_file(&mut self, project: ProjectId, path: &Utf8Path) -> Result<Option<usize>> {
         let tx = self.conn.transaction()?;
         // Explicit chunk delete (rather than relying on the files FK cascade)
         // so the FTS triggers fire on a plain DELETE statement.
-        tx.execute(
+        let chunks = tx.execute(
             "DELETE FROM chunks WHERE project_id = ? AND path = ?",
             params![project, path.as_str()],
         )?;
@@ -982,7 +988,7 @@ impl Store {
             params![project, path.as_str()],
         )?;
         tx.commit()?;
-        Ok(removed > 0)
+        Ok((removed > 0).then_some(chunks))
     }
 
     // ---- generation / status ---------------------------------------------
