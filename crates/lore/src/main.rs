@@ -18,7 +18,22 @@ enum Command {
     /// Run the daemon in the foreground.
     Daemon,
     /// Register a project directory with the daemon.
-    Add { path: String },
+    ///
+    /// The name is written into the project's `.lore.toml` so it follows the
+    /// repo; an existing one there is never rewritten.
+    Add {
+        /// Project directory. Defaults to the current directory.
+        path: Option<String>,
+        /// Name to register under. Defaults to the name in the project's
+        /// `.lore.toml`, then to the directory's own name.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Deregister a project and drop its index.
+    Remove {
+        /// Project name or key, as `lore status` reports it.
+        project: String,
+    },
     /// Write a project's `.loreignore` from the ecosystems it looks like.
     ///
     /// Never overwrites an existing one, and needs no running daemon.
@@ -48,7 +63,8 @@ fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
     match args.command {
         Command::Daemon => daemon(),
-        Command::Add { path } => cli::run(cli::add(path)),
+        Command::Add { path, name } => cli::run(cli::add(path, name)),
+        Command::Remove { project } => cli::run(cli::remove(project)),
         Command::Init { path } => cli::init(path),
         Command::Index { project } => cli::run(cli::index(project)),
         Command::Status { json, project } => cli::run(cli::status(json, project)),
