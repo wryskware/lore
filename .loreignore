@@ -1,0 +1,14 @@
+# .loreignore — what Lore does not index in this project.
+#
+# gitignore syntax: one pattern per line, a trailing `/` matches directories
+# only, and `!pattern` re-includes something an earlier rule (or .gitignore)
+# excluded. Patterns are unanchored, so `Library/` matches at any depth.
+#
+# Lore generated this file once, from the markers it found below, and will
+# never rewrite or extend it. It is yours now — edit it freely.
+#
+# An empty file means "index everything the VCS rules allow": Lore falls back
+# to its own built-in exclusions only while this file does not exist.
+
+# Rust (Cargo.toml)
+target/
