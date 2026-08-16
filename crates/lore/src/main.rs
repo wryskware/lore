@@ -91,10 +91,21 @@ fn daemon() -> anyhow::Result<()> {
         .init();
 
     let data_dir = lore::daemon::data_dir()?;
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(lore::daemon::run(lore::daemon::DaemonOptions::new(
-            data_dir,
-        )))
+        .build()?;
+    let result = runtime.block_on(lore::daemon::run(lore::daemon::DaemonOptions::new(
+        data_dir,
+    )));
+
+    // Dropping the runtime would wait *unboundedly* for in-flight blocking
+    // work — a startup rescan hashing a multi-hundred-MB repo kept the process
+    // (and the store's ownership lock) alive for minutes after `run` had
+    // already withdrawn the handshake, so `lore stop` reported a daemon gone
+    // whose successor could not start. `run` already spent SHUTDOWN_GRACE on
+    // stragglers and logged that it is exiting anyway; this makes that true.
+    // SQLite's journaling makes dying mid-write safe, and the ownership lock
+    // ends with the process, which is what admission actually waits on.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    result
 }
