@@ -145,7 +145,15 @@ impl LoreServer {
 #[tool_router]
 impl LoreServer {
     #[tool(
-        description = "Hybrid lexical+semantic search over the code projects and design vaults \
+        description = "Your first tool for any \"where is X / how does Y work / what was \
+                       decided about Z\" question in an indexed project: one query replaces a \
+                       chain of exploratory greps and directory reads, and also surfaces \
+                       design-doc and decision context that grep cannot see. Prefer it \
+                       whenever you do not already know the exact file; fall back to grep only \
+                       for exhaustive literal sweeps (every occurrence of an exact string) - \
+                       and note that inconsistently-named concepts defeat literal grep but not \
+                       this search. \
+                       Hybrid lexical+semantic search over the code projects and design vaults \
                        indexed on this machine. Each hit carries provenance (file, line span, \
                        symbol path for code, heading path for Markdown), the status the \
                        document declares, and the authority Lore actually assigns it. Those \
