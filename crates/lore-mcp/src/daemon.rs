@@ -12,10 +12,11 @@
 //! gets to make (D-0007: the daemon is the single authoritative owner of index
 //! state); the failure path tells the agent to ask the user instead.
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use lore_core::discovery;
 use lore_core::{
-    ApiError, DaemonStatus, ExpandRequest, ExpandResponse, SearchRequest, SearchResponse,
+    ApiError, DaemonStatus, ExpandRequest, ExpandResponse, ProjectInfo, SearchRequest,
+    SearchResponse,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -128,6 +129,15 @@ pub enum DaemonError {
     #[error("the lore daemon rejected the request ({status}): {message}")]
     Api { status: u16, message: String },
 
+    /// Every tool call is scoped to one project and this process could not
+    /// work out which. The daemon's own remedy is relayed verbatim rather than
+    /// paraphrased, with the override appended: the agent cannot change its
+    /// working directory, so the escape hatch has to be named here.
+    #[error(
+        "lore could not tell which project this session belongs to: {0}. Set the LORE_PROJECT environment variable to a registered project name or key, or ask the user to run `lore add <path>` for this directory."
+    )]
+    Unscoped(String),
+
     #[error("the lore daemon returned a response this proxy could not parse: {0}")]
     Protocol(String),
 }
@@ -156,10 +166,47 @@ impl DaemonClient {
         self.post("expand", request).await
     }
 
-    pub async fn status(&self) -> Result<DaemonStatus, DaemonError> {
-        let url = format!("{}/status", self.endpoint.base_url()?);
+    /// `status` for one project. Never the machine-wide view: that is the
+    /// local-admin surface (`lore status`), and an agent enumerating every
+    /// project on the box is the leak scoping exists to close.
+    pub async fn status(&self, project: &str) -> Result<DaemonStatus, DaemonError> {
+        let url = format!(
+            "{}/status?project={}",
+            self.endpoint.base_url()?,
+            urlencode(project)
+        );
         let response = self.send(self.http.get(&url), &url).await?;
         decode(response).await
+    }
+
+    /// Which registered project contains `path` — the interim, local-only
+    /// scoping convenience (`GET /v1/resolve`).
+    pub async fn resolve(&self, path: &Utf8Path) -> Result<ProjectInfo, DaemonError> {
+        let url = format!(
+            "{}/resolve?path={}",
+            self.endpoint.base_url()?,
+            urlencode(path.as_str())
+        );
+        let response = self.send(self.http.get(&url), &url).await?;
+        decode(response).await
+    }
+
+    /// Normalize a name-or-key the user pinned via `LORE_PROJECT` into the
+    /// project it names. `status` is reused rather than given a lookup route of
+    /// its own: it already resolves all three spellings and already 404s with
+    /// the remedy.
+    pub async fn lookup(&self, project: &str) -> Result<ProjectInfo, DaemonError> {
+        let status = self.status(project).await?;
+        let found = status.projects.into_iter().next().ok_or_else(|| {
+            DaemonError::Protocol(format!("status scoped to `{project}` listed no project"))
+        })?;
+        Ok(ProjectInfo {
+            id: found.id,
+            name: found.name,
+            key: found.key,
+            root: found.root,
+            kind: found.kind,
+        })
     }
 
     async fn post<Q: Serialize, R: DeserializeOwned>(
@@ -189,6 +236,22 @@ impl DaemonClient {
             }
         })
     }
+}
+
+/// Minimal percent-encoding for a query value (RFC 3986 unreserved set).
+/// Project names and Windows paths both carry characters that would otherwise
+/// end the query string early.
+fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 /// Non-2xx bodies are `ApiError` JSON by contract; a body that is not is still

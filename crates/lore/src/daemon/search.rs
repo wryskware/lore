@@ -126,8 +126,14 @@ pub const AUTHORITY_DEPRECATED: f64 = 0.7;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SearchError {
-    #[error("unknown project `{0}`")]
+    #[error(
+        "unknown project `{0}`; name a registered project (see `lore status`), or register one with `lore add <path>`"
+    )]
     UnknownProject(String),
+    #[error(
+        "unknown project key `{0}`; name a registered project (see `lore status`), or register one with `lore add <path>`"
+    )]
+    UnknownProjectKey(String),
     #[error(
         "unknown design status `{0}` (expected exploration, leaning, decided, deprecated or unclassified)"
     )]
@@ -157,9 +163,17 @@ pub fn execute(
     let sources: HashMap<ProjectId, Project> = projects.iter().map(|p| (p.id, p.clone())).collect();
 
     let mut filter = SearchFilter::default();
-    if let Some(key) = &request.project {
-        let project = super::resolve_project(&projects, key)
-            .ok_or_else(|| SearchError::UnknownProject(key.clone()))?;
+    // Key first, exactly as `expand` resolves it: a client replaying a stale
+    // display name alongside a fresh key must not silently query the wrong
+    // source. The two resolvers stay separate so neither accepts the other's
+    // vocabulary (see `daemon::resolve_project_key`).
+    if let Some(key) = &request.project_key {
+        let project = super::resolve_project_key(&projects, key)
+            .ok_or_else(|| SearchError::UnknownProjectKey(key.clone()))?;
+        filter.project = Some(project.id);
+    } else if let Some(name) = &request.project {
+        let project = super::resolve_project(&projects, name)
+            .ok_or_else(|| SearchError::UnknownProject(name.clone()))?;
         filter.project = Some(project.id);
     }
     filter.path_prefix = request

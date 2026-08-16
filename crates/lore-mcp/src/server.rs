@@ -8,14 +8,33 @@
 //! Every tool is a proxy. This module parses arguments, calls one daemon route,
 //! renders the answer, and returns; it holds no index state and makes no
 //! ranking decisions of its own (D-0007).
+//!
+//! # Scoping is automatic and not negotiable
+//!
+//! Every query is scoped to exactly one project (the scoping resolution in
+//! `design/9_Scratch/2026-08-16_project-scoping-decision-brief.md`), and the
+//! agent does not choose it: the server resolves *its own* project once per
+//! process and sends it on every call. Cross-project search is therefore not
+//! reachable from here at all — the `project` parameter is gone rather than
+//! defaulted, because a parameter an agent can set is a parameter it will set.
+//!
+//! Resolution is the daemon's `GET /v1/resolve` against this process's working
+//! directory (an editor spawns the server inside the workspace it opened), and
+//! `LORE_PROJECT` overrides it entirely for the cases where that is not true.
+//! Both are interim: which mechanism finally names a project to a *remote*
+//! daemon is deliberately still open.
 
+use std::sync::Arc;
+
+use camino::Utf8PathBuf;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::Deserialize;
+use tokio::sync::OnceCell;
 
-use lore_core::{ExpandRequest, SearchRequest};
+use lore_core::{ExpandRequest, ProjectInfo, SearchRequest};
 
 use crate::daemon::{DaemonClient, DaemonError, Endpoint};
 use crate::render;
@@ -61,9 +80,6 @@ pub struct SearchParams {
                               work; the query is matched lexically and semantically."
     )]
     pub query: String,
-    #[schemars(description = "Restrict to one registered project, by name or id. \
-                              Omit to search everything indexed on this machine.")]
-    pub project: Option<String>,
     #[schemars(
         description = "Project-relative path prefix filter, forward slashes (e.g. \"design/\")."
     )]
@@ -81,11 +97,24 @@ pub struct SearchParams {
     pub limit: Option<u32>,
 }
 
+impl SearchParams {
+    /// The wire request, scoped to the project this server resolved. `project`
+    /// stays empty: the key is exact, and sending a display name alongside it
+    /// would only invite a client to trust the weaker of the two.
+    fn into_request(self, project_key: &str) -> SearchRequest {
+        SearchRequest {
+            project_key: Some(project_key.to_string()),
+            ..SearchRequest::from(self)
+        }
+    }
+}
+
 impl From<SearchParams> for SearchRequest {
     fn from(params: SearchParams) -> Self {
         SearchRequest {
             query: params.query,
-            project: params.project,
+            project: None,
+            project_key: None,
             path_prefix: params.path_prefix,
             language: params.language,
             status: params
@@ -127,18 +156,81 @@ pub struct ExpandParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct NoParams {}
 
+/// Environment variable that pins this server's project, by name or key.
+///
+/// Overrides working-directory resolution completely — it exists for the
+/// arrangements where the server's cwd is not the workspace (a globally
+/// configured MCP server, a launcher that starts it from `/`).
+pub const PROJECT_ENV: &str = "LORE_PROJECT";
+
 #[derive(Debug, Clone)]
 pub struct LoreServer {
     client: DaemonClient,
+    /// `LORE_PROJECT`, read once at construction. Held as a value rather than
+    /// read at use so the override is a property of the server a test can set,
+    /// not a property of the process a test has to mutate.
+    pinned: Option<String>,
+    /// Resolved lazily on the first tool call, then reused.
+    ///
+    /// Not resolved in `new`: the server is a long-lived stdio child that an
+    /// editor may start before the daemon exists, and a constructor that
+    /// needed a running daemon would turn "start them in the wrong order" into
+    /// a dead session. Only *success* is cached, so the first call after the
+    /// daemon appears still works.
+    scope: Arc<OnceCell<ProjectInfo>>,
     tool_router: ToolRouter<Self>,
 }
 
 impl LoreServer {
     pub fn new(endpoint: Endpoint) -> Self {
+        let pinned = std::env::var(PROJECT_ENV)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        Self::pinned_to(endpoint, pinned)
+    }
+
+    /// [`Self::new`] with the `LORE_PROJECT` override supplied directly.
+    pub fn pinned_to(endpoint: Endpoint, project: Option<String>) -> Self {
         Self {
             client: DaemonClient::new(endpoint),
+            pinned: project,
+            scope: Arc::new(OnceCell::new()),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// The one project every call in this process is scoped to.
+    async fn scope(&self) -> Result<&ProjectInfo, DaemonError> {
+        self.scope
+            .get_or_try_init(|| async {
+                match &self.pinned {
+                    Some(pinned) => self.client.lookup(pinned).await,
+                    None => {
+                        let cwd = std::env::current_dir()
+                            .map_err(|err| DaemonError::Unscoped(err.to_string()))
+                            .and_then(|cwd| {
+                                Utf8PathBuf::from_path_buf(cwd).map_err(|path| {
+                                    DaemonError::Unscoped(format!(
+                                        "the working directory is not valid UTF-8: {}",
+                                        path.display()
+                                    ))
+                                })
+                            })?;
+                        self.client.resolve(&cwd).await.map_err(|err| match err {
+                            // The daemon's remedy is the useful half; it is
+                            // relayed inside a message that also names the
+                            // override, which the daemon cannot know about.
+                            DaemonError::Api {
+                                status: 404,
+                                message,
+                            } => DaemonError::Unscoped(message),
+                            other => other,
+                        })
+                    }
+                }
+            })
+            .await
     }
 }
 
@@ -153,8 +245,10 @@ impl LoreServer {
                        for exhaustive literal sweeps (every occurrence of an exact string) - \
                        and note that inconsistently-named concepts defeat literal grep but not \
                        this search. \
-                       Hybrid lexical+semantic search over the code projects and design vaults \
-                       indexed on this machine. Each hit carries provenance (file, line span, \
+                       Hybrid lexical+semantic search over this session's project - the code and \
+                       design vault of the repository you are working in, scoped automatically, \
+                       with no way to reach another project. Each hit carries provenance (file, \
+                       line span, \
                        symbol path for code, heading path for Markdown), the status the \
                        document declares, and the authority Lore actually assigns it. Those \
                        differ on purpose: `decided` is honored only when the document cites a \
@@ -166,8 +260,12 @@ impl LoreServer {
                        project_key and chunk_id to read it."
     )]
     async fn search(&self, Parameters(params): Parameters<SearchParams>) -> CallToolResult {
+        let scope = match self.scope().await {
+            Ok(scope) => scope,
+            Err(err) => return failed(&err),
+        };
         let query = params.query.clone();
-        match self.client.search(&params.into()).await {
+        match self.client.search(&params.into_request(&scope.key)).await {
             Ok(response) => text(render::search(&query, &response)),
             Err(err) => failed(&err),
         }
@@ -179,14 +277,25 @@ impl LoreServer {
                        not quote or edit code from a search result without expanding it first."
     )]
     async fn expand(&self, Parameters(params): Parameters<ExpandParams>) -> CallToolResult {
+        // The parameters stay: a hit carries its own `project_key`, and echoing
+        // it back is the exact round trip `search` documents. They are only
+        // *filled in* when the agent supplied neither, which is the common case
+        // now that there is only ever one project to expand from.
+        let mut project_key = params.project_key;
+        if project_key.is_none() && params.project.is_none() {
+            match self.scope().await {
+                Ok(scope) => project_key = Some(scope.key.clone()),
+                Err(err) => return failed(&err),
+            }
+        }
         let label = params
             .project
             .clone()
-            .or_else(|| params.project_key.clone())
+            .or_else(|| project_key.clone())
             .unwrap_or_default();
         let request = ExpandRequest {
             project: params.project.unwrap_or_default(),
-            project_key: params.project_key,
+            project_key,
             chunk_id: params.chunk_id,
             context_lines: params.context_lines,
         };
@@ -197,14 +306,18 @@ impl LoreServer {
     }
 
     #[tool(
-        description = "Index health: daemon version, index generation, every registered project \
-                       with its file/chunk/embedding coverage, and the embedding endpoint's \
-                       state. Check this when search comes back empty, stale, or lexical-only - \
-                       an unconfigured or unreachable embedding endpoint silently costs you \
-                       every semantic match."
+        description = "Index health for this session's project: daemon version, index \
+                       generation, the project's file/chunk/embedding coverage, and the \
+                       embedding endpoint's state. Check this when search comes back empty, \
+                       stale, or lexical-only - an unconfigured or unreachable embedding \
+                       endpoint silently costs you every semantic match."
     )]
     async fn status(&self, Parameters(_): Parameters<NoParams>) -> CallToolResult {
-        match self.client.status().await {
+        let scope = match self.scope().await {
+            Ok(scope) => scope,
+            Err(err) => return failed(&err),
+        };
+        match self.client.status(&scope.key).await {
             Ok(response) => text(render::status(&response)),
             Err(err) => failed(&err),
         }
@@ -233,13 +346,15 @@ impl ServerHandler for LoreServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("lore-mcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Lore indexes this machine's code projects and design vaults locally. Search it \
-                 before answering questions about this codebase or about past design decisions, \
-                 and prefer sources whose effective authority is `decided` over prose that \
-                 merely sounds confident - a document declaring itself decided has not earned \
-                 that unless Lore validated it against the project's decision ledger, and it \
-                 will say so when it did not. Registering projects and forcing a reindex are \
-                 deliberately not available here: ask the user to run `lore add <path>` or \
+                "Lore indexes this project's code and design vault locally. Search it before \
+                 answering questions about this codebase or about past design decisions, and \
+                 prefer sources whose effective authority is `decided` over prose that merely \
+                 sounds confident - a document declaring itself decided has not earned that \
+                 unless Lore validated it against the project's decision ledger, and it will \
+                 say so when it did not. Every tool here is scoped to the one project this \
+                 session is in; other projects on this machine are not reachable and asking \
+                 for them is not an option. Registering projects and forcing a reindex are \
+                 deliberately not available either: ask the user to run `lore add <path>` or \
                  `lore index`.",
             )
     }
@@ -253,16 +368,18 @@ mod tests {
     fn search_params_map_onto_the_wire_request_and_lower_status_filters() {
         let params = SearchParams {
             query: "chunk boundaries".into(),
-            project: Some("lore".into()),
             path_prefix: Some("design/".into()),
             language: Some("markdown".into()),
             status: Some(vec![StatusFilter::Decided, StatusFilter::Leaning]),
             limit: Some(5),
         };
-        let request: SearchRequest = params.into();
+        let request = params.into_request("lore-9a1c");
 
         assert_eq!(request.query, "chunk boundaries");
-        assert_eq!(request.project.as_deref(), Some("lore"));
+        // The scope is the server's, never the agent's: the key goes on the
+        // wire and the ambiguous display name is left empty.
+        assert_eq!(request.project_key.as_deref(), Some("lore-9a1c"));
+        assert_eq!(request.project, None);
         assert_eq!(request.path_prefix.as_deref(), Some("design/"));
         assert_eq!(request.language.as_deref(), Some("markdown"));
         assert_eq!(request.status, vec!["decided", "leaning"]);
@@ -275,7 +392,6 @@ mod tests {
         // deserialization error on a `#[serde(default)] Vec<String>` field.
         let request: SearchRequest = SearchParams {
             query: "q".into(),
-            project: None,
             path_prefix: None,
             language: None,
             status: None,

@@ -181,6 +181,7 @@ fn every_pre_existing_wire_field_survives_and_the_additions_are_the_specified_on
             actual: keys(&SearchRequest {
                 query: "ranking".into(),
                 project: Some("lore".into()),
+                project_key: Some("lore".into()),
                 path_prefix: None,
                 language: None,
                 status: vec!["decided".into()],
@@ -195,7 +196,12 @@ fn every_pre_existing_wire_field_survives_and_the_additions_are_the_specified_on
                 "query",
                 "status",
             ],
-            added: &["sources"],
+            // `project_key` mirrors `ExpandRequest`'s: additive in shape, even
+            // though the *semantics* of `project` tightened at the same time
+            // (a request naming neither is now refused). That tightening is
+            // not expressible as a field, which is why it is a self-describing
+            // 400 rather than an API_VERSION bump.
+            added: &["project_key", "sources"],
         },
     ];
 
@@ -279,6 +285,7 @@ fn a_response_from_a_daemon_that_predates_this_change_still_deserializes() {
     let old_request: SearchRequest =
         serde_json::from_value(json!({ "query": "ranking" })).expect("old request parses");
     assert_eq!(old_request.sources, None, "absent means every kind");
+    assert_eq!(old_request.project_key, None);
     assert!(old_request.status.is_empty());
 
     let old_expand: ExpandRequest =

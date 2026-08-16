@@ -12,12 +12,16 @@
 //! daemon is not there — the last being the case a proxy is most likely to get
 //! wrong.
 
+use std::sync::{Arc, Mutex};
+
+use axum::extract::Request;
+use axum::middleware::{self, Next};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use camino::Utf8PathBuf;
 use lore_core::{
-    DaemonStatus, EmbeddingStatus, ExpandResponse, ProjectStatus, SearchResponse, SearchResult,
-    WatchState,
+    DaemonStatus, EmbeddingStatus, ExpandResponse, ProjectInfo, ProjectStatus, SearchRequest,
+    SearchResponse, SearchResult, WatchState,
 };
 use lore_mcp::{Endpoint, LoreServer};
 use rmcp::ServiceExt;
@@ -28,21 +32,74 @@ use serde_json::{Value, json};
 // Stub daemon
 // ---------------------------------------------------------------------------
 
+/// What the stub was asked for, in order.
+///
+/// Scoping is invisible in the rendered output an agent reads — the whole point
+/// is that the agent never chooses it — so the only way to assert it is to
+/// watch what actually went over the wire.
+type Requests = Arc<Mutex<Vec<String>>>;
+
 /// Canned `/v1` responses, built from the real `lore_core` types so a change to
 /// the wire contract breaks this file at compile time rather than at snapshot
 /// time.
 async fn stub_daemon() -> String {
+    stub_daemon_recording().await.0
+}
+
+async fn stub_daemon_recording() -> (String, Requests) {
+    let seen: Requests = Arc::new(Mutex::new(Vec::new()));
     let app = Router::new()
-        .route("/v1/search", post(|| async { Json(canned_search()) }))
+        .route(
+            "/v1/search",
+            post({
+                let seen = seen.clone();
+                move |Json(request): Json<SearchRequest>| {
+                    let seen = seen.clone();
+                    async move {
+                        seen.lock().unwrap().push(format!(
+                            "search project_key={:?} project={:?}",
+                            request.project_key, request.project
+                        ));
+                        Json(canned_search())
+                    }
+                }
+            }),
+        )
         .route("/v1/expand", post(|| async { Json(canned_expand()) }))
-        .route("/v1/status", get(|| async { Json(canned_status()) }));
+        .route("/v1/status", get(|| async { Json(canned_status()) }))
+        // Every tool call resolves its project first now; without this route
+        // the stub would answer nothing at all.
+        .route("/v1/resolve", get(|| async { Json(canned_project()) }))
+        .layer(middleware::from_fn({
+            let seen = seen.clone();
+            move |request: Request, next: Next| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock()
+                        .unwrap()
+                        .push(format!("{} {}", request.method(), request.uri()));
+                    next.run(request).await
+                }
+            }
+        }));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    format!("http://{addr}/v1")
+    (format!("http://{addr}/v1"), seen)
+}
+
+/// What `/v1/resolve` hands back: the project this session is standing in.
+fn canned_project() -> ProjectInfo {
+    ProjectInfo {
+        id: 2,
+        name: "lore".into(),
+        key: "lore".into(),
+        root: r"C:\Users\wrysk\wryskware\lore".into(),
+        kind: "repo".into(),
+    }
 }
 
 /// Three shapes the renderer treats differently, in one response: a vault hit
@@ -272,13 +329,81 @@ async fn search_renders_vault_authority_and_a_truncated_code_hit() {
         "search",
         json!({
             "query": "how does expand work",
-            "project": "lore",
             "status": ["decided", "leaning"],
             "limit": 5
         }),
     )
     .await;
     insta::assert_snapshot!("search_vault_and_code", rendered);
+}
+
+/// The agent cannot ask for a project, so the server has to supply one — and
+/// it has to be the *key*, which identifies a source exactly where the display
+/// name only usually does. Asserted on the wire rather than in the rendering,
+/// because the agent never sees this happen.
+#[tokio::test]
+async fn every_tool_call_resolves_and_scopes_itself_without_being_asked() {
+    let (base, seen) = stub_daemon_recording().await;
+    let server = LoreServer::new(Endpoint::Fixed(base));
+
+    call_tool(server.clone(), "search", json!({ "query": "anything" })).await;
+    let requests = seen.lock().unwrap().clone();
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.starts_with("GET /v1/resolve?path=")),
+        "the server must resolve its own project: {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|r| r == r#"search project_key=Some("lore") project=None"#),
+        "the resolved key must reach the wire: {requests:?}"
+    );
+
+    // Resolution is cached: a second call does not re-resolve, and `status`
+    // asks for its own project rather than the machine-wide view.
+    seen.lock().unwrap().clear();
+    call_tool(server, "status", json!({})).await;
+    let requests = seen.lock().unwrap().clone();
+    assert!(
+        !requests.iter().any(|r| r.contains("/v1/resolve")),
+        "resolution should be cached per process: {requests:?}"
+    );
+    assert!(
+        requests.iter().any(|r| r == "GET /v1/status?project=lore"),
+        "status must be scoped, never machine-wide: {requests:?}"
+    );
+}
+
+/// `LORE_PROJECT` replaces working-directory resolution entirely — the escape
+/// hatch for a server whose cwd is not the workspace. It is normalized through
+/// `status`, so a name and a key both land on the same project key.
+#[tokio::test]
+async fn a_pinned_project_replaces_working_directory_resolution() {
+    let (base, seen) = stub_daemon_recording().await;
+    let server = LoreServer::pinned_to(Endpoint::Fixed(base), Some("lexomancy".into()));
+
+    call_tool(server, "search", json!({ "query": "anything" })).await;
+    let requests = seen.lock().unwrap().clone();
+    assert!(
+        !requests.iter().any(|r| r.contains("/v1/resolve")),
+        "a pinned project must not consult the working directory: {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|r| r == "GET /v1/status?project=lexomancy"),
+        "the pin is normalized through status: {requests:?}"
+    );
+    // The stub's status lists lexomancy first, so its key is what scopes the
+    // search — the pin named it, the daemon resolved it, the key travelled.
+    assert!(
+        requests
+            .iter()
+            .any(|r| r == r#"search project_key=Some("lexomancy") project=None"#),
+        "{requests:?}"
+    );
 }
 
 #[tokio::test]

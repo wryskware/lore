@@ -219,6 +219,23 @@ impl RepoAuthority {
 #[serde(default, deny_unknown_fields)]
 struct RepoConfigFile {
     authority: Option<AuthorityTable>,
+    project: Option<ProjectTable>,
+}
+
+/// The repository's committed project name, written by `lore add`.
+///
+/// It lives in the same file as `[authority]` but is **independent of it**:
+/// a `.lore.toml` containing only `[project]` declares no profile, so the repo
+/// still indexes exactly like one with no file at all. D-0012's optionality is
+/// not weakened by naming a repo, and naming a repo does not opt it into
+/// authority semantics.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectTable {
+    /// Absent is legal: the table may exist for keys this build does not yet
+    /// read. `lore add` then falls through to the root's basename.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -230,6 +247,56 @@ struct AuthorityTable {
     /// Absent means [`Behavior::Annotate`].
     #[serde(default)]
     behavior: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// [project].name — read client-side by `lore add`
+// ---------------------------------------------------------------------------
+
+/// What a repository's `.lore.toml` says about its own name.
+///
+/// Four states rather than `Option<String>`, because `lore add` has to write
+/// into this file and the three "no name" cases need different treatment: an
+/// absent file may be created, a file with no `[project]` table may have one
+/// appended, and a file that already has the table must not get a second one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeclaredName {
+    /// No `.lore.toml` at the registered root.
+    Absent,
+    /// A file Lore parsed that has no `[project]` table at all.
+    NoTable,
+    /// A `[project]` table that declares no usable name.
+    Unnamed,
+    /// The committed name, already trimmed.
+    Named(String),
+}
+
+/// Read `<root>/.lore.toml`'s `[project].name`.
+///
+/// Unlike [`RepoAuthority::load`] this *does* fail on a malformed file: the
+/// caller is about to write into it, and appending to a file Lore could not
+/// parse would corrupt whatever the user actually wrote.
+pub fn declared_name(root: &Utf8Path) -> anyhow::Result<DeclaredName> {
+    let path = root.join(REPO_CONFIG_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => parse_declared_name(&text)
+            .map_err(|message| anyhow::anyhow!("{path} {message}\nFix the file, then try again.")),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(DeclaredName::Absent),
+        Err(err) => Err(anyhow::Error::new(err).context(format!("reading {path}"))),
+    }
+}
+
+/// The parse half of [`declared_name`], over the file's text.
+pub fn parse_declared_name(text: &str) -> Result<DeclaredName, String> {
+    let file: RepoConfigFile = toml::from_str(text)
+        .map_err(|err| format!("is not valid Lore configuration: {}", err.message()))?;
+    Ok(match file.project {
+        None => DeclaredName::NoTable,
+        Some(project) => match project.name.as_deref().map(str::trim) {
+            Some(name) if !name.is_empty() => DeclaredName::Named(name.to_string()),
+            _ => DeclaredName::Unnamed,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -299,6 +366,104 @@ mod tests {
             assert!(!parsed.annotates() && !parsed.ranks(), "{text:?}");
             assert!(parsed.error.is_some(), "{text:?} must be visible");
         }
+    }
+
+    /// D-0012's optionality is canon, and naming a repo must not erode it: a
+    /// `.lore.toml` that says only what the project is *called* has to index
+    /// exactly like a repo with no file at all.
+    #[test]
+    fn a_project_only_file_is_as_neutral_as_no_file() {
+        for text in [
+            "[project]\nname = \"lore\"\n",
+            "[project]\n",
+            "# a comment\n[project]\nname = \"my design vault\"\n",
+        ] {
+            let parsed = RepoAuthority::parse(text);
+            assert_eq!(parsed, RepoAuthority::default(), "{text:?}");
+            assert_eq!(parsed.active(), None, "{text:?}");
+            assert!(!parsed.annotates() && !parsed.ranks(), "{text:?}");
+            assert_eq!(parsed.error, None, "{text:?} is not a config error");
+        }
+    }
+
+    #[test]
+    fn a_name_and_a_profile_coexist_without_either_changing_the_other() {
+        let both = RepoAuthority::parse(
+            "[project]\nname = \"lore\"\n\n[authority]\nprofile = \"lore-v1\"\nbehavior = \"rank\"\n",
+        );
+        assert_eq!(both.profile, Some(Profile::LoreV1));
+        assert!(both.annotates() && both.ranks());
+        assert_eq!(both.error, None);
+        // Order is irrelevant, as it is for any TOML document.
+        assert_eq!(
+            RepoAuthority::parse(
+                "[authority]\nprofile = \"lore-v1\"\nbehavior = \"rank\"\n\n[project]\nname = \"lore\"\n"
+            ),
+            both
+        );
+    }
+
+    /// Same strictness as everywhere else in this file: a misspelled key
+    /// presents as "the name mysteriously never took" unless it is refused.
+    #[test]
+    fn an_unknown_key_inside_project_is_a_visible_error() {
+        for text in [
+            "[project]\nnamme = \"lore\"\n",
+            "[project]\nname = \"lore\"\nkey = \"lore\"\n",
+        ] {
+            let parsed = RepoAuthority::parse(text);
+            assert_eq!(parsed.active(), None, "{text:?}");
+            assert!(parsed.error.is_some(), "{text:?} must be visible");
+            assert!(
+                parse_declared_name(text).is_err(),
+                "{text:?} must not be written into"
+            );
+        }
+    }
+
+    /// The four states `lore add` distinguishes, because each one calls for a
+    /// different edit to the file.
+    #[test]
+    fn declared_names_separate_absent_untabled_unnamed_and_named() {
+        assert_eq!(parse_declared_name(""), Ok(DeclaredName::NoTable));
+        assert_eq!(
+            parse_declared_name("[authority]\nprofile = \"lore-v1\"\n"),
+            Ok(DeclaredName::NoTable)
+        );
+        assert_eq!(
+            parse_declared_name("[project]\n"),
+            Ok(DeclaredName::Unnamed)
+        );
+        // Whitespace is absence, not a project named "   ".
+        assert_eq!(
+            parse_declared_name("[project]\nname = \"  \"\n"),
+            Ok(DeclaredName::Unnamed)
+        );
+        assert_eq!(
+            parse_declared_name("[project]\nname = \"  lore  \"\n"),
+            Ok(DeclaredName::Named("lore".into()))
+        );
+        assert!(parse_declared_name("[project\nname =").is_err());
+    }
+
+    #[test]
+    fn declared_name_reads_the_root_file_and_reports_absence_distinctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        assert_eq!(declared_name(&root).unwrap(), DeclaredName::Absent);
+
+        std::fs::write(root.join(REPO_CONFIG_FILE), "[project]\nname = \"lore\"\n").unwrap();
+        assert_eq!(
+            declared_name(&root).unwrap(),
+            DeclaredName::Named("lore".into())
+        );
+
+        // Unlike `RepoAuthority::load`, this one fails loudly: the caller is
+        // about to write into the file.
+        std::fs::write(root.join(REPO_CONFIG_FILE), "not toml at [all").unwrap();
+        let err = declared_name(&root).unwrap_err().to_string();
+        assert!(err.contains(REPO_CONFIG_FILE), "{err}");
+        assert!(err.contains("Fix the file"), "{err}");
     }
 
     #[test]

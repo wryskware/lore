@@ -198,6 +198,24 @@ pub struct ProjectList {
 }
 
 // ---------------------------------------------------------------------------
+// DELETE /v1/projects/{name-or-key}  (deregister — CLI-only, not exposed via MCP)
+// ---------------------------------------------------------------------------
+
+/// What deregistering a project actually destroyed. The counts are read
+/// *before* the delete, so the caller can be told the size of what it just
+/// discarded rather than a row of zeroes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoveProjectResponse {
+    pub project: ProjectInfo,
+    /// File records forgotten with the project.
+    #[serde(default)]
+    pub files: u64,
+    /// Chunks (and their FTS rows and vectors) forgotten with the project.
+    #[serde(default)]
+    pub chunks: u64,
+}
+
+// ---------------------------------------------------------------------------
 // POST /v1/index  (trigger a rescan/reindex)
 // ---------------------------------------------------------------------------
 
@@ -220,8 +238,18 @@ pub struct IndexResponse {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchRequest {
     pub query: String,
-    /// Restrict to one project by name or id.
+    /// Scope the query to one project by name or id. **Required**: a request
+    /// naming neither this nor [`Self::project_key`] is rejected, because
+    /// every query is scoped to exactly one project.
     pub project: Option<String>,
+    /// Stable opaque project key, as returned by
+    /// [`SearchResult::project_key`], [`ProjectInfo::key`] and
+    /// `GET /v1/resolve`. Takes precedence over [`Self::project`] when both
+    /// are given — the same rule [`ExpandRequest::project_key`] follows, and
+    /// for the same reason: the key identifies a source exactly where a
+    /// display name only usually does.
+    #[serde(default)]
+    pub project_key: Option<String>,
     /// Project-relative path prefix filter (forward slashes).
     pub path_prefix: Option<String>,
     /// Lowercase language tag filter ("csharp", "markdown", …).

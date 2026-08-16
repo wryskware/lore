@@ -93,6 +93,9 @@ async fn the_daemon_starts_serves_and_withdraws_its_handshake() {
             .post(format!("{base}/search"))
             .json(&lore_core::SearchRequest {
                 query: "findablekeyword".into(),
+                // Every query is scoped to one project now; this daemon has
+                // exactly one and the test is about indexing, not scoping.
+                project: Some("fixture".into()),
                 ..Default::default()
             })
             .send()
@@ -244,6 +247,7 @@ async fn registrations_and_index_state_survive_a_restart() {
                     .post(format!("{base}/search"))
                     .json(&lore_core::SearchRequest {
                         query,
+                        project: Some("fixture".into()),
                         ..Default::default()
                     })
                     .send()

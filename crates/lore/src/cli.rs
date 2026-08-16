@@ -28,10 +28,12 @@ use std::future::Future;
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use lore::daemon::ignorefile;
+use lore::repo_config::{self, DeclaredName};
 use lore_core::discovery;
 use lore_core::{
     DaemonStatus, EmbeddingStatus, ExpandResponse, IndexRequest, IndexResponse, ProjectInfo,
-    ProjectStatus, RegisterProjectRequest, SearchRequest, SearchResponse, SearchResult, WatchState,
+    ProjectStatus, RegisterProjectRequest, RemoveProjectResponse, SearchRequest, SearchResponse,
+    SearchResult, WatchState,
 };
 use serde::Serialize;
 
@@ -54,7 +56,8 @@ pub fn run<F: Future<Output = Result<()>>>(task: F) -> Result<()> {
 pub struct SearchArgs {
     /// What to look for. Natural language and literal identifiers both work.
     pub query: String,
-    /// Restrict to one registered project, by name or id.
+    /// Scope to one registered project, by name or id. Defaults to the project
+    /// containing the current directory.
     #[arg(long)]
     pub project: Option<String>,
     /// Project-relative path prefix filter, forward slashes.
@@ -84,6 +87,9 @@ impl From<&SearchArgs> for SearchRequest {
         SearchRequest {
             query: args.query.clone(),
             project: args.project.clone(),
+            // Filled in from `/v1/resolve` when `--project` was not given; see
+            // [`search`].
+            project_key: None,
             path_prefix: args.path_prefix.clone(),
             language: args.language.clone(),
             status: args.status.clone(),
@@ -93,27 +99,169 @@ impl From<&SearchArgs> for SearchRequest {
     }
 }
 
-/// `lore add <path>` — register a project root.
+/// `lore add [path] [--name <name>]` — register a project root under a name
+/// the repository commits.
 ///
 /// The path is made absolute against the current directory before it is sent,
 /// because a relative path means nothing to a daemon started from somewhere
 /// else. Canonicalization (symlinks, casing, `..`) stays the daemon's job: it
 /// is the one that has to decide whether two spellings are the same project.
-pub async fn add(path: String) -> Result<()> {
-    let root = absolute_utf8(&path)?;
+///
+/// Naming is the client's job, not the daemon's, and the file is written only
+/// *after* the daemon accepts the name — a `.lore.toml` naming a project that
+/// failed to register would be a lie committed into the repo.
+pub async fn add(path: Option<String>, name: Option<String>) -> Result<()> {
+    let root = absolute_utf8(path.as_deref().unwrap_or("."))?;
+    if !root.is_dir() {
+        bail!("not a directory: {root}");
+    }
+    let declared = repo_config::declared_name(&root)?;
+    let resolved = resolve_name(&root, name.as_deref(), &declared)?;
+
     let client = Client::connect()?;
     let body = client
         .post(
             "projects",
             &RegisterProjectRequest {
                 root: root.to_string(),
-                name: None,
+                name: Some(resolved.clone()),
             },
         )
         .await?;
     let project: ProjectInfo = parse(&body)?;
     println!("registered {} (key {})", project.name, project.key);
     println!("  {}", project.root);
+
+    match commit_name(&root, &resolved, &declared) {
+        Ok(note) => {
+            if let Some(note) = note {
+                println!("  {note}");
+            }
+        }
+        // The registration stands; only the repo's copy of the name is
+        // missing, and saying so is the difference between a user who re-runs
+        // one command and one who wonders why the name did not stick.
+        Err(err) => println!(
+            "  warning: registered, but {} could not be written: {err:#}",
+            root.join(repo_config::REPO_CONFIG_FILE)
+        ),
+    }
+    Ok(())
+}
+
+/// `--name` > the repo's committed `[project].name` > the root's basename.
+///
+/// A flag that contradicts a committed name is refused rather than applied:
+/// the file is the repo's own answer to "what is this project called", and
+/// silently registering under a different one would leave the two disagreeing
+/// with no sign of it.
+fn resolve_name(root: &Utf8Path, flag: Option<&str>, declared: &DeclaredName) -> Result<String> {
+    let name = match (flag.map(str::trim), declared) {
+        (Some(flag), DeclaredName::Named(existing)) if flag != existing => bail!(
+            "{path} already names this project `{existing}`, and lore will not rewrite it.\n\
+             Drop --name to register as `{existing}`, or edit {path} to rename the project.",
+            path = root.join(repo_config::REPO_CONFIG_FILE),
+        ),
+        (Some(flag), _) => flag.to_string(),
+        (None, DeclaredName::Named(existing)) => existing.clone(),
+        (None, _) => root
+            .file_name()
+            .ok_or_else(|| {
+                anyhow::anyhow!("cannot derive a project name from {root}; pass --name")
+            })?
+            .to_string(),
+    };
+    validate_name(&name)?;
+    Ok(name)
+}
+
+/// Names travel through URLs, TOML and log lines, and address a directory
+/// nobody should be able to escape from — but they are a human's label, so the
+/// rule is "nothing that breaks a downstream", not an identifier grammar.
+fn validate_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        bail!("a project name cannot be empty; pass --name <name>");
+    }
+    if name.contains(['/', '\\']) {
+        bail!("a project name cannot contain a path separator: `{name}`; pass --name <name>");
+    }
+    if name.chars().any(char::is_control) {
+        bail!("a project name cannot contain control characters; pass --name <name>");
+    }
+    Ok(())
+}
+
+/// Write the resolved name into the repo's `.lore.toml`, and say what happened
+/// when the answer is not simply "wrote it".
+///
+/// Appending is textual on purpose. Re-serializing the file through `toml`
+/// would round-trip a document Lore only partly understands, discarding the
+/// user's comments and key order to add one line.
+fn commit_name(root: &Utf8Path, name: &str, declared: &DeclaredName) -> Result<Option<String>> {
+    let path = root.join(repo_config::REPO_CONFIG_FILE);
+    let table = format!("[project]\nname = {}\n", toml_string(name));
+    match declared {
+        DeclaredName::Named(_) => Ok(None),
+        DeclaredName::Absent => {
+            std::fs::write(
+                &path,
+                format!(
+                    "# Lore project configuration, committed so the name follows this repo\n\
+                     # across machines and contributors. Edit it freely; lore only ever\n\
+                     # appends to it.\n{table}"
+                ),
+            )
+            .with_context(|| format!("writing {path}"))?;
+            Ok(Some(format!("wrote {path}")))
+        }
+        DeclaredName::NoTable => {
+            let existing =
+                std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
+            let separator = if existing.ends_with('\n') {
+                "\n"
+            } else {
+                "\n\n"
+            };
+            std::fs::write(&path, format!("{existing}{separator}{table}"))
+                .with_context(|| format!("writing {path}"))?;
+            Ok(Some(format!("named the project in {path}")))
+        }
+        // A second `[project]` table would make the file unparseable, and
+        // editing inside the existing one is the user's call, not ours.
+        DeclaredName::Unnamed => Ok(Some(format!(
+            "{path} has a [project] table with no `name`; add `name = {}` to it so the name \
+             follows this repo",
+            toml_string(name)
+        ))),
+    }
+}
+
+/// A TOML basic string. Names are permissive, so quoting them by hand is not
+/// safe; this is the one place the escaping has to be right.
+fn toml_string(value: &str) -> String {
+    toml::Value::String(value.to_string()).to_string()
+}
+
+/// `lore remove <name-or-key>` — deregister a project and drop its index.
+///
+/// The counterpart `lore add` never had: a stale worktree or bench copy stays
+/// registered forever otherwise, mixing its results into every query that
+/// resolves to a sibling.
+pub async fn remove(project: String) -> Result<()> {
+    let client = Client::connect()?;
+    let body = client
+        .delete(&format!("projects/{}", urlencode(&project)))
+        .await?;
+    let removed: RemoveProjectResponse = parse(&body)?;
+    println!(
+        "removed {} (key {})",
+        removed.project.name, removed.project.key
+    );
+    println!("  {}", removed.project.root);
+    println!(
+        "  dropped {} file(s) and {} chunk(s) from the index",
+        removed.files, removed.chunks
+    );
     Ok(())
 }
 
@@ -184,9 +332,20 @@ pub async fn status(json: bool, project: Option<String>) -> Result<()> {
 
 /// `lore search <query>` — the same query surface agents get over MCP, so a
 /// human can reproduce and debug exactly what an agent saw.
+///
+/// Every query is scoped to one project. `--project` says which; without it
+/// the daemon is asked which registered project contains the current directory
+/// — the interim, local-only convenience the scoping resolution sanctions (see
+/// `GET /v1/resolve`). The flag still wins, because the local CLI is the
+/// admin surface: a human may deliberately query a project they are not
+/// standing in, where an agent may not.
 pub async fn search(args: SearchArgs) -> Result<()> {
     let client = Client::connect()?;
-    let body = client.post("search", &SearchRequest::from(&args)).await?;
+    let mut request = SearchRequest::from(&args);
+    if request.project.is_none() {
+        request.project_key = Some(client.resolve_here().await?.key);
+    }
+    let body = client.post("search", &request).await?;
     if args.json {
         println!("{body}");
         return Ok(());
@@ -286,6 +445,26 @@ impl Client {
     async fn post<T: Serialize>(&self, route: &str, body: &T) -> Result<String> {
         let url = format!("{}/{route}", self.base_url);
         self.finish(self.http.post(&url).json(body), &url).await
+    }
+
+    async fn delete(&self, route: &str) -> Result<String> {
+        let url = format!("{}/{route}", self.base_url);
+        self.finish(self.http.delete(&url), &url).await
+    }
+
+    /// The registered project containing the current directory.
+    ///
+    /// The daemon's 404 already names the remedy (`lore add <path>`), so it is
+    /// relayed rather than restated — a second, differently-worded remedy for
+    /// the same condition is how the two drift apart.
+    async fn resolve_here(&self) -> Result<ProjectInfo> {
+        let cwd = std::env::current_dir().context("reading the current directory")?;
+        let cwd = Utf8PathBuf::from_path_buf(cwd)
+            .map_err(|path| anyhow::anyhow!("path is not valid UTF-8: {}", path.display()))?;
+        let body = self
+            .get(&format!("resolve?path={}", urlencode(cwd.as_str())))
+            .await?;
+        parse(&body)
     }
 
     /// Returns the raw body so `--json` can print exactly what the daemon said
@@ -727,6 +906,192 @@ mod tests {
         // Already-absolute input survives unchanged in shape.
         let absolute = absolute_utf8(resolved.as_str()).unwrap();
         assert_eq!(absolute, resolved);
+    }
+
+    // -- `lore add` naming --------------------------------------------------
+
+    /// A temp project root, plus the `.lore.toml` it ships (if any).
+    fn repo(config: Option<&str>) -> (tempfile::TempDir, Utf8PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf-8 tempdir");
+        if let Some(config) = config {
+            std::fs::write(root.join(repo_config::REPO_CONFIG_FILE), config).expect("write config");
+        }
+        (dir, root)
+    }
+
+    fn resolved(root: &Utf8Path, flag: Option<&str>) -> Result<String> {
+        resolve_name(root, flag, &repo_config::declared_name(root)?)
+    }
+
+    #[test]
+    fn the_flag_wins_then_the_committed_name_then_the_directory() {
+        // Nothing committed: the directory's own name, which is what a user
+        // adding a repo without ceremony expects to see in `lore status`.
+        let (_dir, root) = repo(None);
+        let basename = root.file_name().unwrap().to_string();
+        assert_eq!(resolved(&root, None).unwrap(), basename);
+        assert_eq!(resolved(&root, Some("chosen")).unwrap(), "chosen");
+
+        // A committed name beats the directory — that is the whole point of
+        // committing it: two checkouts of one repo answer to one name.
+        let (_dir, root) = repo(Some("[project]\nname = \"lore\"\n"));
+        assert_eq!(resolved(&root, None).unwrap(), "lore");
+
+        // …and a table with no name falls through rather than erroring.
+        let (_dir, root) = repo(Some("[project]\n"));
+        assert_eq!(
+            resolved(&root, None).unwrap(),
+            root.file_name().unwrap().to_string()
+        );
+
+        // Flags are trimmed, since a shell quote easily adds a space.
+        let (_dir, root) = repo(None);
+        assert_eq!(resolved(&root, Some("  spaced  ")).unwrap(), "spaced");
+    }
+
+    /// The file is the repo's own answer to "what is this called". Overriding
+    /// it silently would leave the registry and the repo disagreeing with no
+    /// sign of it, so the flag that contradicts it is refused.
+    #[test]
+    fn a_flag_contradicting_the_committed_name_is_refused_with_both_options() {
+        let (_dir, root) = repo(Some("[project]\nname = \"lore\"\n"));
+        let err = resolved(&root, Some("something-else"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already names this project `lore`"), "{err}");
+        assert!(err.contains("Drop --name"), "{err}");
+        assert!(err.contains("edit"), "{err}");
+        assert!(err.contains(repo_config::REPO_CONFIG_FILE), "{err}");
+
+        // Restating the name it already has is agreement, not a conflict.
+        assert_eq!(resolved(&root, Some("lore")).unwrap(), "lore");
+    }
+
+    #[test]
+    fn a_broken_lore_toml_is_never_written_into() {
+        let (_dir, root) = repo(Some("[project\nname ="));
+        let err = resolved(&root, Some("lore")).unwrap_err().to_string();
+        assert!(err.contains("Fix the file"), "{err}");
+        // Untouched: refusing is the point.
+        let text = std::fs::read_to_string(root.join(repo_config::REPO_CONFIG_FILE)).unwrap();
+        assert_eq!(text, "[project\nname =");
+    }
+
+    #[test]
+    fn names_are_permissive_but_never_break_a_downstream() {
+        for good in [
+            "lore",
+            "my design vault",
+            "Lexomancy-bench",
+            "lore.v2",
+            "日本語",
+        ] {
+            validate_name(good).unwrap_or_else(|err| panic!("{good:?} should be legal: {err}"));
+        }
+        for (bad, expected) in [
+            ("", "empty"),
+            ("   ", "empty"),
+            ("a/b", "path separator"),
+            (r"a\b", "path separator"),
+            ("a\nb", "control characters"),
+            ("a\tb", "control characters"),
+        ] {
+            let err = validate_name(bad).unwrap_err().to_string();
+            assert!(err.contains(expected), "{bad:?}: {err}");
+            assert!(err.contains("--name"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_absent_lore_toml_is_created_with_a_header_and_the_name() {
+        let (_dir, root) = repo(None);
+        let note = commit_name(&root, "my design vault", &DeclaredName::Absent).unwrap();
+        assert!(note.unwrap().starts_with("wrote "));
+
+        let text = std::fs::read_to_string(root.join(repo_config::REPO_CONFIG_FILE)).unwrap();
+        assert!(text.starts_with("# Lore project configuration"), "{text:?}");
+        assert!(
+            text.contains("[project]\nname = \"my design vault\"\n"),
+            "{text:?}"
+        );
+        // What was written reads back as what was meant, quoting included.
+        assert_eq!(
+            repo_config::parse_declared_name(&text),
+            Ok(DeclaredName::Named("my design vault".into()))
+        );
+        // …and it is still a neutral repo: naming is not an authority opt-in.
+        assert_eq!(
+            lore::repo_config::RepoAuthority::parse(&text),
+            lore::repo_config::RepoAuthority::default()
+        );
+    }
+
+    /// Appending is textual on purpose: re-serializing through `toml` would
+    /// discard the user's comments and key order to add one line.
+    #[test]
+    fn an_existing_lore_toml_is_appended_to_byte_for_byte() {
+        let original =
+            "# hand-written, do not lose me\n\n[authority]\n# and this\nprofile = \"lore-v1\"\n";
+        let (_dir, root) = repo(Some(original));
+        let note = commit_name(&root, "lore", &DeclaredName::NoTable).unwrap();
+        assert!(note.unwrap().contains("named the project"));
+
+        let text = std::fs::read_to_string(root.join(repo_config::REPO_CONFIG_FILE)).unwrap();
+        assert!(
+            text.starts_with(original),
+            "the original survives: {text:?}"
+        );
+        assert!(text.contains("# hand-written, do not lose me"));
+        assert!(text.contains("# and this"));
+        assert_eq!(
+            repo_config::parse_declared_name(&text),
+            Ok(DeclaredName::Named("lore".into()))
+        );
+        // The profile it already declared is untouched.
+        assert!(lore::repo_config::RepoAuthority::parse(&text).annotates());
+    }
+
+    #[test]
+    fn a_file_that_already_names_the_project_is_left_alone() {
+        let original = "[project]\nname = \"lore\"\n";
+        let (_dir, root) = repo(Some(original));
+        let note = commit_name(&root, "lore", &DeclaredName::Named("lore".into())).unwrap();
+        assert_eq!(note, None, "nothing to say and nothing to write");
+        assert_eq!(
+            std::fs::read_to_string(root.join(repo_config::REPO_CONFIG_FILE)).unwrap(),
+            original
+        );
+    }
+
+    /// A `[project]` table with no `name` cannot get a second one appended, and
+    /// editing inside it is the user's call. The registration still stands; the
+    /// user is told what to add so the name follows the repo.
+    #[test]
+    fn an_unnamed_project_table_is_reported_rather_than_rewritten() {
+        let original = "[project]\n";
+        let (_dir, root) = repo(Some(original));
+        let note = commit_name(&root, "lore", &DeclaredName::Unnamed)
+            .unwrap()
+            .expect("the user is told");
+        assert!(note.contains("no `name`"), "{note}");
+        assert!(note.contains("name = \"lore\""), "{note}");
+        assert_eq!(
+            std::fs::read_to_string(root.join(repo_config::REPO_CONFIG_FILE)).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn a_name_needing_escaping_round_trips_through_toml() {
+        for name in ["quote\"inside", "back\\slash-free", "emoji 🙂", "lore"] {
+            let rendered = format!("[project]\nname = {}\n", toml_string(name));
+            assert_eq!(
+                repo_config::parse_declared_name(&rendered),
+                Ok(DeclaredName::Named(name.to_string())),
+                "{name:?} -> {rendered:?}"
+            );
+        }
     }
 
     // -- rendering ---------------------------------------------------------
