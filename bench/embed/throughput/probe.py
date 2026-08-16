@@ -24,24 +24,63 @@ import subprocess
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def post_embeddings(url, model, texts, timeout):
-    payload = json.dumps({"model": model, "input": texts}).encode("utf-8")
+def post_embeddings(url, model, texts, timeout, encoding_format=None):
+    body = {"model": model, "input": texts}
+    if encoding_format:
+        body["encoding_format"] = encoding_format
+    payload = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         url.rstrip("/") + "/v1/embeddings",
         payload,
-        {"Content-Type": "application/json"},
+        {
+            "Content-Type": "application/json",
+            # Some edge proxies (RunPod's, observed 2026-08-16) 403 the default
+            # Python-urllib UA.
+            "User-Agent": "curl/8.9.1 (lore embed throughput probe)",
+        },
     )
     with OPENER.open(req, timeout=timeout) as resp:
         return json.loads(resp.read())
 
 
+METRICS_OF_INTEREST = (
+    "te_embed_count",                    # inputs embedded
+    "te_batch_next_size_count",          # forward passes
+    "te_embed_inference_duration_sum",   # billed per input, see --metrics-url help
+    "te_embed_queue_duration_sum",
+)
+
+
+def snapshot_metrics(metrics_url, timeout=20):
+    """Read the TEI counters we care about. Returns {} on any failure."""
+    out = {}
+    try:
+        req = urllib.request.Request(
+            metrics_url, headers={"User-Agent": "curl/8.9.1 (lore embed throughput probe)"}
+        )
+        with OPENER.open(req, timeout=timeout) as resp:
+            for line in resp.read().decode("utf-8", "ignore").splitlines():
+                for name in METRICS_OF_INTEREST:
+                    if line.startswith(name + " "):
+                        out[name] = float(line.split()[1])
+    except Exception:
+        pass
+    return out
+
+
 def gpu_sampler(stop_evt, out, interval=1.0):
-    """Poll whole-GPU VRAM while the run is in flight. Best effort."""
+    """Poll whole-GPU VRAM while the run is in flight. Best effort.
+
+    Only started for a loopback server — against a remote endpoint this would
+    sample the *client's* GPU and report a number that looks plausible and
+    means nothing.
+    """
     while not stop_evt.is_set():
         try:
             raw = subprocess.run(
@@ -56,7 +95,13 @@ def gpu_sampler(stop_evt, out, interval=1.0):
         stop_evt.wait(interval)
 
 
-def run_pass(url, model, batches, concurrency, timeout):
+def is_local(url):
+    """VRAM sampling only means anything when the server shares this host."""
+    host = urllib.parse.urlparse(url).hostname or ""
+    return host in ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+
+
+def run_pass(url, model, batches, concurrency, timeout, encoding_format=None):
     work = queue.Queue()
     for b in batches:
         work.put(b)
@@ -72,11 +117,13 @@ def run_pass(url, model, batches, concurrency, timeout):
                 return
             t0 = time.perf_counter()
             try:
-                body = post_embeddings(url, model, batch, timeout)
+                body = post_embeddings(url, model, batch, timeout, encoding_format)
                 dt = time.perf_counter() - t0
                 n_tok = (body.get("usage") or {}).get("prompt_tokens")
                 n_vec = len(body.get("data") or [])
-                dims = len(body["data"][0]["embedding"]) if n_vec else 0
+                first = body["data"][0]["embedding"] if n_vec else []
+                # base64 responses carry a string, not a list of floats
+                dims = len(first) if isinstance(first, list) else len(first) * 3 // 4 // 4
                 with lock:
                     latencies.append(dt)
                     if n_tok:
@@ -93,8 +140,10 @@ def run_pass(url, model, batches, concurrency, timeout):
 
     vram = []
     stop_evt = threading.Event()
-    sampler = threading.Thread(target=gpu_sampler, args=(stop_evt, vram), daemon=True)
-    sampler.start()
+    sampler = None
+    if is_local(url):
+        sampler = threading.Thread(target=gpu_sampler, args=(stop_evt, vram), daemon=True)
+        sampler.start()
 
     threads = [threading.Thread(target=worker) for _ in range(concurrency)]
     t0 = time.perf_counter()
@@ -105,7 +154,8 @@ def run_pass(url, model, batches, concurrency, timeout):
     wall = time.perf_counter() - t0
 
     stop_evt.set()
-    sampler.join(timeout=3)
+    if sampler:
+        sampler.join(timeout=3)
     return wall, latencies, tokens, errors, vram
 
 
@@ -121,6 +171,23 @@ def main():
     ap.add_argument("--warmup", type=int, default=64, help="chunks to send before timing")
     ap.add_argument("--timeout", type=float, default=600.0)
     ap.add_argument("--out", help="append one JSON result object per pass to this file")
+    ap.add_argument(
+        "--encoding-format",
+        choices=["float", "base64"],
+        help="base64 cuts response size ~4x — worth it when the server is remote",
+    )
+    ap.add_argument(
+        "--metrics-url",
+        help="TEI /metrics URL. Records raw counter deltas per pass as evidence "
+        "(inputs embedded, forward passes, billed inference seconds). These are "
+        "NOT a network-free throughput figure: te_embed_inference_duration_sum "
+        "bills every input the full duration of the batch it rode in, so it "
+        "over-counts real GPU time by roughly the batch size, and the "
+        "over-count factor is not recoverable from the counters alone. To "
+        "separate network from GPU, sweep concurrency instead: throughput that "
+        "climbs with concurrency was RTT-bound, throughput that stays flat was "
+        "GPU-bound.",
+    )
     args = ap.parse_args()
 
     chunks = [json.loads(line)["text"] for line in open(args.fixture, encoding="utf-8")]
@@ -134,22 +201,34 @@ def main():
 
     if args.warmup:
         print(f"warmup ({args.warmup} chunks)…", flush=True)
-        post_embeddings(args.url, args.model, chunks[: args.warmup], args.timeout)
+        post_embeddings(
+            args.url, args.model, chunks[: min(args.warmup, args.batch)],
+            args.timeout, args.encoding_format,
+        )
 
     batches = [chunks[i : i + args.batch] for i in range(0, len(chunks), args.batch)]
 
     print(f"\n{'conc':>5} {'chunks/s':>9} {'tok/s':>9} {'MB/s':>6} "
-          f"{'p50 ms':>8} {'p95 ms':>8} {'wall s':>7} {'VRAM MiB':>9}")
+          f"{'p50 ms':>8} {'p95 ms':>8} {'wall s':>7} {'VRAM MiB':>9} {'in/pass':>10}")
     for conc in [int(c) for c in args.concurrency.split(",")]:
+        m0 = snapshot_metrics(args.metrics_url) if args.metrics_url else None
         wall, lat, tok, errors, vram = run_pass(
-            args.url, args.model, batches, conc, args.timeout
+            args.url, args.model, batches, conc, args.timeout, args.encoding_format
         )
+        m1 = snapshot_metrics(args.metrics_url) if args.metrics_url else None
         if errors:
             print(f"{conc:>5}  {len(errors)} errors; first: {errors[0]}")
             continue
         lat.sort()
         n_tok = sum(tok)
         peak_vram = max((m for m, _ in vram), default=0)
+        deltas = (
+            {k: round(m1[k] - m0.get(k, 0), 3) for k in m1}
+            if (m0 is not None and m1)
+            else None
+        )
+        passes = (deltas or {}).get("te_batch_next_size_count") or 0
+        inputs = (deltas or {}).get("te_embed_count") or 0
         row = {
             "label": args.label,
             "model": args.model,
@@ -166,10 +245,13 @@ def main():
             "p95_ms": round(lat[int(len(lat) * 0.95)] * 1000, 1),
             "peak_gpu_mib": peak_vram,
             "dims": globals().get("_dims"),
+            "server_metric_deltas": deltas,
+            "inputs_per_forward_pass": round(inputs / passes, 1) if passes else None,
         }
         print(f"{conc:>5} {row['chunks_per_s']:>9} "
               f"{(row['tokens_per_s'] or '-'):>9} {row['mb_per_s']:>6} "
-              f"{row['p50_ms']:>8} {row['p95_ms']:>8} {row['wall_s']:>7} {peak_vram:>9}")
+              f"{row['p50_ms']:>8} {row['p95_ms']:>8} {row['wall_s']:>7} {peak_vram:>9} "
+              f"{(row['inputs_per_forward_pass'] or '-'):>10}")
         if args.out:
             with open(args.out, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(row) + "\n")

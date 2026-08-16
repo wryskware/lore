@@ -105,6 +105,38 @@ would close some of it.
 Quantized checkpoints also tend to drop `1_Pooling/`, so TEI needs an explicit
 `--pooling last-token` or it refuses to start.
 
+## Run: A40 48 GB (rented pod), 2026-08-16
+
+The arm the 3070 could not host: TEI 1.9.3 serving **unquantized
+`Qwen/Qwen3-Embedding-4B` in float16**, 2560 dims, `last_token` pooling,
+`max_client_batch_size` 32, `max_batch_tokens` 16384. ~10.2 GB VRAM at 100%
+GPU utilization under load. Same fixture as above. Raw rows:
+`runs/runpod-a40-20260816.jsonl`.
+
+| conc | chunks/s | tok/s | wall s | p50 ms | p95 ms |
+|---|---|---|---|---|---|
+| 1 | 12.8 | 4,033 | 311.7 | 2,666 | 3,290 |
+| 2 | 25.0 | 7,862 | 159.9 | 2,601 | 3,527 |
+| 4 | 31.7 | 9,957 | 126.3 | 4,070 | 5,035 |
+| 8 | 32.9 | 10,340 | 121.6 | 7,631 | 9,375 |
+| 16 | **33.0** | **10,386** | 121.0 | 15,177 | 16,804 |
+
+This one was measured **over the internet**, not on the box — the pod's SSH
+proxy has no sftp subsystem and ignores exec commands, so the fixture could
+not be copied over for a loopback run. The concurrency sweep is what separates
+network from GPU, and it does so cleanly: 1→2 scales 1.95x with p50 latency
+flat (round-trip-bound, GPU idle), while 4→8→16 is flat at ~33 chunks/s with
+the pod pegged at 100% GPU (compute-bound). **Read the plateau, not the
+concurrency-1 row** — the low end of this table is measuring the Atlantic.
+
+Note the shape differs from the local arms, which saturate at concurrency 2.
+Here concurrency 4+ is needed just to keep the GPU fed across the WAN, which is
+what a remote embedder costs in practice.
+
+Against the 3070's 4B FP8 (5,313 tok/s), the A40 at 10,386 tok/s is ~2.0x —
+close to the raw compute ratio, and it gets there while running the model
+*unquantized* and unconstrained by KV cache.
+
 Setup gotchas, both one-time:
 
 - vLLM's Triton needs a C compiler; without `build-essential` the engine dies
@@ -117,7 +149,18 @@ Setup gotchas, both one-time:
   binary on `PATH` (present in the venv, but only if the venv's `bin` is on
   `PATH` — launching vLLM by absolute path is not enough).
 
-Caveat: this measures the server on an idle GPU over loopback. It excludes
+Two probe behaviours worth knowing before trusting a column:
+
+- VRAM sampling shells out to `nvidia-smi` **on the client**, so it is only
+  started when the target is loopback. A remote arm reports `null` rather than
+  a plausible-looking reading of your own GPU.
+- `--metrics-url` records TEI counter deltas as evidence but derives no rate
+  from them. `te_embed_inference_duration_sum` bills every input the full
+  duration of the batch it rode in, so it over-counts GPU time by roughly the
+  batch size and cannot be corrected from the counters alone. Sweep concurrency
+  to separate network from GPU instead.
+
+Caveat: the local runs measure the server on an idle GPU over loopback. This excludes
 chunking, SQLite writes, daemon pacing, and (if the daemon ran on another
 machine) the network. It is an upper bound on what a lore drain could reach,
 not a drain measurement.
