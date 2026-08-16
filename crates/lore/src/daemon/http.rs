@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{DefaultBodyLimit, FromRequest, Request, State};
+use axum::extract::{DefaultBodyLimit, FromRequest, Query, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -156,7 +156,19 @@ type ApiResult<T> = Result<Json<T>, ApiErr>;
 // Handlers
 // ---------------------------------------------------------------------------
 
-async fn status(State(state): State<AppState>) -> ApiResult<DaemonStatus> {
+/// `GET /v1/status?project=<name>` — the optional filter adds that project's
+/// per-corpus store-scan window to the latency list. Without it only the
+/// global endpoints are reported, so a registry with many projects does not
+/// turn `status` into a wall of rows.
+#[derive(Debug, serde::Deserialize)]
+struct StatusQuery {
+    project: Option<String>,
+}
+
+async fn status(
+    State(state): State<AppState>,
+    Query(query): Query<StatusQuery>,
+) -> ApiResult<DaemonStatus> {
     let status = state
         .store
         .with(|store| store.status())
@@ -195,7 +207,14 @@ async fn status(State(state): State<AppState>) -> ApiResult<DaemonStatus> {
         // whole point of D-0007 is that a user can see *why* results are
         // lexical-only.
         embeddings: state.embeddings.status(),
-        latency: state.latency.snapshot(),
+        latency: {
+            let mut latency = state.latency.snapshot();
+            latency.retain(|l| match l.endpoint.split_once(':') {
+                None => true, // global endpoints always
+                Some((_, project)) => query.project.as_deref() == Some(project),
+            });
+            latency
+        },
     }))
 }
 
@@ -331,6 +350,13 @@ async fn search_route(
     ApiJson(request): ApiJson<SearchRequest>,
 ) -> ApiResult<lore_core::SearchResponse> {
     let started = std::time::Instant::now();
+    // The store stage is recorded per project: the vector arm is an O(n)
+    // scan, so its cost is a property of the corpus searched, not of the
+    // daemon. `all` = no project filter (every corpus scanned).
+    let store_label = format!(
+        "search_store:{}",
+        request.project.as_deref().unwrap_or("all")
+    );
 
     // Embedding the query is network I/O, so it happens *before* the store
     // lock is taken — never while holding it. `None` simply means this
@@ -338,11 +364,16 @@ async fn search_route(
     let query_vector = state.embeddings.embed_query(&request.query).await;
     state.latency.record("search_embed", started.elapsed());
 
+    let store_started = std::time::Instant::now();
     let outcome = state
         .store
         .with(move |store| search::execute(store, &request, query_vector.as_deref()))
         .await
         .map_err(|err| ApiErr::internal("search", err))?;
+    // Both the global aggregate and the per-corpus window: `status` shows the
+    // aggregate by default and the labeled row on request.
+    state.latency.record("search_store", store_started.elapsed());
+    state.latency.record(&store_label, store_started.elapsed());
     state.latency.record("search", started.elapsed());
     match outcome {
         Ok(response) => Ok(Json(response)),

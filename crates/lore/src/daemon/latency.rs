@@ -28,16 +28,25 @@ struct Window {
 }
 
 /// Shared recorder; cheap to clone, locked only for a push or a snapshot.
+///
+/// Keys are strings because the store stage is recorded **per project**
+/// (`search_store:<project>`): the vector arm is an O(n) scan, so a daemon
+/// serving one 82k-chunk project and two 4k ones has three different search
+/// latencies, and a single aggregate would hide the one that matters.
+/// Cardinality is bounded by the registry size.
 #[derive(Clone, Default)]
 pub struct LatencyRecorder {
-    windows: Arc<Mutex<HashMap<&'static str, Window>>>,
+    windows: Arc<Mutex<HashMap<String, Window>>>,
 }
 
 impl LatencyRecorder {
-    pub fn record(&self, endpoint: &'static str, elapsed: Duration) {
+    pub fn record(&self, endpoint: &str, elapsed: Duration) {
         let ms = u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX);
         let mut windows = self.windows.lock().expect("latency lock");
-        let window = windows.entry(endpoint).or_default();
+        let window = match windows.get_mut(endpoint) {
+            Some(window) => window,
+            None => windows.entry(endpoint.to_string()).or_default(),
+        };
         window.samples += 1;
         if window.ring.len() == WINDOW {
             window.ring.pop_front();
@@ -61,7 +70,7 @@ impl LatencyRecorder {
                     u64::from(sorted[rank - 1])
                 };
                 EndpointLatency {
-                    endpoint: (*endpoint).to_string(),
+                    endpoint: endpoint.clone(),
                     samples: window.samples,
                     p50_ms: pct(50),
                     p90_ms: pct(90),
@@ -118,6 +127,17 @@ mod tests {
         let s = &recorder.snapshot()[0];
         assert_eq!(s.samples as usize, WINDOW + 500);
         assert_eq!(s.max_ms, 1);
+    }
+
+    #[test]
+    fn per_project_store_labels_are_independent_windows() {
+        let recorder = LatencyRecorder::default();
+        recorder.record("search_store:Lexomancy", Duration::from_millis(1200));
+        recorder.record("search_store:lore", Duration::from_millis(30));
+        let snap = recorder.snapshot();
+        assert_eq!(snap.len(), 2);
+        assert_eq!((snap[0].endpoint.as_str(), snap[0].p50_ms), ("search_store:Lexomancy", 1200));
+        assert_eq!((snap[1].endpoint.as_str(), snap[1].p50_ms), ("search_store:lore", 30));
     }
 
     #[test]

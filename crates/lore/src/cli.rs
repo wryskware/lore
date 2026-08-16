@@ -129,10 +129,15 @@ pub async fn index(project: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// `lore status` — daemon and index health.
-pub async fn status(json: bool) -> Result<()> {
+/// `lore status` — daemon and index health. `project` additionally reports
+/// that project's per-corpus store-scan latency window.
+pub async fn status(json: bool, project: Option<String>) -> Result<()> {
     let client = Client::connect()?;
-    let body = client.get("status").await?;
+    let route = match &project {
+        Some(p) => format!("status?project={}", urlencode(p)),
+        None => "status".to_string(),
+    };
+    let body = client.get(&route).await?;
     if json {
         println!("{body}");
         return Ok(());
@@ -155,6 +160,22 @@ pub async fn search(args: SearchArgs) -> Result<()> {
         render_search(&args.query, &parse::<SearchResponse>(&body)?)
     );
     Ok(())
+}
+
+/// Minimal percent-encoding for a query value (RFC 3986 unreserved set).
+fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => {
+                let _ = write!(out, "%{byte:02X}");
+            }
+        }
+    }
+    out
 }
 
 fn absolute_utf8(path: &str) -> Result<Utf8PathBuf> {

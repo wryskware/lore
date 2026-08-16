@@ -26,6 +26,9 @@ enum Command {
         /// Print the daemon's raw JSON response instead of the table.
         #[arg(long)]
         json: bool,
+        /// Additionally report this project's store-scan latency window.
+        #[arg(long)]
+        project: Option<String>,
     },
     /// Search the index — the same surface agents get over MCP.
     Search(cli::SearchArgs),
@@ -40,7 +43,7 @@ fn main() -> anyhow::Result<()> {
         Command::Daemon => daemon(),
         Command::Add { path } => cli::run(cli::add(path)),
         Command::Index { project } => cli::run(cli::index(project)),
-        Command::Status { json } => cli::run(cli::status(json)),
+        Command::Status { json, project } => cli::run(cli::status(json, project)),
         Command::Search(search) => cli::run(cli::search(search)),
     }
 }
