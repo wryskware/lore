@@ -119,13 +119,15 @@ pub const RRF_K: f64 = 60.0;
 // *navigational* query landed below two dozen mediocre hits, and decided docs
 // leapfrogged the query's actual target from rank 20. The values below are
 // derived from the shift we actually want at the top of the list: decided
-// lifts ~3 ranks, leaning ~1, deprecated loses ~3–4. Authority breaks ties
-// and lifts a near-miss; a decisive match wins regardless of tier.
+// reaches ~5 ranks (2.1's "comparable similarity" includes the few-rank BM25
+// spread a pack of near-identical docs produces — the laundering tests pin
+// this), leaning ~2, deprecated loses ~3–4. Authority breaks ties and lifts
+// a near-miss; a decisively better match wins regardless of tier.
 //
 // Because RRF scores carry no corpus statistics, these rank shifts are the
 // same for every repo — the multipliers transfer without per-corpus retuning.
 /// Effective tier 3 — validated `decided`, and the ledger itself.
-pub const AUTHORITY_DECIDED: f64 = 1.05;
+pub const AUTHORITY_DECIDED: f64 = 1.07;
 /// Effective tier 2 — `leaning`.
 pub const AUTHORITY_LEANING: f64 = 1.02;
 /// Effective tier 1 — `exploration`, unclassified, non-vault (code) chunks,
