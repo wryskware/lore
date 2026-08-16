@@ -40,9 +40,11 @@ running.** `run.ps1` refuses if `opencode` is alive (override with `-Force`).
 - `setup.ps1` — downloads llama.cpp (highest CUDA build; Blackwell needs
   ≥ 12.8) and GGUFs (~16 GB total, resumable). Network/disk only.
 - `run.ps1` — the bench itself (see header comment for details).
-- `score.ps1` — hit@5/10, MRR@10, nDCG@10 (binary), per-kind breakdown, and
-  the cost table (drain time, chunks/s, exact prompt tokens from
-  llama-server `/metrics`, per-process VRAM peak) → `results/summary.md`.
+- `score.ps1` — hit@5/10, MRR@10, nDCG@10 (binary), per-kind breakdown, the
+  cost table (drain time, chunks/s, exact prompt tokens from llama-server
+  `/metrics`, per-process VRAM peak), and daemon-side latency percentiles
+  (`/v1/status` `latency` field: `search`/`search_embed` global,
+  `search_store:<name>` via `?project=`) → `results/summary.md`.
 
 ## Protocol
 

@@ -102,6 +102,37 @@ foreach ($r in ($runs | Sort-Object model)) {
     $d = $r.run.drain
     $md.Add("| $($r.run.model) | $($d.chunks) | $($d.seconds) | $($d.chunks_per_sec) | $($d.prompt_tokens) | $($d.tokens_per_sec) | $($d.vram_llama_max_mib) | $($d.vram_gpu_max_mib) | $($r.run.model_load_seconds) |")
 }
+$md.Add("`n## Daemon-side latency (rolling-window percentiles, ms)`n")
+$md.Add('`search_embed` is the embed-query wait inside search — the per-query cost of the model itself; `search` is the whole handler.')
+$md.Add('')
+$md.Add('| model | search p50/p95/p99 | search_embed p50/p95/p99 | samples (search) |')
+$md.Add('|---|---|---|---|')
+foreach ($r in ($runs | Sort-Object model)) {
+    $g = $r.run.daemon_latency.global
+    if (-not $g) { continue }
+    $s = $g | Where-Object endpoint -eq 'search'
+    $e = $g | Where-Object endpoint -eq 'search_embed'
+    $sCell = if ($s) { "$($s.p50_ms) / $($s.p95_ms) / $($s.p99_ms)" } else { '-' }
+    $eCell = if ($e) { "$($e.p50_ms) / $($e.p95_ms) / $($e.p99_ms)" } else { '-' }
+    $md.Add("| $($r.run.model) | $sCell | $eCell | $(if ($s) { $s.samples } else { '-' }) |")
+}
+$md.Add('')
+$md.Add('Per-corpus store scan (`search_store:<project>`, p50/p95 ms):')
+$md.Add('')
+$corpusNames = @($runs | ForEach-Object { $_.run.daemon_latency.PSObject.Properties.Name } | Where-Object { $_ -ne 'global' } | Sort-Object -Unique)
+if ($corpusNames) {
+    $md.Add('| model | ' + ($corpusNames -join ' | ') + ' |')
+    $md.Add('|---' * ($corpusNames.Count + 1) + '|')
+    foreach ($r in ($runs | Sort-Object model)) {
+        $cells = foreach ($cn in $corpusNames) {
+            $e = $r.run.daemon_latency.$cn
+            if ($e) { "$($e.p50_ms) / $($e.p95_ms)" } else { '-' }
+        }
+        $md.Add("| $($r.run.model) | " + ($cells -join ' | ') + ' |')
+    }
+    $md.Add('')
+}
+
 $warn = @($runs | ForEach-Object { $_.run.warnings } | Where-Object { $_ })
 if ($warn) { $md.Add("`n## Warnings`n"); $warn | ForEach-Object { $md.Add("- $_") } }
 
