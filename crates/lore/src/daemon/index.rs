@@ -261,8 +261,14 @@ pub fn index_paths(
             .iter()
             .chain(to_remove.iter())
             .any(|rel| is_decision_source(rel));
-        if decisions_touched {
-            refresh_authority(ctx, project, profile, false, &mut summary);
+        // A profile change invalidates every tier in the project, not just
+        // this batch's. The recompute below fixes the tiers; the *chunks* of
+        // files outside this batch are still stale, which is why the watcher
+        // answers a `.lore.toml` edit with a full scan rather than a batch.
+        // This branch is the safety net for any other route into an
+        // incremental pass with a moved profile.
+        if decisions_touched || summary.profile_changed {
+            refresh_authority(ctx, project, profile, summary.profile_changed, &mut summary);
         }
     }
 

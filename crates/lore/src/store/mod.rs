@@ -537,7 +537,7 @@ impl Store {
                 name: r.get(2)?,
                 key: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
                 kind: read_kind(r.get::<_, Option<String>>(4)?.as_deref()),
-                authority: read_authority(r.get(5)?, r.get(6)?, r.get(7)?),
+                authority: read_authority((r.get(5)?, r.get(6)?, r.get(7)?)),
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -570,7 +570,7 @@ impl Store {
         let Some((profile, behavior, error)) = current else {
             return Ok(false);
         };
-        if &read_authority(profile, behavior, error) == authority {
+        if &read_authority((profile, behavior, error)) == authority {
             return Ok(false);
         }
         self.conn.execute(
@@ -599,7 +599,7 @@ impl Store {
             )
             .optional()?;
         Ok(match row {
-            Some((profile, behavior, error)) => read_authority(profile, behavior, error),
+            Some(stored) => read_authority(stored),
             None => RepoAuthority::default(),
         })
     }
@@ -752,25 +752,20 @@ impl Store {
     /// Everything the effective-tier policy needs that is not on the chunk
     /// row: the project's active decisions and its source kind.
     fn authority_context(&self, project: ProjectId) -> Result<AuthorityContext> {
-        let row: Option<(
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        )> = self
+        let row: Option<(Option<String>, StoredAuthority)> = self
             .conn
             .query_row(
                 "SELECT kind, authority_profile, authority_behavior, authority_error
                  FROM projects WHERE id = ?",
                 params![project],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?))),
             )
             .optional()?;
-        let (kind, profile, behavior, error) = row.unwrap_or_default();
+        let (kind, stored) = row.unwrap_or_default();
         Ok(AuthorityContext {
             active: self.active_decisions(project)?,
             kind: read_kind(kind.as_deref()),
-            profile: read_authority(profile, behavior, error).active(),
+            profile: read_authority(stored).active(),
         })
     }
 
@@ -1013,7 +1008,7 @@ impl Store {
                     .get::<_, Option<String>>(11)?
                     .and_then(|json| serde_json::from_str(&json).ok())
                     .unwrap_or_default(),
-                authority: read_authority(r.get(12)?, r.get(13)?, r.get(14)?),
+                authority: read_authority((r.get(12)?, r.get(13)?, r.get(14)?)),
             })
         })?;
         let mut projects: Vec<ProjectStatus> = rows.collect::<std::result::Result<_, _>>()?;
@@ -1318,6 +1313,10 @@ impl AuthorityContext {
     }
 }
 
+/// The three `projects` columns that spell out a repo's `.lore.toml` verdict:
+/// `(authority_profile, authority_behavior, authority_error)`.
+type StoredAuthority = (Option<String>, Option<String>, Option<String>);
+
 /// Rebuild a [`RepoAuthority`] from its three stored columns.
 ///
 /// Unrecognized spellings degrade to neutral rather than failing, on the same
@@ -1325,12 +1324,7 @@ impl AuthorityContext {
 /// a profile this build does not must not make the store unopenable — and
 /// neutral is the *safe* direction, since the alternative is applying a policy
 /// this build does not actually implement.
-fn read_authority(
-    profile: Option<String>,
-    behavior: Option<String>,
-    error: Option<String>,
-) -> RepoAuthority {
-    let stored = profile;
+fn read_authority((stored, behavior, error): StoredAuthority) -> RepoAuthority {
     let profile = stored.as_deref().and_then(Profile::parse);
     let error = match (&stored, profile) {
         // Written by a daemon that knows a profile this one does not. Neutral
