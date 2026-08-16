@@ -228,6 +228,7 @@ pub fn status(status: &DaemonStatus) -> String {
         generation = status.generation,
     );
     let _ = writeln!(out, "{}", embeddings(&status.embeddings));
+    push_abandoned(&mut out, status.embed_abandoned);
 
     if status.projects.is_empty() {
         out.push_str("projects: none registered (ask the user to run `lore add <path>`)\n");
@@ -258,6 +259,23 @@ pub fn status(status: &DaemonStatus) -> String {
         push_authority_violations(&mut out, project);
     }
     out
+}
+
+/// Chunks the embed worker gave up on, and only when there are any.
+///
+/// Silent when clean, on the same rule as every other note here: a line that
+/// says "0 chunks were skipped" on every call costs tokens to say nothing.
+/// Loud when it is not, because a corpus quietly missing some of its vectors
+/// answers searches with a gap an agent cannot otherwise see (D-0007).
+fn push_abandoned(out: &mut String, abandoned: u64) {
+    if abandoned == 0 {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "EMBEDDING: {abandoned} chunk(s) refused by the endpoint this daemon run and not \
+         embedded; they are retried periodically, so search may be missing them for now"
+    );
 }
 
 /// Which authority profile this repository opted into, and how healthy it is.
@@ -602,6 +620,7 @@ mod tests {
             projects: vec![],
             embeddings: EmbeddingStatus::Unconfigured,
             latency: Vec::new(),
+            embed_abandoned: 0,
         };
         assert!(status(&base).contains("embeddings: UNCONFIGURED"));
         assert!(
@@ -666,6 +685,7 @@ mod tests {
             ],
             embeddings: EmbeddingStatus::Unconfigured,
             latency: Vec::new(),
+            embed_abandoned: 0,
         });
         assert!(rendered.contains("  lexomancy  files 812  chunks 9134  embedded 0/9134 (0%)"));
         assert!(rendered.contains("  lore       files 96  chunks 1204  embedded 1204/1204 (100%)"));
@@ -696,6 +716,7 @@ mod tests {
             }],
             embeddings: EmbeddingStatus::Unconfigured,
             latency: Vec::new(),
+            embed_abandoned: 0,
         };
         assert!(!status(&status_body).contains("WATCH RETRYING"));
 
@@ -706,6 +727,29 @@ mod tests {
     #[test]
     fn coverage_does_not_divide_by_zero_on_an_unindexed_project() {
         assert_eq!(coverage(0, 0), "0/0");
+    }
+
+    /// Chunks the endpoint refused are a gap in the corpus that answers no
+    /// search and appears nowhere else — so it is reported, and only when
+    /// there is something to report (#9).
+    #[test]
+    fn abandoned_chunks_are_reported_and_a_clean_run_says_nothing() {
+        let body = |abandoned: u64| DaemonStatus {
+            api_version: 1,
+            daemon_version: "0.1.0".into(),
+            generation: 1,
+            projects: vec![],
+            embeddings: EmbeddingStatus::Unconfigured,
+            latency: Vec::new(),
+            embed_abandoned: abandoned,
+        };
+        assert!(!status(&body(0)).contains("EMBEDDING"));
+
+        let rendered = status(&body(7));
+        assert!(rendered.contains("EMBEDDING: 7 chunk(s)"), "{rendered}");
+        // Not a life sentence: the note has to say they come back, or an agent
+        // reads a temporary gap as a permanent one.
+        assert!(rendered.contains("retried"), "{rendered}");
     }
 
     /// The agent-facing copy of the CLI's violation block. It is duplicated
@@ -734,6 +778,7 @@ mod tests {
             }],
             embeddings: EmbeddingStatus::Unconfigured,
             latency: Vec::new(),
+            embed_abandoned: 0,
         };
 
         assert!(!status(&body(0, Vec::new())).contains("AUTHORITY"));

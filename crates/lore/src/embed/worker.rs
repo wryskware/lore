@@ -167,8 +167,6 @@ pub struct EmbedWorker {
     notify: Arc<Notify>,
     cancel: CancellationToken,
     poisoned: HashMap<(ProjectId, ChunkId), Poison>,
-    /// Chunks abandoned this process lifetime; logged, not persisted.
-    skipped: usize,
     page_rows: usize,
     retry_delay: Duration,
     poison_ttl: Duration,
@@ -199,7 +197,6 @@ impl EmbedWorker {
             notify,
             cancel,
             poisoned: HashMap::new(),
-            skipped: 0,
             page_rows: PAGE_ROWS,
             retry_delay: POISON_RETRY_DELAY,
             poison_ttl: POISON_TTL,
@@ -225,8 +222,12 @@ impl EmbedWorker {
     /// rejected again. They are not gone for good — each is offered again once
     /// its [`POISON_TTL`] is up — so this is the count of chunks the worker
     /// has given up on at least once, not of chunks it will never send.
+    ///
+    /// Kept on [`Health`] rather than in this struct because `/v1/status`
+    /// reports it (D-0007: degradation is never silent) and the worker is not
+    /// reachable from a request handler.
     pub fn skipped(&self) -> usize {
-        self.skipped
+        self.health.abandoned() as usize
     }
 
     pub async fn run(mut self) {
@@ -277,7 +278,7 @@ impl EmbedWorker {
                 _ = tokio::time::sleep(IDLE_TICK) => {}
             }
         }
-        tracing::debug!(skipped = self.skipped, "embed worker stopped");
+        tracing::debug!(skipped = self.skipped(), "embed worker stopped");
     }
 
     /// Probe the endpoint and publish the result. Returns readiness.
@@ -579,7 +580,7 @@ impl EmbedWorker {
                     false => retry_delay,
                 };
             if before < ABANDON_STRIKES && entry.strikes >= ABANDON_STRIKES {
-                self.skipped += 1;
+                self.health.record_abandoned(1);
             }
         }
     }

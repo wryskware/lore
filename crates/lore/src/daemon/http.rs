@@ -289,6 +289,10 @@ async fn status(
         // whole point of D-0007 is that a user can see *why* results are
         // lexical-only.
         embeddings: state.embeddings.status(),
+        // Machine-wide even under `?project=`: the worker's poison set is not
+        // per project, and attributing its count to whichever project was
+        // asked about would be a fabrication.
+        embed_abandoned: state.embeddings.abandoned_chunks(),
     }))
 }
 

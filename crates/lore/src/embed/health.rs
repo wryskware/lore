@@ -54,6 +54,11 @@ struct Inner {
     next: AtomicU64,
     /// Raised when someone wants the stored verdict re-checked now.
     probe_request: Notify,
+    /// Chunks the worker has abandoned this process lifetime. Lives here
+    /// rather than in the worker because it is a *reported* degradation and
+    /// the worker is not reachable from the status handler — this handle
+    /// already is, and already carries the rest of the embedding story.
+    abandoned: AtomicU64,
 }
 
 #[derive(Clone, Debug)]
@@ -90,8 +95,24 @@ impl Health {
                 }),
                 next: AtomicU64::new(0),
                 probe_request: Notify::new(),
+                abandoned: AtomicU64::new(0),
             }),
         }
+    }
+
+    /// Record `chunks` more chunks crossing into abandoned.
+    ///
+    /// Counted once per chunk, the first time it is given up on — an
+    /// abandoned chunk is offered again when its TTL expires, and counting the
+    /// retry would turn a bounded degradation into a growing number.
+    pub fn record_abandoned(&self, chunks: u64) {
+        self.inner.abandoned.fetch_add(chunks, Ordering::Relaxed);
+    }
+
+    /// Chunks abandoned this process lifetime. Not persisted: it describes
+    /// what *this* daemon gave up on, and a restart genuinely starts over.
+    pub fn abandoned(&self) -> u64 {
+        self.inner.abandoned.load(Ordering::Relaxed)
     }
 
     pub fn status(&self) -> EmbeddingStatus {

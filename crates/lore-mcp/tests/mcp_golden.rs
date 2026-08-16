@@ -184,8 +184,9 @@ fn canned_expand() -> ExpandResponse {
 }
 
 /// Degraded on purpose: an unreachable embedding endpoint, a project with zero
-/// embedded chunks, and a project with refused authority declarations — the
-/// three states an agent most needs to be able to name.
+/// embedded chunks, a project with refused authority declarations, and chunks
+/// the endpoint would not embed — the states an agent most needs to be able to
+/// name, all of which are invisible in search results themselves.
 fn canned_status() -> DaemonStatus {
     DaemonStatus {
         api_version: 1,
@@ -237,6 +238,7 @@ fn canned_status() -> DaemonStatus {
             error: "connection refused".into(),
         },
         latency: Vec::new(),
+        embed_abandoned: 12,
     }
 }
 

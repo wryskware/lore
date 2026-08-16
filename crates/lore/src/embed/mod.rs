@@ -138,6 +138,13 @@ impl Embedder {
         &self.health
     }
 
+    /// Chunks the embed worker has abandoned this process lifetime — what
+    /// `GET /v1/status` reports alongside [`Self::status`]. Zero when there is
+    /// no worker at all, which is the truth: nothing has been given up on.
+    pub fn abandoned_chunks(&self) -> u64 {
+        self.health.abandoned()
+    }
+
     pub fn client(&self) -> Option<&Arc<EmbedClient>> {
         self.client.as_ref()
     }

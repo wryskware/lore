@@ -682,6 +682,7 @@ fn render_status(status: &DaemonStatus) -> String {
         generation = status.generation,
     );
     let _ = writeln!(out, "{}", render_embeddings(&status.embeddings));
+    push_abandoned(&mut out, status.embed_abandoned);
     for l in &status.latency {
         let _ = writeln!(
             out,
@@ -725,6 +726,23 @@ fn render_status(status: &DaemonStatus) -> String {
         push_authority_violations(&mut out, project);
     }
     out
+}
+
+/// Chunks the embed worker gave up on, and only when there are any — the same
+/// silent-when-clean rule `lore-mcp`'s renderer follows, and the same reason:
+/// a corpus missing some of its vectors is invisible in the results.
+///
+/// The remedy is the daemon log, which names what the endpoint actually said;
+/// nothing on this surface can.
+fn push_abandoned(out: &mut String, abandoned: u64) {
+    if abandoned == 0 {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "EMBEDDING: {abandoned} chunk(s) refused by the endpoint this daemon run and not \
+         embedded; they are retried periodically - see the daemon log for what it said"
+    );
 }
 
 /// The repository's authority profile, its health, and its decision corpus.
@@ -1345,9 +1363,30 @@ mod tests {
             projects: vec![],
             embeddings: EmbeddingStatus::Unconfigured,
             latency: Vec::new(),
+            embed_abandoned: 0,
         });
         assert!(rendered.contains("projects: none registered (run `lore add <path>`)"));
         assert!(rendered.starts_with("lore daemon 0.1.0  api v1  generation 0\n"));
+    }
+
+    /// The CLI half of the same rule as `lore-mcp`'s renderer: silent when the
+    /// run is clean, loud when the endpoint refused chunks (#9).
+    #[test]
+    fn abandoned_chunks_are_reported_only_when_there_are_any() {
+        let body = |abandoned: u64| DaemonStatus {
+            api_version: 1,
+            daemon_version: "0.1.0".into(),
+            generation: 1,
+            projects: vec![],
+            embeddings: EmbeddingStatus::Unconfigured,
+            latency: Vec::new(),
+            embed_abandoned: abandoned,
+        };
+        assert!(!render_status(&body(0)).contains("EMBEDDING"));
+
+        let rendered = render_status(&body(19));
+        assert!(rendered.contains("EMBEDDING: 19 chunk(s)"), "{rendered}");
+        assert!(rendered.contains("daemon log"), "{rendered}");
     }
 
     #[test]
@@ -1386,6 +1425,7 @@ mod tests {
             }],
             embeddings: EmbeddingStatus::Unconfigured,
             latency: Vec::new(),
+            embed_abandoned: 0,
         };
 
         // Clean vault: not a word about authority.

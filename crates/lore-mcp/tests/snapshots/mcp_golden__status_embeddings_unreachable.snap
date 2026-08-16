@@ -1,10 +1,10 @@
 ---
 source: crates/lore-mcp/tests/mcp_golden.rs
-assertion_line: 302
 expression: rendered
 ---
 lore daemon 0.1.0  api v1  generation 42
 embeddings: UNREACHABLE - http://127.0.0.1:11434 (connection refused); search is lexical-only until it answers
+EMBEDDING: 12 chunk(s) refused by the endpoint this daemon run and not embedded; they are retried periodically, so search may be missing them for now
 projects (2):
   lexomancy  files 812  chunks 9134  embedded 0/9134 (0%)  C:\repos\Lexomancy
     authority: lore-v1 (rank)  decisions 14/16 active

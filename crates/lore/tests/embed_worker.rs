@@ -295,6 +295,10 @@ async fn a_refused_chunk_is_retried_once_before_it_is_abandoned() {
     assert_eq!(worker.drain().await, Drained::Interrupted);
     assert_eq!(refused(&rig), 2, "the delayed retry never happened");
     assert_eq!(worker.skipped(), 1, "the second rejection is the verdict");
+    // …and the same count is what `/v1/status` reads (#9). The worker is not
+    // reachable from a request handler, so this is the only place the two ends
+    // of that wire can be tied together.
+    assert_eq!(rig.embedder.abandoned_chunks(), 1);
 
     tokio::time::sleep(RETRY_IN * 2).await;
     assert!(worker.probe().await);

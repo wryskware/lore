@@ -48,11 +48,29 @@ pub struct DaemonStatus {
     pub generation: u64,
     pub projects: Vec<ProjectStatus>,
     pub embeddings: EmbeddingStatus,
+    /// Chunks the embed worker has given up on **this process lifetime**: the
+    /// endpoint refused them twice, so they are held back rather than retried
+    /// forever. Not a permanent verdict — each is offered again when its
+    /// poison window expires — and not persisted, because it describes what
+    /// this daemon did, not what the index is.
+    ///
+    /// Reported because a corpus quietly missing some of its vectors is
+    /// exactly the silent degradation D-0007 refuses to allow. Zero (and
+    /// absent from the JSON) is the normal case, and from a daemon that
+    /// predates the field.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub embed_abandoned: u64,
     /// Request-latency percentiles per endpoint over a rolling window.
     /// Empty/absent from a daemon that predates latency metrics (additive on
     /// the wire in both directions).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub latency: Vec<EndpointLatency>,
+}
+
+/// `skip_serializing_if` predicate for additive counters whose interesting
+/// value is "not zero".
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// Nearest-rank latency percentiles for one endpoint (`search`,
