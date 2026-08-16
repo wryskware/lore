@@ -101,8 +101,11 @@ function Invoke-Cell([string]$model, [string]$repo, [string]$arm, [string]$task)
         if ($r.vcs -eq 'git') {
             git -C $r.dir add -N . 2>$null
             # git writes the file itself — piping through Set-Content rewrites
-            # line endings and breaks `git apply`.
-            git -C $r.dir diff --output=(Join-Path $outDir 'diff.patch')
+            # line endings and breaks `git apply`. Quoted as ONE argument:
+            # bare `--output=(...)` splits at the paren in pwsh, git gets an
+            # empty --output= and captures nothing (lost the 4 qwen T5 diffs
+            # on 2026-08-16 before this fix).
+            git -C $r.dir diff "--output=$(Join-Path $outDir 'diff.patch')"
             git -C $r.dir checkout -- . 2>$null
             git -C $r.dir clean -fd 2>$null
         } else {
