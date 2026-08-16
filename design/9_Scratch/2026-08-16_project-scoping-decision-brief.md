@@ -169,6 +169,68 @@ Under B specifically:
   directory.
 - Nothing has been implemented for scoping. No canon has been changed.
 
+## The larger fork behind this one (Wrysk, 2026-08-16)
+
+Scoping is one instance of a bigger split: **the CLI is a different thing when
+it is a client to a shared instance than when it drives a local daemon.** Is a
+given caller an administrator of the index or a user of it?
+
+### The capability tiers already exist
+
+The daemon's routes divide cleanly today:
+
+| Tier | Routes | Effect |
+| --- | --- | --- |
+| Mutating | `POST /projects`, `POST /index` | Changes shared index state |
+| Read | `/status`, `/search`, `/expand` | Observes it |
+
+And `lore-mcp` **already withholds the mutating tier** — its server
+instructions tell agents that registration and reindex are deliberately
+unavailable and to ask the user to run `lore add` / `lore index` instead.
+
+So a two-tier capability model is already in the product. It is enforced by
+*omitting tools from one client's surface*, not by the API. Locally that is
+sufficient, because the only caller is the machine's owner. Remotely it is not
+a boundary at all: the HTTP endpoints are reachable directly, unauthenticated,
+by anything that can route to the box.
+
+Making that split explicit and API-enforced is a prerequisite for a shared
+instance, and it is independent of how scoping resolves.
+
+### D-0003's "single authoritative owner" acquires a second meaning
+
+The constraint was written about *process* ownership — no multi-process
+indexing free-for-all, the failure that crashed the machine. On a shared box it
+also becomes a question of *authority*: if user A runs `lore index`, user B's
+queries are affected. One owner of index state no longer implies one
+beneficiary of it.
+
+### The part that may dominate everything else: ingestion
+
+Lore indexes by walking the filesystem. `lore add <path>` sends a path the
+**daemon** must then walk. That is coherent only while both sit on one machine.
+
+A daemon on a shared dev box has three options, and they are not small:
+
+1. **Repos live on the shared box.** Development moves to the server; the
+   walker is unchanged. Simplest for Lore, largest change to how Wrysk works.
+2. **The daemon reaches the repos.** Network mount, or the daemon clones them
+   itself. Keeps local development, but re-introduces path semantics across the
+   wire and needs credentials to private remotes.
+3. **Ingestion inverts.** The client pushes file content and the daemon never
+   touches a filesystem it does not own. Cleanest tenancy story, and by far the
+   biggest departure from the current design — watcher, `.loreignore`
+   evaluation and incremental hashing all currently live daemon-side.
+
+This is arguably a *larger* fork than the scoping question, and it may
+constrain it: option 3 in particular makes path-based anything moot and makes
+repo-declared identity close to forced.
+
+**Recorded as an open question, not a proposal.** It touches D-0003 and D-0007
+directly and belongs in issue #18's scope. Flagged here because deciding
+scoping in isolation risks answering the small question in a way the big one
+overturns.
+
 ## Recommendation offered, not taken
 
 On the constraint as stated — the daemon moving off the user's machine — **B is
