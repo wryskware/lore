@@ -88,6 +88,7 @@ foreach ($modelId in $Models) {
             "query_prefix = $($m.query_prefix | ConvertTo-Json)"
             "document_prefix = $($m.document_prefix | ConvertTo-Json)"
             'batch_max_items = 64'
+            "max_embed_bytes = $($m.max_embed_bytes)"
         ) | Set-Content (Join-Path $dataDir 'config.toml')
     }
 
@@ -102,8 +103,12 @@ foreach ($modelId in $Models) {
             if (-not $llamaExe) { throw 'llama-server.exe missing — run setup.ps1 first' }
             $gguf = Join-Path $Root "models\$modelId.gguf"
             if (-not (Test-Path $gguf)) { throw "$gguf missing — run setup.ps1" }
+            # Baseline before the server exists: per-process VRAM is [N/A]
+            # under Windows WDDM, so llama's footprint is whole-GPU delta.
+            $vramBaseline = 0
+            try { $vramBaseline = [int](& nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits) } catch {}
             $args = @('-m', $gguf, '--embedding', '--pooling', $m.pooling,
-                      '-c', $m.ctx, '-b', 8192, '-ub', 8192, '--parallel', 4,
+                      '-c', $m.ctx, '-b', 8192, '-ub', 8192, '--parallel', $m.parallel,
                       '-ngl', 999, '--metrics', '--host', '127.0.0.1', '--port', $LlamaPort)
             $llama = Start-Process -FilePath $llamaExe.FullName -ArgumentList $args -PassThru -WindowStyle Hidden `
                 -RedirectStandardOutput (Join-Path $outDir 'llama.out.log') -RedirectStandardError (Join-Path $outDir 'llama.err.log')
@@ -150,13 +155,7 @@ foreach ($modelId in $Models) {
             $llamaMib = 0; $gpuMib = 0
             try {
                 $gpuMib = [int](& nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
-                if ($llama) {
-                    $apps = & nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits
-                    foreach ($line in $apps) {
-                        $p, $mem = $line -split ',\s*'
-                        if ([int]$p -eq $llama.Id) { $llamaMib = [int]$mem }
-                    }
-                }
+                if ($llama) { $llamaMib = [math]::Max(0, $gpuMib - $vramBaseline) }
             } catch {}
             if ($llamaMib -gt $maxLlama) { $maxLlama = $llamaMib }
             if ($gpuMib -gt $maxGpu) { $maxGpu = $gpuMib }
