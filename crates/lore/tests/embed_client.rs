@@ -161,6 +161,54 @@ async fn a_client_error_is_permanent_and_never_retried() {
     stub.shutdown().await;
 }
 
+/// The failure from #6: Ollama on Windows answered a perfectly valid request
+/// with a 400 whose body was the dial error from running out of ephemeral
+/// ports. Taken at face value that is "never retry", and it cost 64 healthy
+/// chunks their vectors. The body is the evidence that outranks the status.
+#[tokio::test]
+async fn a_transport_error_wrapped_in_a_client_error_is_retried() {
+    const DIAL: &str = "Post \"http://127.0.0.1:11434/api/embed\": dial tcp \
+         127.0.0.1:11434: connectex: Only one usage of each socket address \
+         (protocol/network address/port) is normally permitted.";
+
+    let stub = Stub::start().await;
+    stub.state
+        .script([Reply::StatusBody(400, DIAL.to_string())]);
+    let client = EmbedClient::new(settings(&stub.base)).unwrap();
+
+    let vectors = client
+        .embed(&texts(&["ranking"]))
+        .await
+        .expect("the retry found the port pressure gone");
+    assert_eq!(vectors[0], stub_vector("ranking"));
+    assert_eq!(stub.state.attempts(), 2, "one failure, one success");
+    stub.shutdown().await;
+}
+
+/// …but the benefit of the doubt is bounded. A 4xx that keeps failing is
+/// permanent after all, because the alternative — calling it transient — has
+/// the worker re-sending it every pass for the life of the process.
+#[tokio::test]
+async fn a_transport_signature_that_never_clears_is_permanent_after_all() {
+    let stub = Stub::start().await;
+    stub.state.script(std::iter::repeat_n(
+        Reply::StatusBody(400, "dial tcp: i/o timeout".to_string()),
+        10,
+    ));
+    let client = EmbedClient::new(settings(&stub.base)).unwrap();
+
+    let err = client
+        .embed(&texts(&["ranking"]))
+        .await
+        .expect_err("every attempt failed");
+    assert!(
+        err.is_permanent(),
+        "an unending 4xx must not be transient: {err}"
+    );
+    assert_eq!(stub.state.attempts(), 4, "max_attempts, not more");
+    stub.shutdown().await;
+}
+
 #[tokio::test]
 async fn retry_after_is_honoured_in_preference_to_the_backoff() {
     let stub = Stub::start().await;

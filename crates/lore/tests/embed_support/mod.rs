@@ -72,6 +72,9 @@ pub enum Reply {
     Status(u16),
     /// Fail with this status and `Retry-After: <secs>`.
     StatusRetryAfter(u16, u64),
+    /// Fail with this status and exactly this body — the way to reproduce a
+    /// server that wraps one kind of failure in another's status code.
+    StatusBody(u16, String),
     /// Succeed with exactly these vectors, one per input — the way to hand
     /// the worker a vector no honest model would produce.
     Vectors(Vec<Vec<f32>>),
@@ -249,6 +252,7 @@ async fn embeddings(State(state): State<Arc<StubState>>, body: String) -> Respon
                 "scripted failure",
             )
                 .into_response(),
+            Reply::StatusBody(code, body) => (status(code), body).into_response(),
             Reply::Vectors(vectors) => {
                 assert_eq!(vectors.len(), inputs.len(), "scripted vectors per input");
                 let data: Vec<Value> = vectors
