@@ -1,68 +1,87 @@
-# Round-2 steering drafts — lore adoption on the on-arm
+# Lore steering — final drafts (Lever A + Lever B)
 
-Drafted mid-round-1 (qwen matrix running, unsteered). Round 1 observation:
-qwen3.8 on-arm lore usage is bimodal — 12/12 tool calls on lore/T1, then 0
-on lore/T3, 0 on terrarium/T2, 1/19 on terrarium/T1. It reaches for lore
-when the prompt smells like a search task and greps its way through
-everything else. Two levers, deliberately separable experiments. Neither is
-applied anywhere yet; both are Wrysk-review-then-apply.
+Status: **drafted, nothing applied.** Wrysk is holding off on another bench
+round; these are ready to apply whenever. Updated after the round-1 grading
+pass, which changed the framing: unsteered adoption cost **zero
+correctness** (qwen 12.5/15 both arms; no cell anywhere scored worse with
+lore on), so steering's job is not rescuing quality — it is (a) capturing
+the token/wall win that only materialized where the model actually leaned
+on retrieval (Lexomancy: luna −55% tokens at equal-or-better scores) and
+(b) avoiding the aimless-exploration tax where lore was carried but unused
+(qwen terrarium/lore T3/T5 cells). That also means steering can ship on its
+own merits and be validated by dogfood; a round-2 bench validates it but is
+not a prerequisite.
 
-## Lever A — repo-level nudge (AGENTS.md in each bench repo)
+## Lever B — lore-mcp `search` tool description (recommended first; ships to every consumer)
 
-Cheap, per-repo, no code change, invisible to the off arm (the file only
-matters if the agent reads it, but opencode injects AGENTS.md into context,
-so it lands on both arms — the off arm just has no lore tools to act on it;
-worth noting when grading).
-
-Proposed text, identical in all three bench repos:
-
-```markdown
-# Working in this repo
-
-This repo is indexed by the lore context daemon. When you need to find
-where something is implemented, how a subsystem works, or what the design
-docs decided, call `lore_search` FIRST — it does hybrid lexical+semantic
-retrieval over code and design docs and is faster and more complete than
-grepping. Use grep/glob only for exhaustive literal sweeps (every call
-site of an exact string). After a search hit, use `lore_expand` to read
-it before quoting or editing.
-```
-
-Placement: `AGENTS.md` at repo root of `lore-bench`, `terrarium-bench`, and
-for Lexomancy the bench junction root (verify opencode picks it up through
-the junction; Lexomancy-alt is under cm, so the file must be a local-only
-add that T5's undo pass never captures — add it to the run-day checklist,
-not the tree, or pre-freeze it before pinning).
-
-## Lever B — tool-description rewording (lore-mcp server.rs)
-
-Current `search` description is strong on authority semantics but silent on
-*when to use the tool at all* — no contrast with the native grep/read tools
-sitting next to it in the model's toolbox. Proposed: prepend a use-cue
-sentence, keep the authority text intact.
+`crates/lore-mcp/src/server.rs`, `search` tool. Replacement description —
+the first two sentences are new, the authority text is unchanged from
+current:
 
 ```text
-Your first tool for any "where is / how does / what decided" question
-about an indexed project: hybrid lexical+semantic search over the code
-and design vaults on this machine. Prefer this over grep or directory
-listing when you don't already know the exact file — one query replaces
-several exploratory greps and also surfaces design-doc context grep
-cannot see. [existing provenance/authority text unchanged] ...
+Your first tool for any "where is X / how does Y work / what was decided
+about Z" question in an indexed project: one query replaces a chain of
+exploratory greps and directory reads, and also surfaces design-doc and
+decision context that grep cannot see. Prefer it whenever you do not
+already know the exact file; fall back to grep only for exhaustive
+literal sweeps (every occurrence of an exact string) — and note that
+inconsistently-named concepts defeat literal grep but not this search.
+Hybrid lexical+semantic search over the code projects and design vaults
+indexed on this machine. Each hit carries provenance (file, line span,
+symbol path for code, heading path for Markdown), the status the
+document declares, and the authority Lore actually assigns it. Those
+differ on purpose: `decided` is honored only when the document cites a
+decision still active in the project's ledger, and scratch/research
+paths are capped whatever they declare - a demoted hit says why in its
+authority note. Prefer sources whose *effective* authority is `decided`
+when documents disagree; cited decision IDs are provenance, not
+authority. Excerpts are truncated; call `expand` with a hit's
+project_key and chunk_id to read it.
 ```
 
-`expand` and `status` descriptions already carry their use-cues; no change.
+The "inconsistently-named concepts" cue is earned: the round-1 Lexomancy
+T3 trap (code says Lexonic, ledger says Lexic) is exactly the case where a
+literal grep silently loses half the results.
 
-Costs of B: touches `crates/lore-mcp/src/server.rs`, must update the golden
-snapshot `mcp_golden__tools_list.snap`, and must keep the
-`tool_descriptions_steer_the_agent_rather_than_restating_the_name` test
-green. Benefits every consumer, not just the bench — arguably the
-principled fix if round 1 shows the description undersells the tool.
+`expand`/`status` descriptions unchanged. Application checklist:
+- update `mcp_golden__tools_list.snap` (`cargo insta` or snapshot review)
+- keep `tool_descriptions_steer_the_agent_rather_than_restating_the_name`
+  green
+- separate commit, no other changes mixed in
 
-## Protocol note
+## Lever A — repo AGENTS.md nudge (hold unless B proves insufficient)
 
-Round 1 ran the on-arm **unsteered** — record that in the round-1 plan doc
-before grading so on-arm scores are read as organic-adoption numbers. A
-round-2 rerun needs only the 15 on-arm cells (~20 min) to produce the
-three-way off / on-unsteered / on-steered comparison. If both levers go in
-at once we can't attribute the delta; recommended order is B alone first
-(it ships to real users), A only if B is insufficient.
+Identical text for each bench repo (and usable verbatim in any real repo
+lore indexes). Final wording:
+
+```markdown
+## Code and design search
+
+This repo is indexed by the lore context daemon. For any "where is X",
+"how does Y work", or "what was decided about Z" question, call
+`lore_search` FIRST — it searches code and design docs together and is
+faster and more complete than grepping, especially when you don't know
+the exact file or the concept's naming is inconsistent. After a hit, use
+`lore_expand` to read it in full before quoting or editing. Use
+grep/glob only for exhaustive literal sweeps of an exact string.
+```
+
+Bench-application caveats (recorded from round 1, matter only if a round 2
+actually runs):
+- opencode injects AGENTS.md into context on BOTH arms; the off arm just
+  has no lore tools to act on it. Note it when grading.
+- Lexomancy: the file must live at the bench junction root and stay out of
+  the cm workspace so T5's undo pass never captures it; add to the run-day
+  checklist rather than the tree.
+
+## If/when a round 2 runs
+
+Only the 15 on-arm cells need re-running (~20 min qwen serial, ~10 min luna
+4-wide) for an off / on-unsteered / on-steered three-way. Apply B alone
+first; A only if B doesn't move adoption. Key fixes to fold in first, from
+the graders' key_gaps notes (see bench/results/grades.md 2026-08-16
+section): lore-T3's prompt asks only half its key bullet; lore-T5 should
+state whether CHUNK_FORMAT_VERSION must bump; lexomancy-T5 should pin the
+shield-percentage normalization (answers chose Block/MaxHP); the two T4
+keys should say whether code citations satisfy the prose-source
+requirement (both arms took symmetric 0.5s on the strict reading).
