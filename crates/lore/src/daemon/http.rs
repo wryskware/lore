@@ -13,6 +13,20 @@
 //!   [`StoreHandle::with`], which puts every blocking call on the blocking
 //!   pool.
 //!
+//! # Scoping
+//!
+//! Every *query* is scoped to exactly one project: `search` and `expand`
+//! reject a request that names none, with an error that says how to name one
+//! (`design/9_Scratch/2026-08-16_project-scoping-decision-brief.md`,
+//! "Resolution"). `GET /v1/status?project=` narrows the same way.
+//!
+//! **Bare `GET /v1/status` deliberately stays machine-wide.** It is the
+//! local-admin surface — what `lore status` prints for the person who owns the
+//! daemon — not the answer a scoped client gets. `lore-mcp` therefore always
+//! passes `?project=`, so an agent enumerates only its own project. When the
+//! daemon stops being loopback-only, this is the view that needs a capability
+//! boundary rather than a filter.
+//!
 //! No authentication: the listener binds `127.0.0.1` only, so reaching it
 //! already requires local code execution.
 // TODO(hardening): a bearer secret written into daemon.json (readable only by
@@ -22,16 +36,16 @@
 
 use std::sync::Arc;
 
-use axum::extract::{DefaultBodyLimit, FromRequest, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 
 use lore_core::{
     DaemonStatus, ExpandRequest, IndexRequest, IndexResponse, ProjectInfo, ProjectList,
-    RegisterProjectRequest, SearchRequest,
+    RegisterProjectRequest, RemoveProjectResponse, SearchRequest,
 };
 
 use crate::config::Config;
@@ -67,6 +81,8 @@ pub fn router(state: AppState) -> Router {
     let v1 = Router::new()
         .route("/status", get(status))
         .route("/projects", get(list_projects).post(register_project))
+        .route("/projects/{project}", delete(remove_project))
+        .route("/resolve", get(resolve))
         .route("/index", post(index))
         .route("/search", post(search_route))
         .route("/expand", post(expand_route))
@@ -104,6 +120,18 @@ impl ApiErr {
         Self::new(StatusCode::NOT_FOUND, message)
     }
 
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, message)
+    }
+}
+
+/// Appended to every "which project?" refusal. Errors in this codebase name
+/// the remedy, and for scoping there are exactly two: look one up, or enroll
+/// one.
+const NAME_A_PROJECT: &str =
+    "name a registered project (see `lore status`), or register one with `lore add <path>`";
+
+impl ApiErr {
     /// Internal failures are logged with their full chain and reported with a
     /// short message: the client can only retry, and the detail belongs in
     /// the daemon's log where it is correlated with everything else.
@@ -156,10 +184,16 @@ type ApiResult<T> = Result<Json<T>, ApiErr>;
 // Handlers
 // ---------------------------------------------------------------------------
 
-/// `GET /v1/status?project=<name>` — the optional filter adds that project's
-/// per-corpus store-scan window to the latency list. Without it only the
-/// global endpoints are reported, so a registry with many projects does not
-/// turn `status` into a wall of rows.
+/// `GET /v1/status?project=<name-or-key>` — scope the report to one project.
+///
+/// With the filter the `projects` list holds that project alone and the
+/// latency list gains its per-corpus store-scan window; an unknown name is a
+/// 404 rather than an empty list, because "no such project" and "that project
+/// has nothing indexed" are different answers.
+///
+/// Without it the report stays machine-wide: see the module header on why the
+/// unscoped view is the local-admin surface rather than the default a scoped
+/// client should get.
 #[derive(Debug, serde::Deserialize)]
 struct StatusQuery {
     project: Option<String>,
@@ -176,64 +210,85 @@ async fn status(
         .map_err(|err| ApiErr::internal("status", err))?
         .map_err(|err| ApiErr::internal("status", err))?;
 
+    let mut projects: Vec<lore_core::ProjectStatus> = status
+        .projects
+        .into_iter()
+        .map(|p| lore_core::ProjectStatus {
+            id: p.project,
+            name: p.name,
+            key: p.key,
+            root: p.root.into_string(),
+            kind: p.kind.as_str().to_string(),
+            files: p.files,
+            chunks: p.chunks,
+            embedded_chunks: p.embedded_chunks,
+            authority_violations: p.authority_violations,
+            authority_violation_paths: p
+                .authority_violation_paths
+                .into_iter()
+                .map(camino::Utf8PathBuf::into_string)
+                .collect(),
+            // The repo's own `.lore.toml` verdict (D-0012). The behavior
+            // is reported only alongside a profile: on its own it would
+            // claim a mode for a repo that declared nothing.
+            authority_profile: p
+                .authority
+                .profile
+                .map(|profile| profile.as_str().to_string()),
+            authority_behavior: p
+                .authority
+                .profile
+                .map(|_| p.authority.behavior.as_str().to_string()),
+            authority_config_error: p.authority.error,
+            decisions_active: p.decisions_active,
+            decisions_total: p.decisions_total,
+            decision_violations: p
+                .decision_violations
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            // Same reasoning as `embeddings` below: a watch that is not
+            // armed degrades the daemon silently unless it is reported.
+            watch: state.watch_status.of(p.project),
+        })
+        .collect();
+
+    // Scoping the report, when asked. Identity is matched the same three ways
+    // everything else accepts a project (name, key, id), so a caller holding
+    // any of them can narrow without first translating it.
+    if let Some(wanted) = query.project.as_deref() {
+        projects.retain(|p| p.name == wanted || p.key == wanted || p.id.to_string() == wanted);
+        if projects.is_empty() {
+            return Err(ApiErr::not_found(format!(
+                "unknown project `{wanted}`; {NAME_A_PROJECT}"
+            )));
+        }
+    }
+
     Ok(Json(DaemonStatus {
         api_version: lore_core::API_VERSION,
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
         generation: status.generation,
-        projects: status
-            .projects
-            .into_iter()
-            .map(|p| lore_core::ProjectStatus {
-                id: p.project,
-                name: p.name,
-                key: p.key,
-                root: p.root.into_string(),
-                kind: p.kind.as_str().to_string(),
-                files: p.files,
-                chunks: p.chunks,
-                embedded_chunks: p.embedded_chunks,
-                authority_violations: p.authority_violations,
-                authority_violation_paths: p
-                    .authority_violation_paths
-                    .into_iter()
-                    .map(camino::Utf8PathBuf::into_string)
-                    .collect(),
-                // The repo's own `.lore.toml` verdict (D-0012). The behavior
-                // is reported only alongside a profile: on its own it would
-                // claim a mode for a repo that declared nothing.
-                authority_profile: p
-                    .authority
-                    .profile
-                    .map(|profile| profile.as_str().to_string()),
-                authority_behavior: p
-                    .authority
-                    .profile
-                    .map(|_| p.authority.behavior.as_str().to_string()),
-                authority_config_error: p.authority.error,
-                decisions_active: p.decisions_active,
-                decisions_total: p.decisions_total,
-                decision_violations: p
-                    .decision_violations
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect(),
-                // Same reasoning as `embeddings` below: a watch that is not
-                // armed degrades the daemon silently unless it is reported.
-                watch: state.watch_status.of(p.project),
-            })
-            .collect(),
+        // Per-corpus latency rows are labeled `endpoint:<whatever the request
+        // said>`, which may be a name or a key; matching the scoped project's
+        // own identifiers keeps the row visible either way.
+        latency: {
+            let identifiers: Vec<&str> = projects
+                .iter()
+                .flat_map(|p| [p.name.as_str(), p.key.as_str()])
+                .collect();
+            let mut latency = state.latency.snapshot();
+            latency.retain(|l| match l.endpoint.split_once(':') {
+                None => true, // global endpoints always
+                Some((_, project)) => query.project.is_some() && identifiers.contains(&project),
+            });
+            latency
+        },
+        projects,
         // Live probe result, not a guess derived from the config file: the
         // whole point of D-0007 is that a user can see *why* results are
         // lexical-only.
         embeddings: state.embeddings.status(),
-        latency: {
-            let mut latency = state.latency.snapshot();
-            latency.retain(|l| match l.endpoint.split_once(':') {
-                None => true, // global endpoints always
-                Some((_, project)) => query.project.as_deref() == Some(project),
-            });
-            latency
-        },
     }))
 }
 
@@ -279,6 +334,11 @@ async fn register_project(
     // makes `expand(project, chunk_id)` resolve the wrong source or 404
     // (S1#3). Reject at the door rather than silently accepting an ambiguous
     // registry; the caller has a one-flag fix.
+    //
+    // 409 rather than 400: the request is well-formed and the name is legal —
+    // it is the *registry's current state* that refuses it, and that is a
+    // state the caller can change. Re-adding the same root under the same name
+    // is not a collision with itself; it is the idempotent rename path below.
     let existing = projects_of(&state).await?;
     if crate::registry::names_taken_by_others(&existing, &root).contains(&name) {
         let other = existing
@@ -286,9 +346,10 @@ async fn register_project(
             .find(|project| project.name == name)
             .map(|project| project.root.to_string())
             .unwrap_or_default();
-        return Err(ApiErr::bad_request(format!(
-            "a project named `{name}` is already registered ({other}); \
-             pass --name to give this one a different display name"
+        return Err(ApiErr::conflict(format!(
+            "a project named `{name}` is already registered at {other}, so {root} cannot \
+             also claim it; choose another name with `--name <name>`, or edit that repo's \
+             .lore.toml to rename it"
         )));
     }
 
@@ -353,6 +414,139 @@ async fn register_project(
     Ok(Json(info(&project)))
 }
 
+/// `DELETE /v1/projects/{name-or-key}` — deregister a project and forget its
+/// index.
+///
+/// The four things that make a project "registered" are undone in an order
+/// that cannot leave a half-removed one behind on any single failure:
+/// the manifest is authoritative, so it is republished from the store the
+/// moment the store changes, and the watch is dropped last because a watcher
+/// still armed on a forgotten root only costs a wasted rescan request, while a
+/// manifest still naming it would resurrect the project on the next start.
+async fn remove_project(
+    State(state): State<AppState>,
+    Path(wanted): Path<String>,
+) -> ApiResult<RemoveProjectResponse> {
+    let projects = projects_of(&state).await?;
+    // Name first, then key — the same precedence `resolve_project` documents,
+    // extended to keys because a caller who has only a key (an agent replaying
+    // a search result, a script) should not have to translate it first.
+    let project = super::resolve_project(&projects, &wanted)
+        .or_else(|| super::resolve_project_key(&projects, &wanted))
+        .ok_or_else(|| ApiErr::not_found(format!("unknown project `{wanted}`; {NAME_A_PROJECT}")))?
+        .clone();
+
+    // Counted before the delete: afterwards there is nothing left to count,
+    // and "removed 0 chunks" would misreport every removal.
+    let counted = state
+        .store
+        .with(|store| store.status())
+        .await
+        .map_err(|err| ApiErr::internal("remove project", err))?
+        .map_err(|err| ApiErr::internal("remove project", err))?
+        .projects
+        .into_iter()
+        .find(|p| p.project == project.id);
+    let (files, chunks) = counted.map_or((0, 0), |p| (p.files, p.chunks));
+
+    let id = project.id;
+    let removed = state
+        .store
+        .with(move |store| store.remove_project(id))
+        .await
+        .map_err(|err| ApiErr::internal("remove project", err))?
+        .map_err(|err| ApiErr::internal("remove project", err))?;
+    if !removed {
+        return Err(ApiErr::not_found(format!(
+            "unknown project `{wanted}`; {NAME_A_PROJECT}"
+        )));
+    }
+
+    // Same reasoning as registration: a stale manifest outlives the process,
+    // so a failure here is loud even though the removal itself succeeded.
+    {
+        let data_dir = state.data_dir.clone();
+        match state
+            .store
+            .with(move |store| crate::registry::publish(store, &data_dir))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) | Err(err) => tracing::error!(
+                error = %format!("{err:#}"),
+                "project removed but the registry manifest could not be written; \
+                 it will come back on the next start"
+            ),
+        }
+    }
+
+    let _ = state.watch.send(WatchCommand::Unwatch(id));
+    state.watch_status.forget(id);
+
+    tracing::info!(
+        project = %project.name,
+        key = %project.key,
+        root = %project.root,
+        files, chunks,
+        "project removed"
+    );
+    Ok(Json(RemoveProjectResponse {
+        project: info(&project),
+        files,
+        chunks,
+    }))
+}
+
+/// `GET /v1/resolve?path=<absolute path>` — which registered project contains
+/// this path?
+///
+/// **INTERIM, and local-only.** The scoping resolution
+/// (`design/9_Scratch/2026-08-16_project-scoping-decision-brief.md`) settled
+/// the wire contract — every query names one project — while explicitly
+/// *deferring* the identity mechanism to issue #18's ingestion fork. Until
+/// that is decided the identifier is the registry's own project name/key, and
+/// this endpoint is the sanctioned convenience by which a co-located client
+/// fills it in from where it happens to be standing.
+///
+/// It is acceptable only because the daemon is loopback-only today: registered
+/// roots are paths on the daemon's filesystem, which means nothing to a remote
+/// client. Expect it to be revisited — most sharply if ingestion inverts, which
+/// makes path-based anything moot. The rest of the wire stays name/key-based;
+/// this is the one route that takes a path.
+#[derive(Debug, serde::Deserialize)]
+struct ResolveQuery {
+    path: String,
+}
+
+async fn resolve(
+    State(state): State<AppState>,
+    Query(query): Query<ResolveQuery>,
+) -> ApiResult<ProjectInfo> {
+    let path = Utf8Path::new(query.path.trim());
+    if path.as_str().is_empty() || !path.is_absolute() {
+        return Err(ApiErr::bad_request(format!(
+            "resolve needs an absolute path, not `{}`; pass the client's working directory",
+            query.path
+        )));
+    }
+
+    let projects = projects_of(&state).await?;
+    // Longest root wins. Roots may legitimately nest (a repo and a package
+    // inside it are two projects), and the innermost one is the project the
+    // caller is actually standing in — the same rule the watcher's routing
+    // would reach for if it had to pick just one.
+    let project = projects
+        .iter()
+        .filter(|project| paths::is_within(&project.root, path))
+        .max_by_key(|project| project.root.as_str().len())
+        .ok_or_else(|| {
+            ApiErr::not_found(
+                "path is not inside any registered project; register it with `lore add <path>`",
+            )
+        })?;
+    Ok(Json(info(project)))
+}
+
 async fn index(
     State(state): State<AppState>,
     ApiJson(request): ApiJson<IndexRequest>,
@@ -379,13 +573,32 @@ async fn search_route(
     ApiJson(request): ApiJson<SearchRequest>,
 ) -> ApiResult<lore_core::SearchResponse> {
     let started = std::time::Instant::now();
+
+    // Scoping is a requirement, not a default: an unscoped query used to span
+    // every project on the machine, which on a shared daemon is one user
+    // reading another's code.
+    //
+    // API_VERSION is deliberately *not* bumped for this. /v1 is pre-release,
+    // no released client depends on the unscoped behavior, and the refusal is
+    // self-describing — a client that sends the old shape gets a 400 telling
+    // it exactly what to add, which is strictly more useful than a version
+    // handshake failure that says only "upgrade".
+    let scope = request
+        .project_key
+        .as_deref()
+        .or(request.project.as_deref())
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .ok_or_else(|| {
+            ApiErr::bad_request(format!(
+                "search is scoped to one project: pass `project` (or `project_key`) and {NAME_A_PROJECT}"
+            ))
+        })?;
+
     // The store stage is recorded per project: the vector arm is an O(n)
     // scan, so its cost is a property of the corpus searched, not of the
-    // daemon. `all` = no project filter (every corpus scanned).
-    let store_label = format!(
-        "search_store:{}",
-        request.project.as_deref().unwrap_or("all")
-    );
+    // daemon.
+    let store_label = format!("search_store:{scope}");
 
     // Embedding the query is network I/O, so it happens *before* the store
     // lock is taken — never while holding it. `None` simply means this
@@ -408,9 +621,10 @@ async fn search_route(
     state.latency.record("search", started.elapsed());
     match outcome {
         Ok(response) => Ok(Json(response)),
-        Err(err @ search::SearchError::UnknownProject(_)) => {
-            Err(ApiErr::not_found(err.to_string()))
-        }
+        Err(
+            err @ (search::SearchError::UnknownProject(_)
+            | search::SearchError::UnknownProjectKey(_)),
+        ) => Err(ApiErr::not_found(err.to_string())),
         Err(err @ search::SearchError::UnknownStatus(_)) => {
             Err(ApiErr::bad_request(err.to_string()))
         }
@@ -427,15 +641,23 @@ async fn expand_route(
     // Key first: it is exact. The display-name path stays for humans, older
     // clients, and anyone typing a command by hand.
     let project = match &request.project_key {
-        Some(key) => super::resolve_project_key(&projects, key)
-            .ok_or_else(|| ApiErr::not_found(format!("unknown project key `{key}`")))?,
-        None if request.project.is_empty() => {
-            return Err(ApiErr::bad_request(
-                "expand needs a project: pass project_key from the search result",
-            ));
+        Some(key) => super::resolve_project_key(&projects, key).ok_or_else(|| {
+            ApiErr::not_found(format!("unknown project key `{key}`; {NAME_A_PROJECT}"))
+        })?,
+        // Same scoping requirement as `search`, and the same reasoning about
+        // API_VERSION; here it was already an error, only under-explained.
+        None if request.project.trim().is_empty() => {
+            return Err(ApiErr::bad_request(format!(
+                "expand is scoped to one project: pass `project_key` from the search result \
+                 (or `project`) and {NAME_A_PROJECT}"
+            )));
         }
-        None => super::resolve_project(&projects, &request.project)
-            .ok_or_else(|| ApiErr::not_found(format!("unknown project `{}`", request.project)))?,
+        None => super::resolve_project(&projects, &request.project).ok_or_else(|| {
+            ApiErr::not_found(format!(
+                "unknown project `{}`; {NAME_A_PROJECT}",
+                request.project
+            ))
+        })?,
     }
     .clone();
 

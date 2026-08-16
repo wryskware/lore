@@ -4,6 +4,8 @@
 //! assumptions about table layout — so they stay valid if the seam is
 //! re-implemented on Tantivy+arroy.
 
+use std::collections::BTreeSet;
+
 use camino::{Utf8Path, Utf8PathBuf};
 use lore::repo_config::{Behavior, Profile, RepoAuthority};
 use lore::store::{
@@ -267,6 +269,93 @@ fn get_chunk_and_get_file_chunks_are_ordered() {
             .get_chunk(proj, &lore::types::ChunkId("nope".into()))
             .unwrap()
             .is_none()
+    );
+}
+
+/// What `lore remove` actually destroys, pinned so the CLI's promise ("dropped
+/// N file(s) and M chunk(s)") is not larger than the deletion behind it.
+///
+/// The one that is easy to get wrong is `embeddings`: nothing deletes it by
+/// project id — the vectors go only because their chunks do, through the FK
+/// cascade on `chunks(id)`. A refactor that deleted chunk rows some other way
+/// would silently orphan every vector, and a stale vector answers searches.
+#[test]
+fn remove_project_cascades_chunks_fts_vectors_files_and_decisions() {
+    let dir = TempDir::new().unwrap();
+    let mut store = open(&dir);
+    let doomed = store
+        .register_project(p("C:/repos/doomed"), "doomed")
+        .unwrap();
+    let keeper = store
+        .register_project(p("C:/repos/keeper"), "keeper")
+        .unwrap();
+
+    for project in [doomed, keeper] {
+        let c = code_chunk("src/lib.rs", "f", "fn f() { let capybara = 1; }", "rust");
+        store
+            .replace_file_chunks(project, p("src/lib.rs"), "h", std::slice::from_ref(&c))
+            .unwrap();
+        store
+            .upsert_embeddings(&[NewEmbedding {
+                project,
+                chunk_id: c.id.clone(),
+                vector: vec![1.0, 0.0],
+            }])
+            .unwrap();
+    }
+    store
+        .set_active_decisions(doomed, &BTreeSet::from(["D-0001".to_string()]))
+        .unwrap();
+
+    assert!(store.remove_project(doomed).unwrap());
+    assert!(
+        !store.remove_project(doomed).unwrap(),
+        "a second removal reports that there was nothing to remove"
+    );
+
+    // The project itself.
+    let names: Vec<String> = store
+        .list_projects()
+        .unwrap()
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
+    assert_eq!(names, ["keeper"]);
+
+    // Its rows: chunks, FTS entries, vectors, file records, decisions.
+    let mine = SearchFilter {
+        project: Some(doomed),
+        ..SearchFilter::default()
+    };
+    assert!(
+        store
+            .lexical_search("capybara", &mine, 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .vector_search(&[1.0, 0.0], &mine, 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(store.list_files(doomed).unwrap().is_empty());
+    assert!(store.active_decisions(doomed).unwrap().is_empty());
+
+    // …and only its rows. The survivor's chunk, FTS row and vector are intact,
+    // which is what makes the deletion a removal rather than a wipe.
+    let all = SearchFilter::default();
+    assert_eq!(store.lexical_search("capybara", &all, 10).unwrap().len(), 1);
+    assert_eq!(store.vector_search(&[1.0, 0.0], &all, 10).unwrap().len(), 1);
+    let status = store.status().unwrap();
+    assert_eq!(status.projects.len(), 1);
+    assert_eq!(
+        (
+            status.projects[0].files,
+            status.projects[0].chunks,
+            status.projects[0].embedded_chunks
+        ),
+        (1, 1, 1)
     );
 }
 

@@ -63,6 +63,7 @@ fn request(query: &str) -> SearchRequest {
     SearchRequest {
         query: query.to_string(),
         project: None,
+        project_key: None,
         path_prefix: None,
         language: None,
         status: Vec::new(),

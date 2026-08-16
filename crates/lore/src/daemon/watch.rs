@@ -78,6 +78,12 @@ pub const EVENT_CAPACITY: usize = 64;
 pub enum WatchCommand {
     /// Start watching a project root (idempotent).
     Watch(Project),
+    /// Stop watching a deregistered project (idempotent, and silent about a
+    /// project it never had). The root travels inside the pump's own table
+    /// rather than in the message: by the time this is sent the project is
+    /// already gone from the store, so the pump is the last place that still
+    /// knows which path to disarm.
+    Unwatch(ProjectId),
 }
 
 pub type WatchSender = mpsc::UnboundedSender<WatchCommand>;
@@ -117,6 +123,13 @@ impl WatchStatus {
 
     fn set(&self, project: ProjectId, state: WatchState) {
         self.lock().insert(project, state);
+    }
+
+    /// Drop a deregistered project's coverage. Leaving the entry would keep a
+    /// forgotten project's watch state alive for whatever row later inherits
+    /// its id.
+    pub fn forget(&self, project: ProjectId) {
+        self.lock().remove(&project);
     }
 
     fn lock(&self) -> MutexGuard<'_, BTreeMap<ProjectId, WatchState>> {
@@ -332,6 +345,24 @@ impl Watches {
         self.status.set(id, WatchState::Retrying);
     }
 
+    /// Forget a deregistered project: disarm its root and stop reporting it.
+    ///
+    /// Disarming is unconditional rather than "only if armed" — the backend's
+    /// `disarm` is best-effort by contract, and a watch that is mid-retry has
+    /// no armed handle to distinguish anyway.
+    fn forget(&mut self, backend: &mut impl WatchBackend, project: ProjectId) {
+        let Some(desired) = self.projects.remove(&project) else {
+            return;
+        };
+        backend.disarm(&desired.project.root);
+        self.status.forget(project);
+        tracing::info!(
+            project = %desired.project.name,
+            root = %desired.project.root,
+            "no longer watching; the project was deregistered"
+        );
+    }
+
     /// Arm every watch whose attempt is due. Failures reschedule themselves.
     fn arm_due(&mut self, backend: &mut impl WatchBackend, now: Instant) {
         for desired in self.projects.values_mut() {
@@ -531,6 +562,7 @@ pub async fn run_with<B: WatchBackend>(
             () = sleep_until(due) => {}
             command = commands.recv() => match command {
                 Some(WatchCommand::Watch(project)) => watches.want(project),
+                Some(WatchCommand::Unwatch(project)) => watches.forget(&mut backend, project),
                 None => break,
             },
             batch = events.recv() => match batch {

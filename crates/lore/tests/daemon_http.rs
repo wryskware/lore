@@ -100,6 +100,24 @@ async fn post(router: &Router, uri: &str, body: Value) -> (StatusCode, Value) {
     call(router, "POST", uri, Some(body)).await
 }
 
+async fn delete(router: &Router, uri: &str) -> (StatusCode, Value) {
+    call(router, "DELETE", uri, None).await
+}
+
+/// A scoped search against this file's single-project harness.
+///
+/// Every query names a project now, and the tests below are about filters,
+/// ranking and `expand` — not about scoping. Adding `"project": "demo"` to
+/// each of them by hand would say nothing and hide the one place it matters,
+/// so it is defaulted here and the scoping tests post to `/v1/search` directly
+/// where the *absence* is the thing under test.
+async fn search(router: &Router, mut body: Value) -> (StatusCode, Value) {
+    if body.get("project").is_none() && body.get("project_key").is_none() {
+        body["project"] = json!("demo");
+    }
+    post(router, "/v1/search", body).await
+}
+
 // ---------------------------------------------------------------------------
 // status / projects
 // ---------------------------------------------------------------------------
@@ -155,6 +173,7 @@ async fn registering_a_project_lists_it_watches_it_and_queues_a_scan() {
     // scheduled for an initial scan before the response is sent.
     match h.watch.try_recv().expect("a watch command was emitted") {
         WatchCommand::Watch(project) => assert_eq!(project.id, id),
+        other => panic!("registration must arm a watch, not {other:?}"),
     }
     let (queued, work) = h.queue.take().expect("an initial scan was queued");
     assert_eq!(queued, id);
@@ -253,7 +272,7 @@ async fn search_returns_ranked_lexical_results_with_provenance() {
     populate_standard_tree(&h.fixture);
     full_scan(&h.fixture.context(), &h.fixture.project);
 
-    let (status, body) = post(&h.router, "/v1/search", json!({ "query": "daemon owns" })).await;
+    let (status, body) = search(&h.router, json!({ "query": "daemon owns" })).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         body["lexical_only"], true,
@@ -282,12 +301,7 @@ async fn code_hits_carry_a_symbol_path_and_a_language() {
     populate_standard_tree(&h.fixture);
     full_scan(&h.fixture.context(), &h.fixture.project);
 
-    let (_, body) = post(
-        &h.router,
-        "/v1/search",
-        json!({ "query": "alpha", "language": "rust" }),
-    )
-    .await;
+    let (_, body) = search(&h.router, json!({ "query": "alpha", "language": "rust" })).await;
     let top = &body["results"][0];
     assert_eq!(top["language"], "rust");
     assert_eq!(top["path"], "src/lib.rs");
@@ -304,54 +318,48 @@ async fn search_filters_are_all_applied() {
 
     let hits = |body: &Value| body["results"].as_array().unwrap().len();
 
-    let (_, unfiltered) = post(&h.router, "/v1/search", json!({ "query": "daemon" })).await;
+    let (_, unfiltered) = search(&h.router, json!({ "query": "daemon" })).await;
     assert!(hits(&unfiltered) >= 1);
 
     // Path prefix.
-    let (_, body) = post(
+    let (_, body) = search(
         &h.router,
-        "/v1/search",
         json!({ "query": "daemon", "path_prefix": "src/" }),
     )
     .await;
     assert_eq!(hits(&body), 0, "no `daemon` under src/: {body}");
 
     // Language.
-    let (_, body) = post(
+    let (_, body) = search(
         &h.router,
-        "/v1/search",
         json!({ "query": "daemon", "language": "markdown" }),
     )
     .await;
     assert!(hits(&body) >= 1);
-    let (_, body) = post(
+    let (_, body) = search(
         &h.router,
-        "/v1/search",
         json!({ "query": "daemon", "language": "csharp" }),
     )
     .await;
     assert_eq!(hits(&body), 0);
 
     // Vault status, including the "no frontmatter" atom.
-    let (_, body) = post(
+    let (_, body) = search(
         &h.router,
-        "/v1/search",
         json!({ "query": "daemon", "status": ["decided"] }),
     )
     .await;
     assert!(hits(&body) >= 1);
-    let (_, body) = post(
+    let (_, body) = search(
         &h.router,
-        "/v1/search",
         json!({ "query": "daemon", "status": ["unclassified"] }),
     )
     .await;
     assert_eq!(hits(&body), 0, "the only match is a decided doc: {body}");
 
     // Limit.
-    let (_, body) = post(
+    let (_, body) = search(
         &h.router,
-        "/v1/search",
         json!({ "query": "the a demo daemon project", "limit": 1 }),
     )
     .await;
@@ -361,18 +369,12 @@ async fn search_filters_are_all_applied() {
 #[tokio::test]
 async fn search_rejects_an_unknown_project_and_an_unknown_status() {
     let h = harness();
-    let (status, body) = post(
-        &h.router,
-        "/v1/search",
-        json!({ "query": "x", "project": "ghost" }),
-    )
-    .await;
+    let (status, body) = search(&h.router, json!({ "query": "x", "project": "ghost" })).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(body["message"].as_str().unwrap().contains("ghost"));
 
-    let (status, body) = post(
+    let (status, body) = search(
         &h.router,
-        "/v1/search",
         json!({ "query": "x", "status": ["definitely-decided"] }),
     )
     .await;
@@ -391,7 +393,7 @@ async fn a_query_with_no_usable_terms_is_empty_not_an_error() {
     populate_standard_tree(&h.fixture);
     full_scan(&h.fixture.context(), &h.fixture.project);
 
-    let (status, body) = post(&h.router, "/v1/search", json!({ "query": ")))  ((" })).await;
+    let (status, body) = search(&h.router, json!({ "query": ")))  ((" })).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["results"].as_array().unwrap().len(), 0);
 }
@@ -409,7 +411,7 @@ async fn expand_widens_a_chunk_with_surrounding_file_context() {
     h.fixture.write("notes.md", format!("# Heading\n\n{lines}"));
     full_scan(&h.fixture.context(), &h.fixture.project);
 
-    let (_, search) = post(&h.router, "/v1/search", json!({ "query": "line 150" })).await;
+    let (_, search) = search(&h.router, json!({ "query": "line 150" })).await;
     let hit = &search["results"][0];
     let chunk_id = hit["chunk_id"].as_str().unwrap().to_string();
     let (chunk_start, chunk_end) = (
@@ -445,7 +447,7 @@ async fn expand_clamps_context_and_never_runs_off_the_file() {
         .write("small.md", "# Title\n\nJust one paragraph.\n");
     full_scan(&h.fixture.context(), &h.fixture.project);
 
-    let (_, search) = post(&h.router, "/v1/search", json!({ "query": "paragraph" })).await;
+    let (_, search) = search(&h.router, json!({ "query": "paragraph" })).await;
     let chunk_id = search["results"][0]["chunk_id"]
         .as_str()
         .unwrap()
@@ -473,7 +475,7 @@ async fn expand_falls_back_to_stored_text_when_the_file_is_gone() {
         .write("gone.md", "# Gone\n\nSoon to be deleted.\n");
     full_scan(&h.fixture.context(), &h.fixture.project);
 
-    let (_, search) = post(&h.router, "/v1/search", json!({ "query": "deleted" })).await;
+    let (_, search) = search(&h.router, json!({ "query": "deleted" })).await;
     let chunk_id = search["results"][0]["chunk_id"]
         .as_str()
         .unwrap()
@@ -502,7 +504,7 @@ async fn expand_resolves_by_project_key_in_preference_to_the_display_name() {
         .write("notes.md", "# Heading\n\nA line about ranking.\n");
     full_scan(&h.fixture.context(), &h.fixture.project);
 
-    let (_, search) = post(&h.router, "/v1/search", json!({ "query": "ranking" })).await;
+    let (_, search) = search(&h.router, json!({ "query": "ranking" })).await;
     let hit = &search["results"][0];
     let key = hit["project_key"].as_str().unwrap().to_string();
     let chunk_id = hit["chunk_id"].as_str().unwrap().to_string();
@@ -556,10 +558,18 @@ async fn registering_a_duplicate_display_name_is_refused_with_a_remedy() {
         json!({ "root": root, "name": "demo" }),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:#}");
+    // 409, not 400: the request is well-formed and the name is legal — the
+    // registry's current state is what refuses it, and that state can change.
+    assert_eq!(status, StatusCode::CONFLICT, "{body:#}");
     let message = body["message"].as_str().unwrap();
     assert!(message.contains("already registered"), "{message}");
     assert!(message.contains("--name"), "{message}");
+    assert!(message.contains(".lore.toml"), "{message}");
+    // Both roots are named, so the user can tell which project they collided
+    // with without going looking for it.
+    let claimant = lore::daemon::paths::canonicalize_root(&root).unwrap();
+    assert!(message.contains(h.fixture.root.as_str()), "{message}");
+    assert!(message.contains(claimant.as_str()), "{message}");
 
     // The same root under a free name is accepted and gets its own key.
     let (status, body) = post(
@@ -605,7 +615,7 @@ async fn a_valid_but_mismatched_display_name_loses_to_the_project_key() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body:#}");
 
-    let (_, search) = post(&h.router, "/v1/search", json!({ "query": "ranking" })).await;
+    let (_, search) = search(&h.router, json!({ "query": "ranking" })).await;
     let hit = &search["results"][0];
     let chunk_id = hit["chunk_id"].as_str().unwrap().to_string();
     assert_eq!(hit["project_key"], "demo", "{search:#}");
@@ -800,6 +810,359 @@ async fn expand_rejects_unknown_projects_and_unknown_chunks() {
 }
 
 // ---------------------------------------------------------------------------
+// Scoping: every query names exactly one project
+// ---------------------------------------------------------------------------
+
+/// The wire contract from the scoping resolution: an unscoped query used to
+/// span every project on the machine, which on a shared daemon is one user
+/// reading another's code. It is refused, and the refusal says how to scope.
+#[tokio::test]
+async fn an_unscoped_search_is_refused_with_the_remedy() {
+    let h = harness();
+    populate_standard_tree(&h.fixture);
+    full_scan(&h.fixture.context(), &h.fixture.project);
+
+    for body in [
+        json!({ "query": "daemon" }),
+        json!({ "query": "daemon", "project": null }),
+        json!({ "query": "daemon", "project": "   " }),
+    ] {
+        let (status, response) = post(&h.router, "/v1/search", body.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body} -> {response:#}");
+        let message = response["message"].as_str().unwrap();
+        assert!(message.contains("scoped to one project"), "{message}");
+        assert!(message.contains("project"), "{message}");
+        assert!(message.contains("lore status"), "{message}");
+        assert!(message.contains("lore add <path>"), "{message}");
+    }
+
+    // …and the same query with a project is a perfectly ordinary success, so
+    // the refusal is about scoping and nothing else.
+    let (status, _) = search(&h.router, json!({ "query": "daemon" })).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn an_unscoped_expand_is_refused_with_the_remedy() {
+    let h = harness();
+    let (status, body) = post(&h.router, "/v1/expand", json!({ "chunk_id": "abc" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let message = body["message"].as_str().unwrap();
+    assert!(message.contains("scoped to one project"), "{message}");
+    assert!(message.contains("project_key"), "{message}");
+    assert!(message.contains("lore add <path>"), "{message}");
+
+    // A whitespace-only display name is absence, not a project named "  ".
+    let (status, body) = post(
+        &h.router,
+        "/v1/expand",
+        json!({ "project": " ", "chunk_id": "abc" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:#}");
+}
+
+/// The key path stays scoped too — `search` resolves it exactly as `expand`
+/// does, so an agent replaying a hit's `project_key` reaches the same source.
+#[tokio::test]
+async fn search_accepts_a_project_key_and_prefers_it_over_the_display_name() {
+    let h = harness();
+    h.fixture
+        .write("notes.md", "# Heading\n\nA line about ranking.\n");
+    full_scan(&h.fixture.context(), &h.fixture.project);
+
+    let (status, body) = post(
+        &h.router,
+        "/v1/search",
+        json!({ "query": "ranking", "project_key": "demo" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    assert_eq!(body["results"][0]["path"], "notes.md");
+
+    // A wrong key beats a right name, or the field would be decorative.
+    let (status, body) = post(
+        &h.router,
+        "/v1/search",
+        json!({ "query": "ranking", "project": "demo", "project_key": "ghost-key" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body:#}");
+    let message = body["message"].as_str().unwrap();
+    assert!(message.contains("ghost-key"), "{message}");
+    assert!(message.contains("lore add <path>"), "{message}");
+}
+
+/// `status` narrows to one project the same way `search` does. Without a
+/// filter it stays machine-wide on purpose — that is the local-admin view.
+#[tokio::test]
+async fn status_scopes_to_one_project_and_404s_on_an_unknown_one() {
+    let h = harness();
+    let other = tempfile::tempdir().unwrap();
+    post(
+        &h.router,
+        "/v1/projects",
+        json!({ "root": other.path().to_string_lossy(), "name": "second" }),
+    )
+    .await;
+
+    let names = |body: &Value| -> Vec<String> {
+        body["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let (status, body) = get(&h.router, "/v1/status").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(names(&body).len(), 2, "the unscoped view is machine-wide");
+
+    let (status, body) = get(&h.router, "/v1/status?project=second").await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    assert_eq!(names(&body), ["second"]);
+
+    // By key as well as by name: a client holding either can narrow.
+    let (status, body) = get(&h.router, "/v1/status?project=demo").await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    assert_eq!(names(&body), ["demo"]);
+    assert_eq!(body["projects"][0]["key"], "demo");
+
+    // An unknown name is a 404, not an empty list: "no such project" and "that
+    // project has nothing indexed" are different answers.
+    let (status, body) = get(&h.router, "/v1/status?project=ghost").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body:#}");
+    let message = body["message"].as_str().unwrap();
+    assert!(message.contains("ghost"), "{message}");
+    assert!(message.contains("lore add <path>"), "{message}");
+}
+
+// ---------------------------------------------------------------------------
+// resolve (INTERIM — see the handler's doc comment)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn resolve_finds_the_project_containing_a_path() {
+    let h = harness();
+    h.fixture.write("src/deep/nested/file.rs", "fn x() {}\n");
+
+    // The root itself, and a directory well inside it: containment is a prefix
+    // test, so a subdirectory costs no walk-up.
+    for path in [
+        h.fixture.root.clone(),
+        h.fixture.root.join("src").join("deep").join("nested"),
+    ] {
+        let (status, body) = get(
+            &h.router,
+            &format!("/v1/resolve?path={}", urlencode(path.as_str())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body:#}");
+        assert_eq!(body["name"], "demo");
+        assert_eq!(body["key"], "demo");
+        assert_eq!(body["root"], h.fixture.root.as_str());
+    }
+}
+
+/// Roots may legitimately nest (a repo and a package inside it are two
+/// projects). The innermost is the one the caller is standing in; first-match
+/// would resolve half of them to the wrong project depending on registry order.
+#[tokio::test]
+async fn resolve_prefers_the_longest_matching_root() {
+    let h = harness();
+    let inner_path = h.fixture.root.join("packages").join("game");
+    std::fs::create_dir_all(&inner_path).unwrap();
+    let (status, body) = post(
+        &h.router,
+        "/v1/projects",
+        json!({ "root": inner_path.as_str(), "name": "game" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+
+    let inner = lore::daemon::paths::canonicalize_root(&inner_path).unwrap();
+    let (status, body) = get(
+        &h.router,
+        &format!("/v1/resolve?path={}", urlencode(inner.join("src").as_str())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    assert_eq!(body["name"], "game", "the innermost root wins: {body:#}");
+
+    // A sibling of the inner root still belongs to the outer project.
+    let (status, body) = get(
+        &h.router,
+        &format!(
+            "/v1/resolve?path={}",
+            urlencode(h.fixture.root.join("docs").as_str())
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    assert_eq!(body["name"], "demo");
+}
+
+#[tokio::test]
+async fn resolve_rejects_a_path_outside_every_root_and_a_relative_one() {
+    let h = harness();
+    let outside = tempfile::tempdir().unwrap();
+    let outside = lore::daemon::paths::canonicalize_root(outside.path()).unwrap();
+
+    let (status, body) = get(
+        &h.router,
+        &format!("/v1/resolve?path={}", urlencode(outside.as_str())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body:#}");
+    let message = body["message"].as_str().unwrap();
+    assert!(
+        message.contains("not inside any registered project"),
+        "{message}"
+    );
+    assert!(message.contains("lore add <path>"), "{message}");
+
+    // Relative and empty are the client's bug, not a missing registration:
+    // a relative path means nothing to a daemon started somewhere else.
+    for path in ["src/lib.rs", ".", ""] {
+        let (status, body) = get(&h.router, &format!("/v1/resolve?path={}", urlencode(path))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path:?}: {body:#}");
+        assert!(
+            body["message"].as_str().unwrap().contains("absolute"),
+            "{body:#}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// remove
+// ---------------------------------------------------------------------------
+
+/// End to end against a real store: register, index, remove — and then check
+/// all four things that made it "registered" are gone, not just the one the
+/// caller happened to look at.
+#[tokio::test]
+async fn removing_a_project_forgets_its_index_manifest_entry_and_watch() {
+    let mut h = harness();
+    populate_standard_tree(&h.fixture);
+    full_scan(&h.fixture.context(), &h.fixture.project);
+    let id = h.fixture.project.id;
+    assert!(h.fixture.chunk_count() > 0, "the fixture must have indexed");
+
+    // Registering a second project so the removal is a removal, not an
+    // emptying: a bug that wiped the whole store would pass otherwise.
+    let other = tempfile::tempdir().unwrap();
+    post(
+        &h.router,
+        "/v1/projects",
+        json!({ "root": other.path().to_string_lossy(), "name": "survivor" }),
+    )
+    .await;
+    while h.watch.try_recv().is_ok() {}
+
+    let (status, body) = delete(&h.router, "/v1/projects/demo").await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    assert_eq!(body["project"]["name"], "demo");
+    assert_eq!(body["project"]["root"], h.fixture.root.as_str());
+    assert_eq!(body["files"], 3, "the caller is told what it discarded");
+    assert!(body["chunks"].as_u64().unwrap() >= 3, "{body:#}");
+
+    // Gone from `status` immediately — not after a restart.
+    let (_, body) = get(&h.router, "/v1/status").await;
+    let names: Vec<&str> = body["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["survivor"], "{body:#}");
+
+    // Gone from the store: rows, not just the projects row.
+    let rows = h
+        .fixture
+        .store
+        .blocking(move |store| store.list_files(id))
+        .expect("list files");
+    assert!(rows.is_empty(), "file records survived: {rows:?}");
+
+    // Gone from the authoritative manifest, so it does not come back on the
+    // next start — which is the failure `lore remove` exists to prevent.
+    let manifest = lore::registry::read(&h.fixture.data_dir)
+        .expect("read manifest")
+        .expect("a manifest exists");
+    let listed: Vec<&str> = manifest
+        .projects
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert_eq!(listed, ["survivor"], "{listed:?}");
+
+    // And the watcher is told to let go of the root.
+    match h.watch.try_recv().expect("an unwatch command was emitted") {
+        WatchCommand::Unwatch(project) => assert_eq!(project, id),
+        other => panic!("removal must disarm the watch, not {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_project_can_be_removed_by_key_and_an_unknown_one_is_a_404() {
+    let h = harness();
+    let (status, body) = delete(&h.router, "/v1/projects/ghost").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body:#}");
+    let message = body["message"].as_str().unwrap();
+    assert!(message.contains("ghost"), "{message}");
+    assert!(message.contains("lore add <path>"), "{message}");
+
+    // The key is as good a handle as the name — a caller holding only the key
+    // from a search result should not have to translate it first.
+    let (status, body) = delete(&h.router, "/v1/projects/demo").await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    assert_eq!(body["project"]["key"], "demo");
+
+    // Removal is not idempotent-silent: a second one is an honest 404.
+    let (status, _) = delete(&h.router, "/v1/projects/demo").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Names carry spaces and other characters that would otherwise end the path
+/// segment early; the CLI percent-encodes, and the router has to decode.
+#[tokio::test]
+async fn a_project_name_needing_percent_encoding_still_addresses_its_project() {
+    let h = harness();
+    let other = tempfile::tempdir().unwrap();
+    let (status, body) = post(
+        &h.router,
+        "/v1/projects",
+        json!({ "root": other.path().to_string_lossy(), "name": "my design vault" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+
+    let (status, body) = delete(
+        &h.router,
+        &format!("/v1/projects/{}", urlencode("my design vault")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    assert_eq!(body["project"]["name"], "my design vault");
+}
+
+/// Percent-encoding matching `cli::urlencode`, so these tests exercise the
+/// same escaping the real client produces.
+fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Protocol-level behaviour
 // ---------------------------------------------------------------------------
 
@@ -839,7 +1202,7 @@ async fn every_error_body_is_an_api_error_including_rejections() {
     assert!(body["message"].is_string(), "{body}");
 
     // Missing required field.
-    let (status, body) = post(&h.router, "/v1/search", json!({ "limit": 5 })).await;
+    let (status, body) = search(&h.router, json!({ "limit": 5 })).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(body["message"].is_string(), "{body}");
 }

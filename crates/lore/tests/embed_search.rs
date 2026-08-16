@@ -93,6 +93,16 @@ async fn post(router: &Router, uri: &str, body: Value) -> (StatusCode, Value) {
     decode(response).await
 }
 
+/// A scoped search against this file's single-project harness — see the same
+/// helper in `daemon_http.rs`. Nothing here is about scoping; everything is
+/// about how the two ranking arms combine.
+async fn search(router: &Router, mut body: Value) -> (StatusCode, Value) {
+    if body.get("project").is_none() {
+        body["project"] = json!("demo");
+    }
+    post(router, "/v1/search", body).await
+}
+
 async fn get(router: &Router, uri: &str) -> (StatusCode, Value) {
     let response = router
         .clone()
@@ -145,14 +155,14 @@ async fn a_semantically_close_chunk_is_found_that_bm25_cannot_see() {
     populate(&h.fixture);
 
     // Control: with no vectors in the store, BM25 is the whole story.
-    let (status, body) = post(&h.router, "/v1/search", json!({ "query": QUERY })).await;
+    let (status, body) = search(&h.router, json!({ "query": QUERY })).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["lexical_only"], true, "nothing is embedded yet");
     assert_eq!(paths(&body), ["docs/one.md"]);
 
     embed_everything(&h).await;
 
-    let (status, body) = post(&h.router, "/v1/search", json!({ "query": QUERY })).await;
+    let (status, body) = search(&h.router, json!({ "query": QUERY })).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["lexical_only"], false, "the vector arm participated");
     // `two.md` was unreachable by BM25 and is now second: RRF puts the
@@ -183,9 +193,8 @@ async fn filters_apply_to_both_arms() {
     populate(&h.fixture);
     embed_everything(&h).await;
 
-    let (_, body) = post(
+    let (_, body) = search(
         &h.router,
-        "/v1/search",
         json!({ "query": QUERY, "path_prefix": "docs/two" }),
     )
     .await;
@@ -193,12 +202,7 @@ async fn filters_apply_to_both_arms() {
     assert_eq!(body["lexical_only"], false);
 
     // A scope containing nothing at all: still a 200, still no vectors.
-    let (status, body) = post(
-        &h.router,
-        "/v1/search",
-        json!({ "query": QUERY, "language": "csharp" }),
-    )
-    .await;
+    let (status, body) = search(&h.router, json!({ "query": QUERY, "language": "csharp" })).await;
     assert_eq!(status, StatusCode::OK);
     assert!(paths(&body).is_empty());
     assert_eq!(body["lexical_only"], true, "no vectors in scope");
@@ -220,14 +224,14 @@ async fn an_endpoint_that_dies_degrades_the_next_request_to_lexical_only() {
     populate(&h.fixture);
     embed_everything(&h).await;
 
-    let (_, body) = post(&h.router, "/v1/search", json!({ "query": QUERY })).await;
+    let (_, body) = search(&h.router, json!({ "query": QUERY })).await;
     assert_eq!(body["lexical_only"], false);
 
     stub.shutdown().await;
 
     // Same query, same corpus, same stored vectors — but the query can no
     // longer be embedded, so the vector arm cannot run.
-    let (status, body) = post(&h.router, "/v1/search", json!({ "query": QUERY })).await;
+    let (status, body) = search(&h.router, json!({ "query": QUERY })).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["lexical_only"], true, "{body:#}");
     assert_eq!(paths(&body), ["docs/one.md"]);
@@ -278,7 +282,7 @@ async fn vault_authority_breaks_ties_in_the_fused_ranking() {
     full_scan(&h.fixture.context(), &h.fixture.project);
     embed_everything(&h).await;
 
-    let (_, response) = post(&h.router, "/v1/search", json!({ "query": QUERY })).await;
+    let (_, response) = search(&h.router, json!({ "query": QUERY })).await;
     // The ledger itself is indexed like anything else and can match; only the
     // four documents under test are ordered here.
     let ranked: Vec<String> = paths(&response)
