@@ -24,6 +24,9 @@ $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
 $PollSec = 3
 $StablePollsNeeded = 3
+# A frozen count with a healthy endpoint means the daemon poisoned some chunks
+# (rejected outright) and went idle: drained-with-skips, not a hang.
+$StallPolls = 40
 
 # ---------------------------------------------------------------- guards ----
 $mainDataDir = Join-Path $env:LOCALAPPDATA 'lore'
@@ -142,7 +145,7 @@ foreach ($modelId in $Models) {
                 -Body (@{ root = $c.root; name = $c.name } | ConvertTo-Json) | Out-Null
         }
         $drainSw = [System.Diagnostics.Stopwatch]::StartNew()
-        $stable = 0; $lastCounts = ''
+        $stable = 0; $stallStable = 0; $lastCounts = ''
         $vram = New-Object System.Collections.Generic.List[string]
         $vram.Add('elapsed_s,llama_mib,gpu_mib,chunks,embedded')
         $maxLlama = 0; $maxGpu = 0
@@ -162,10 +165,17 @@ foreach ($modelId in $Models) {
             $vram.Add("$([math]::Round($drainSw.Elapsed.TotalSeconds,1)),$llamaMib,$gpuMib,$chunks,$embedded")
             $counts = ($ps | ForEach-Object { "$($_.name):$($_.chunks)/$($_.embedded_chunks)" }) -join ' '
             Write-Host "  [$([math]::Round($drainSw.Elapsed.TotalMinutes,1))m] $counts  vram:$llamaMib MiB"
-            $done = ($chunks -gt 0) -and ($counts -eq $lastCounts) -and ($isLexical -or ($embedded -eq $chunks))
+            $fullyDone = ($chunks -gt 0) -and ($counts -eq $lastCounts) -and ($isLexical -or ($embedded -eq $chunks))
+            $frozen = ($chunks -gt 0) -and ($counts -eq $lastCounts)
             $lastCounts = $counts
-            if ($done) { $stable++ } else { $stable = 0 }
+            if ($fullyDone) { $stable++ } else { $stable = 0 }
+            if ($frozen) { $stallStable++ } else { $stallStable = 0 }
             if ($stable -ge $StablePollsNeeded) { break }
+            if (-not $isLexical -and $stallStable -ge $StallPolls -and $st.embeddings.state -eq 'ready') {
+                $skipped = $chunks - $embedded
+                $run.warnings += "drained with $skipped chunks skipped (endpoint rejected them; see daemon.err.log)"
+                break
+            }
             if ($drainSw.Elapsed.TotalMinutes -gt $DrainTimeoutMin) { throw "drain timeout after $DrainTimeoutMin min" }
         }
         $drainSec = [math]::Round($drainSw.Elapsed.TotalSeconds - ($StablePollsNeeded * $PollSec), 1)
@@ -180,6 +190,7 @@ foreach ($modelId in $Models) {
             tokens_per_sec = if ($tok1 -ne $null -and $tok0 -ne $null -and $drainSec -gt 0) { [math]::Round(($tok1 - $tok0) / $drainSec) } else { $null }
             vram_llama_max_mib = $maxLlama
             vram_gpu_max_mib = $maxGpu
+            skipped = if ($isLexical) { 0 } else { [math]::Max(0, $chunks - $embedded) }
         }
 
         # -- queries --------------------------------------------------------
