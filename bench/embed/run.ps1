@@ -43,7 +43,7 @@ $allCorpora = Get-Content (Join-Path $Root 'corpora.json') | ConvertFrom-Json
 if ($Corpora) { $allCorpora = @($allCorpora | Where-Object { $_.name -in $Corpora }) }
 if (-not $Models) {
     $Models = @('lexical') + @($allModels | Where-Object {
-        $_.id -ne 'lexical' -and (Test-Path (Join-Path $Root "models\$($_.id).gguf")) } | ForEach-Object id)
+        $_.id -ne 'lexical' -and -not $_.skip -and (Test-Path (Join-Path $Root "models\$($_.id).gguf")) } | ForEach-Object id)
 }
 
 function Wait-Http([string]$Url, [int]$TimeoutSec, [string]$What) {

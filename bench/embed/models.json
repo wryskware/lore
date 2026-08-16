@@ -61,6 +61,7 @@
   },
   {
     "id": "qwen3-8b",
+    "skip": true,
     "gguf_repo": "Qwen/Qwen3-Embedding-8B-GGUF",
     "gguf_file": "Qwen3-Embedding-8B-Q8_0.gguf",
     "dimensions": 4096,
@@ -71,7 +72,7 @@
     "query_prefix": "Instruct: Given a natural language query, retrieve relevant code snippets or documentation passages\nQuery: ",
     "document_prefix": "",
     "license": "Apache-2.0",
-    "notes": "Quality-ceiling probe (~8.6 GB weights Q8_0)."
+    "notes": "Quality-ceiling probe (~8.6 GB Q8_0). skip: card shows only +0.6 MTEB-Code over 4B for ~2x the drain and VRAM — dropped 2026-08-15."
   },
   {
     "id": "jina-code-1.5b",
