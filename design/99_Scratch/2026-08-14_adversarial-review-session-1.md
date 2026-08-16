@@ -24,9 +24,9 @@ last_reviewed: 2026-08-14
 - **Binding constraint:** D-0001 authority order and promotion gate; D-0004 schema awareness
 - **Locations:** `crates/lore/src/chunk/markdown.rs:119`, `crates/lore/src/chunk/markdown.rs:162`, `crates/lore/src/chunk/common.rs:228`, `crates/lore/src/daemon/search.rs:266`, `crates/lore-mcp/src/server.rs:26`
 - **Failure scenario A:** Add any Markdown file containing `design_status: decided`, with no active decision reference and no ledger authorization. The chunker accepts the word, the store assigns the highest authority tier, search emits `design_status: decided`, and the MCP schema tells the model that `decided` is settled canon. A file edit has therefore crossed the promotion gate without a ledger entry.
-- **Failure scenario B:** Search for architecture terms that occur in `design/9_Scratch/2026-08-14_adversarial-review-briefs.md`. The file has no frontmatter but cites many D-numbers. Every Markdown chunk receives `VaultMeta`, body references are extracted, and `authority_weight` promotes an unclassified chunk with any D-number to the leaning multiplier. The path is never consulted even though D-0001 places all `9_Scratch` material below normal exploration and the memory design explicitly groups `9_Scratch` with deprecated material.
+- **Failure scenario B:** Search for architecture terms that occur in `design/99_Scratch/2026-08-14_adversarial-review-briefs.md`. The file has no frontmatter but cites many D-numbers. Every Markdown chunk receives `VaultMeta`, body references are extracted, and `authority_weight` promotes an unclassified chunk with any D-number to the leaning multiplier. The path is never consulted even though D-0001 places all `99_Scratch` material below normal exploration and the memory design explicitly groups `99_Scratch` with deprecated material.
 - **Why this is architectural:** The retrieval layer treats a declaration or citation as proof of authority. Canon says authority comes from the active ledger and its authorized documents; merely quoting a decision is not inheritance.
-- **Cheap-now fix:** Compute an explicit, validated authority classification at index time. At minimum, special-case the ledger, require `decided` documents to cite an active D-entry, distinguish declared status from validated authority, and force `9_Scratch` to the bottom tier regardless of citations. Surface invalid declarations instead of silently promoting them.
+- **Cheap-now fix:** Compute an explicit, validated authority classification at index time. At minimum, special-case the ledger, require `decided` documents to cite an active D-entry, distinguish declared status from validated authority, and force `99_Scratch` to the bottom tier regardless of citations. Surface invalid declarations instead of silently promoting them.
 
 ### 3. Duplicate project names make search results impossible to expand reliably
 
@@ -94,7 +94,7 @@ last_reviewed: 2026-08-14
 | Rank | Debt | Pay | Cheap-now action |
 |---:|---|---|---|
 | 1 | Daemon admission is check-then-publish | **Now** | Hold a crash-releasing OS ownership lock and add a simultaneous-start test. |
-| 2 | Authority is derived from unvalidated declarations/citations | **Now** | Separate declared status from effective authority; validate ledger refs and demote `9_Scratch` by path. |
+| 2 | Authority is derived from unvalidated declarations/citations | **Now** | Separate declared status from effective authority; validate ledger refs and demote `99_Scratch` by path. |
 | 3 | Project display name doubles as wire identity | **Now** | Introduce a stable opaque project key and make names unique/presentation-only. |
 | 4 | No source kind/timestamp/effective-authority model | **Now, before M3 schema** | Add provenance fields and source filters; leave session capture for M3. |
 | 5 | Discovery advertises one version and one HTTP port | **Now, while v1 has one client generation** | Negotiate supported endpoints/versions; make transport data-driven. |

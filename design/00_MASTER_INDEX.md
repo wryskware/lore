@@ -11,7 +11,7 @@
 - `4_Interfaces/` — [[4_Interfaces/4.1_MCP_Surface|4.1 MCP Surface]]: tools, exclusions.
 - `5_Implementation/` — [[5_Implementation/5.1_Milestones|5.1 Milestones]]: M0–M4, indexing scope, benchmark posture.
 - `7_Research/` — the 2026-08 research phase: [[7_Research/00_summary|summary]], [[7_Research/01_landscape|landscape]], [[7_Research/02_feature-matrix|feature matrix]], raw worker reports in `7_Research/raw/`.
-- `9_Scratch/` — exploration and scratch work; never binding.
+- `99_Scratch/` — exploration and scratch work; never binding.
 
 ## Project state
 

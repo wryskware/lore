@@ -44,7 +44,7 @@ fn populated_search_result() -> SearchResult {
         chunk_id: "9f3a1c2b".into(),
         project: "lore".into(),
         project_key: "lore".into(),
-        path: "design/9_Scratch/notes.md".into(),
+        path: "design/99_Scratch/notes.md".into(),
         line_start: 15,
         line_end: 17,
         language: Some("markdown".into()),
@@ -52,7 +52,7 @@ fn populated_search_result() -> SearchResult {
         heading_path: Some(vec!["Notes".into()]),
         design_status: Some("decided".into()),
         effective_authority: Some("deprecated".into()),
-        authority_note: Some("9_Scratch path cap".into()),
+        authority_note: Some("99_Scratch path cap".into()),
         decision_refs: vec!["D-0007".into()],
         score: 0.8741,
         excerpt: "body".into(),
@@ -335,7 +335,7 @@ fn a_client_that_predates_this_change_still_reads_a_new_daemons_response() {
     let old: OldSearchResult = serde_json::from_value(json).expect("new results parse as old ones");
     assert_eq!(old.chunk_id, "9f3a1c2b");
     assert_eq!(old.project, "lore");
-    assert_eq!(old.path, "design/9_Scratch/notes.md");
+    assert_eq!(old.path, "design/99_Scratch/notes.md");
     assert_eq!((old.line_start, old.line_end), (15, 17));
     assert_eq!(old.language.as_deref(), Some("markdown"));
     assert_eq!(old.symbol_path, None);

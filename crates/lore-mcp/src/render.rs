@@ -464,9 +464,9 @@ mod tests {
     #[test]
     fn a_refused_declaration_renders_the_reason() {
         let mut demoted = vault_hit();
-        demoted.path = "design/9_Scratch/notes.md".into();
+        demoted.path = "design/99_Scratch/notes.md".into();
         demoted.effective_authority = Some("deprecated".into());
-        demoted.authority_note = Some("9_Scratch path cap".into());
+        demoted.authority_note = Some("99_Scratch path cap".into());
         let rendered = search(
             "authority",
             &SearchResponse {
@@ -476,7 +476,7 @@ mod tests {
         );
         assert!(rendered.contains("    status: decided  refs: D-0007, D-0008\n"));
         assert!(
-            rendered.contains("    authority: deprecated - 9_Scratch path cap\n"),
+            rendered.contains("    authority: deprecated - 99_Scratch path cap\n"),
             "{rendered}"
         );
     }

@@ -42,7 +42,7 @@ pub const REPO_CONFIG_FILE: &str = ".lore.toml";
 pub enum Profile {
     /// The Lexomancy-derived D-NNNN workflow: `design_status` frontmatter,
     /// `decision_refs`, a `**/0_Canon/DECISIONS.md` ledger, per-file decision
-    /// records (D-0013) and the `9_Scratch`/`7_Research` path ceilings.
+    /// records (D-0013) and the `99_Scratch`/`7_Research` path ceilings.
     LoreV1,
 }
 

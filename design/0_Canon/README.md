@@ -18,7 +18,7 @@ Design is tentative by default. It becomes canon only through an explicit, user-
 3. Documents named as canonical sources by those entries.
 4. `decided` implementation briefs, only within their declared scope.
 5. `leaning` / `exploration` / unclassified documents — non-binding context.
-6. `deprecated` and `9_Scratch` material — historical or inspirational only.
+6. `deprecated` and `99_Scratch` material — historical or inspirational only.
 
 ## Document states (`design_status` frontmatter)
 

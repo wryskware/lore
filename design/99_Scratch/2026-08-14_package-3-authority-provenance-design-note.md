@@ -18,7 +18,7 @@ explicit authorization per canon rules.
    `authority_weight` (`daemon/search.rs:273`) trusts it: `decided` in
    frontmatter ⇒ 1.15× with no ledger check; an unclassified chunk whose text
    mentions any `D-NNNN` ⇒ 1.05× (`search.rs:275`,
-   `chunk/common.rs:233`). Path is never consulted, so `9_Scratch` material —
+   `chunk/common.rs:233`). Path is never consulted, so `99_Scratch` material —
    which Canon README §Authority-order and 2.1's status-ranking callout place
    with `deprecated` at the bottom — ranks by whatever it declares or quotes.
    The review corpus itself is the exploit: these session notes quote
@@ -62,7 +62,7 @@ explicit authorization per canon rules.
 - **Wire (additive)**: `SearchResult.design_status` stays declared; add
   `effective_authority` (label) and `authority_note` (present only when
   demoted, e.g. `"decided declared but cites no active decision"`,
-  `"9_Scratch path cap"`). MCP schema text updated: `decided` means
+  `"99_Scratch path cap"`). MCP schema text updated: `decided` means
   *validated* decided.
 
 ### 1a — What must `decided` cite to be honored?
@@ -87,7 +87,7 @@ vault needs different names — Lexomancy shares the convention):
 | Path / condition | Rule | Basis |
 |---|---|---|
 | `0_Canon/DECISIONS.md` | pinned tier 3 | it is the canon |
-| any `9_Scratch` segment | **ceiling 0** (with deprecated) | README order #6; 2.1 ranking callout |
+| any `99_Scratch` segment | **ceiling 0** (with deprecated) | README order #6; 2.1 ranking callout |
 | any `7_Research` segment | **ceiling 1** (evidence, not decisions) | README promotion rules |
 | declared `deprecated` | tier 0 | existing behavior |
 

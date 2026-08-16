@@ -366,7 +366,7 @@ pub struct SearchResult {
     pub effective_authority: Option<String>,
     /// Why the effective authority is below the declared one. Present *only*
     /// when the document was demoted, e.g. "decided declared but cites no
-    /// active decision" or "9_Scratch path cap".
+    /// active decision" or "99_Scratch path cap".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority_note: Option<String>,
     /// Decision IDs cited by the file's frontmatter plus this chunk's body.

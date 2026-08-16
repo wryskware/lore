@@ -544,10 +544,10 @@ fn seeded_lexical_store(dir: &TempDir) -> (Store, i64, i64) {
     store
         .replace_file_chunks(
             a,
-            p("design/9_Scratch/notes.md"),
+            p("design/99_Scratch/notes.md"),
             "h",
             &[section_chunk(
-                "design/9_Scratch/notes.md",
+                "design/99_Scratch/notes.md",
                 "Scratch",
                 "Maybe the wombat idea is wrong.",
                 Some(DesignStatus::Deprecated),
@@ -726,7 +726,7 @@ fn lexical_search_filters() {
     assert_eq!(hits.len(), 5);
     assert!(
         hits.iter()
-            .all(|h| h.chunk.path != "design/9_Scratch/notes.md")
+            .all(|h| h.chunk.path != "design/99_Scratch/notes.md")
     );
 
     // Limit is honoured.

@@ -18,13 +18,13 @@ docs without Wrysk's explicit authorization per choice.
 1. **Authority laundering (S1#2).** Any file declaring
    `design_status: decided` gets top ranking authority; any unclassified file
    citing a D-number gets the leaning multiplier; path is never consulted, so
-   `9_Scratch` scratch material outranks its station. Direction: split
+   `99_Scratch` scratch material outranks its station. Direction: split
    *declared* status from *effective* authority computed at index time —
-   validate that `decided` cites an active ledger entry, demote `9_Scratch`
+   validate that `decided` cites an active ledger entry, demote `99_Scratch`
    by path regardless of citations, surface invalid declarations instead of
    silently promoting. Policy questions for Wrysk: what exactly does
    `decided` require to be honored; what is the full path-based floor/ceiling
-   map (9_Scratch, 7_Research, deprecated); how are violations surfaced
+   map (99_Scratch, 7_Research, deprecated); how are violations surfaced
    (status? search result flag? log only?).
 2. **Provenance model before M3 hardens the schema (S1#5).** Sessions
    (D-0008) and later issues need: stable source key, source kind
@@ -55,7 +55,7 @@ docs without Wrysk's explicit authorization per choice.
 ## Constraints
 
 - Proposal document lives in the vault (suggest `1_Architecture` or
-  `9_Scratch` until accepted; its own `design_status` stays exploration
+  `99_Scratch` until accepted; its own `design_status` stays exploration
   until Wrysk says otherwise).
 - If implementation follows approval: worktree, 235-test suite green,
   clippy/fmt clean, commit trailer

@@ -203,7 +203,7 @@ pub struct SearchFilter {
     /// themselves, which is a different question from how they rank.
     pub statuses: Option<Vec<StatusFilter>>,
     /// Minimum **effective** authority tier (see [`crate::authority`]) — e.g.
-    /// `Some(1)` drops `deprecated` and `9_Scratch` material without
+    /// `Some(1)` drops `deprecated` and `99_Scratch` material without
     /// enumerating every other status.
     pub min_authority: Option<u8>,
     /// Allowed source kinds. `None` = every kind, which is the only thing v1

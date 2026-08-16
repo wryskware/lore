@@ -133,7 +133,7 @@ pub const AUTHORITY_LEANING: f64 = 1.02;
 /// Effective tier 1 — `exploration`, unclassified, non-vault (code) chunks,
 /// `7_Research`, and any declaration that failed validation.
 pub const AUTHORITY_NEUTRAL: f64 = 1.0;
-/// Effective tier 0 — `deprecated` and `9_Scratch`: still searchable,
+/// Effective tier 0 — `deprecated` and `99_Scratch`: still searchable,
 /// deliberately demoted.
 pub const AUTHORITY_DEPRECATED: f64 = 0.95;
 
@@ -742,7 +742,7 @@ mod tests {
         use DesignStatus::*;
         let cited = at_tier(
             "cited",
-            "design/9_Scratch/notes.md",
+            "design/99_Scratch/notes.md",
             section("Notes"),
             vault(None, &["D-0007", "D-0003"]),
             authority_tier(None),
@@ -1022,7 +1022,7 @@ mod tests {
 
         let mut demoted = at_tier(
             "x",
-            "design/9_Scratch/notes.md",
+            "design/99_Scratch/notes.md",
             section("Notes"),
             vault(Some(DesignStatus::Decided), &["D-0007"]),
             0,
@@ -1033,7 +1033,10 @@ mod tests {
         assert_eq!(result.project_key, "lore");
         assert_eq!(result.design_status.as_deref(), Some("decided"));
         assert_eq!(result.effective_authority.as_deref(), Some("deprecated"));
-        assert_eq!(result.authority_note.as_deref(), Some("9_Scratch path cap"));
+        assert_eq!(
+            result.authority_note.as_deref(),
+            Some("99_Scratch path cap")
+        );
         // Citations survive as metadata even though they earn nothing.
         assert_eq!(result.decision_refs, ["D-0007"]);
 
@@ -1065,7 +1068,7 @@ mod tests {
             .collect();
         let unjudged = to_result(
             &neutral_sources,
-            at_tier("z", "design/9_Scratch/notes.md", section("Notes"), None, 1),
+            at_tier("z", "design/99_Scratch/notes.md", section("Notes"), None, 1),
         );
         assert_eq!(unjudged.effective_authority, None);
         assert_eq!(unjudged.authority_note, None);

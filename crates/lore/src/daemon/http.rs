@@ -17,7 +17,7 @@
 //!
 //! Every *query* is scoped to exactly one project: `search` and `expand`
 //! reject a request that names none, with an error that says how to name one
-//! (`design/9_Scratch/2026-08-16_project-scoping-decision-brief.md`,
+//! (`design/99_Scratch/2026-08-16_project-scoping-decision-brief.md`,
 //! "Resolution"). `GET /v1/status?project=` narrows the same way.
 //!
 //! **Bare `GET /v1/status` deliberately stays machine-wide.** It is the
@@ -510,7 +510,7 @@ async fn remove_project(
 /// this path?
 ///
 /// **INTERIM, and local-only.** The scoping resolution
-/// (`design/9_Scratch/2026-08-16_project-scoping-decision-brief.md`) settled
+/// (`design/99_Scratch/2026-08-16_project-scoping-decision-brief.md`) settled
 /// the wire contract — every query names one project — while explicitly
 /// *deferring* the identity mechanism to issue #18's ingestion fork. Until
 /// that is decided the identifier is the registry's own project name/key, and

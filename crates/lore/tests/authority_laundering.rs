@@ -184,21 +184,21 @@ fn a_decided_declaration_cannot_reach_the_top_tier_without_an_active_citation() 
     assert!(quoter.score < honest.score);
 }
 
-/// The review's own exploit, reproduced: a `9_Scratch` session note that
+/// The review's own exploit, reproduced: a `99_Scratch` session note that
 /// quotes decision numbers densely *and* matches the query harder than the
 /// ordinary document it is competing with.
 ///
 /// It is deliberately arranged so the lexical arm prefers the scratch note —
 /// asserted directly, so this test cannot pass for the boring reason that the
 /// note was simply a worse match. Authority is what has to move it, and the
-/// gap between adjacent RRF ranks is far smaller than the `9_Scratch`
+/// gap between adjacent RRF ranks is far smaller than the `99_Scratch`
 /// multiplier, so a scratch note cannot buy back its cap with relevance.
 #[test]
 fn a_scratch_note_quoting_decisions_ranks_below_a_plainer_document_it_outmatches() {
     let fixture = Fixture::new("laundering");
     fixture.write(LEDGER, ledger_body());
     fixture.write(
-        "design/9_Scratch/session-notes.md",
+        "design/99_Scratch/session-notes.md",
         doc(
             None,
             None,
@@ -224,14 +224,14 @@ fn a_scratch_note_quoting_decisions_ranks_below_a_plainer_document_it_outmatches
         .collect();
     assert_eq!(
         lexical.first().map(String::as_str),
-        Some("design/9_Scratch/session-notes.md"),
+        Some("design/99_Scratch/session-notes.md"),
         "premise: BM25 prefers the scratch note ({lexical:?})"
     );
 
     // Ranked, it loses anyway.
     let results = search(&fixture, "ranking");
     assert!(
-        rank_of(&results, "design/9_Scratch/session-notes.md")
+        rank_of(&results, "design/99_Scratch/session-notes.md")
             > rank_of(&results, "design/3_Retrieval/3.1.md"),
         "scratch material must not outrank ordinary exploration: {:?}",
         results
@@ -240,11 +240,11 @@ fn a_scratch_note_quoting_decisions_ranks_below_a_plainer_document_it_outmatches
             .collect::<Vec<_>>()
     );
 
-    let scratch = find(&results, "design/9_Scratch/session-notes.md");
+    let scratch = find(&results, "design/99_Scratch/session-notes.md");
     assert_eq!(scratch.effective_authority.as_deref(), Some("deprecated"));
     assert_eq!(
         scratch.authority_note.as_deref(),
-        Some("9_Scratch path cap")
+        Some("99_Scratch path cap")
     );
     // The quoted numbers survive as metadata; they simply earn nothing.
     assert!(
@@ -256,7 +256,7 @@ fn a_scratch_note_quoting_decisions_ranks_below_a_plainer_document_it_outmatches
     assert!(scratch.score > 0.0);
 }
 
-/// A `9_Scratch` note that *also* declares `decided` and cites real canon —
+/// A `99_Scratch` note that *also* declares `decided` and cites real canon —
 /// the maximal claim a scratch file can make — still lands at the bottom, and
 /// reports the actionable half of the story rather than the path cap.
 #[test]
@@ -264,7 +264,7 @@ fn a_scratch_note_declaring_validated_canon_is_still_capped_and_still_reported()
     let fixture = Fixture::new("laundering");
     fixture.write(LEDGER, ledger_body());
     fixture.write(
-        "design/9_Scratch/claim.md",
+        "design/99_Scratch/claim.md",
         doc(
             Some("decided"),
             Some("D-0001"),
@@ -272,24 +272,24 @@ fn a_scratch_note_declaring_validated_canon_is_still_capped_and_still_reported()
         ),
     );
     fixture.write(
-        "design/9_Scratch/overclaim.md",
+        "design/99_Scratch/overclaim.md",
         doc(Some("decided"), None, "Ranking, self-declared and uncited."),
     );
     full_scan(&fixture.context(), &fixture.project);
 
     let results = search(&fixture, "ranking");
 
-    let valid = find(&results, "design/9_Scratch/claim.md");
+    let valid = find(&results, "design/99_Scratch/claim.md");
     assert_eq!(valid.effective_authority.as_deref(), Some("deprecated"));
     assert_eq!(
         valid.authority_note.as_deref(),
-        Some("9_Scratch path cap"),
+        Some("99_Scratch path cap"),
         "a valid citation does not lift scratch material"
     );
 
     // Two demotions apply at once. The tier takes the lower ceiling; the note
     // takes the one the author can act on.
-    let over = find(&results, "design/9_Scratch/overclaim.md");
+    let over = find(&results, "design/99_Scratch/overclaim.md");
     assert_eq!(over.effective_authority.as_deref(), Some("deprecated"));
     assert_eq!(
         over.authority_note.as_deref(),
@@ -308,7 +308,7 @@ fn a_scratch_note_declaring_validated_canon_is_still_capped_and_still_reported()
             .iter()
             .map(|p| p.as_str())
             .collect::<Vec<_>>(),
-        ["design/9_Scratch/overclaim.md"]
+        ["design/99_Scratch/overclaim.md"]
     );
 }
 
@@ -319,7 +319,7 @@ fn the_ledger_outranks_the_scratch_note_arguing_about_it() {
     let fixture = Fixture::new("laundering");
     fixture.write(LEDGER, ledger_body());
     fixture.write(
-        "design/9_Scratch/argument.md",
+        "design/99_Scratch/argument.md",
         doc(
             Some("decided"),
             Some("D-0004"),
@@ -330,7 +330,7 @@ fn the_ledger_outranks_the_scratch_note_arguing_about_it() {
 
     let results = search(&fixture, "supersedes");
     assert!(
-        rank_of(&results, LEDGER) < rank_of(&results, "design/9_Scratch/argument.md"),
+        rank_of(&results, LEDGER) < rank_of(&results, "design/99_Scratch/argument.md"),
         "{:?}",
         results
             .iter()

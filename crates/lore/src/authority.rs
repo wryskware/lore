@@ -19,7 +19,7 @@
 //! decided` was ranked as ratified canon, and any unclassified file that
 //! merely *quoted* a `D-NNNN` was promoted to the `leaning` multiplier. Both
 //! are authority laundering: a file edit crossed the promotion gate without a
-//! ledger entry, and `9_Scratch` notes — which the same README places at the
+//! ledger entry, and `99_Scratch` notes — which the same README places at the
 //! very bottom, with `deprecated` — outranked their station by quoting the
 //! decisions they were arguing about.
 //!
@@ -35,7 +35,7 @@
 //!    deprecated: an invalid declaration is a mistake to surface, not content
 //!    to bury — and recorded as a [`Demotion::UncitedDecided`] violation.
 //! 4. Path ceilings apply to *any* segment of the project-relative path:
-//!    `9_Scratch` → [`SCRATCH_TIER_CEILING`], `7_Research` →
+//!    `99_Scratch` → [`SCRATCH_TIER_CEILING`], `7_Research` →
 //!    [`RESEARCH_TIER_CEILING`]. A declared `deprecated` is already 0 and no
 //!    ceiling can raise it.
 //! 5. A `session` source is capped at [`SESSION_TIER_CEILING`], below vault
@@ -85,7 +85,7 @@ pub const LEDGER_TIER: u8 = 3;
 pub const UNCITED_DECIDED_TIER: u8 = 1;
 
 /// Path segment for scratch material (README authority order #6).
-pub const SCRATCH_SEGMENT: &str = "9_Scratch";
+pub const SCRATCH_SEGMENT: &str = "99_Scratch";
 
 /// Ceiling applied to anything under a [`SCRATCH_SEGMENT`] directory.
 pub const SCRATCH_TIER_CEILING: u8 = 0;
@@ -125,7 +125,7 @@ pub enum Demotion {
     /// The only demotion that is a **violation**: the others are policy
     /// working as intended, this one is a document making a false claim.
     UncitedDecided,
-    /// Under a `9_Scratch` directory.
+    /// Under a `99_Scratch` directory.
     ScratchPath,
     /// Under a `7_Research` directory.
     ResearchPath,
@@ -160,7 +160,7 @@ impl Demotion {
     pub fn note(self) -> &'static str {
         match self {
             Demotion::UncitedDecided => "decided declared but cites no active decision",
-            Demotion::ScratchPath => "9_Scratch path cap",
+            Demotion::ScratchPath => "99_Scratch path cap",
             Demotion::ResearchPath => "7_Research path cap",
             Demotion::SessionSource => "session source cap",
         }
@@ -284,7 +284,7 @@ pub fn effective(
 ) -> Authority {
     // No active profile: the vault policy below does not exist for this repo
     // (D-0012). Everything is neutral, including files whose *path* happens to
-    // spell `9_Scratch` and files whose frontmatter happens to say `decided` —
+    // spell `99_Scratch` and files whose frontmatter happens to say `decided` —
     // a repository that never opted in must not acquire either meaning.
     let Some(Profile::LoreV1) = profile else {
         let mut tier = authority_tier(None);
@@ -846,7 +846,7 @@ mod tests {
     #[test]
     fn path_ceilings_apply_to_any_segment_and_ignore_citations() {
         let scratch = tier(
-            "design/9_Scratch/notes.md",
+            "design/99_Scratch/notes.md",
             Some(DesignStatus::Decided),
             &["D-0007"],
             &["D-0007"],
@@ -886,13 +886,13 @@ mod tests {
 
         // Code under a scratch directory is capped too — the directory is the
         // statement, not the file type.
-        assert_eq!(tier("9_Scratch/spike/main.rs", None, &[], &[]).tier, 0);
+        assert_eq!(tier("99_Scratch/spike/main.rs", None, &[], &[]).tier, 0);
     }
 
     #[test]
     fn a_violation_keeps_the_note_even_when_a_path_cap_bites_harder() {
         let both = tier(
-            "design/9_Scratch/x.md",
+            "design/99_Scratch/x.md",
             Some(DesignStatus::Decided),
             &[],
             &[],
@@ -961,7 +961,7 @@ mod tests {
         for (path, status) in [
             ("design/0_Canon/DECISIONS.md", None),
             ("design/0_Canon/decisions/D-0012-profiles.md", None),
-            ("design/9_Scratch/notes.md", Some(DesignStatus::Deprecated)),
+            ("design/99_Scratch/notes.md", Some(DesignStatus::Deprecated)),
             ("design/7_Research/raw/E.md", Some(DesignStatus::Leaning)),
             ("design/x.md", Some(DesignStatus::Decided)),
             ("docs/y.md", None),

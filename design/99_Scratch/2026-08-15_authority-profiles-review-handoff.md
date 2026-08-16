@@ -146,7 +146,7 @@ and diagnosable.
 
 ### 1. The current convention is globally hardcoded
 
-`0_Canon/DECISIONS.md`, `7_Research`, `9_Scratch`, the four status values, and
+`0_Canon/DECISIONS.md`, `7_Research`, `99_Scratch`, the four status values, and
 the D-NNNN grammar currently have product-wide meaning. There is no authority
 configuration surface. This is surprising for repositories that never adopted
 the workflow and creates accidental coupling to otherwise ordinary path or
@@ -363,7 +363,7 @@ Lexomancy and this repository do not change silently:
 - D-0010 bare-list full supersession semantics;
 - declared document states: exploration, leaning, decided, deprecated;
 - `decided` honored only with at least one active frontmatter reference;
-- `7_Research`, `9_Scratch`, ledger pinning, and session ceilings as currently
+- `7_Research`, `99_Scratch`, ledger pinning, and session ceilings as currently
   implemented;
 - declared/effective authority and violation notes exposed on results; and
 - current authority weights when behavior is `rank`.

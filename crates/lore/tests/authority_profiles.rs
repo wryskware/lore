@@ -25,7 +25,7 @@ use serde_json::Value;
 
 const LEDGER: &str = "design/0_Canon/DECISIONS.md";
 const CANON: &str = "design/1_Architecture/canon.md";
-const SCRATCH: &str = "design/9_Scratch/notes.md";
+const SCRATCH: &str = "design/99_Scratch/notes.md";
 
 const RANK: &str = "[authority]\nprofile = \"lore-v1\"\nbehavior = \"rank\"\n";
 const ANNOTATE: &str = "[authority]\nprofile = \"lore-v1\"\nbehavior = \"annotate\"\n";
@@ -215,7 +215,7 @@ fn an_unconfigured_repo_carries_no_authority_anywhere() {
     );
 
     // Every file is unjudged, including the ledger and the scratch note whose
-    // path spells `9_Scratch`.
+    // path spells `99_Scratch`.
     assert_eq!(tiers(&fixture, CANON), [1], "`decided` was never read");
     assert_eq!(tiers(&fixture, SCRATCH), [1], "and neither was the path");
 
@@ -433,7 +433,7 @@ fn annotate_labels_every_result_but_leaves_the_order_to_retrieval() {
         scratch
             .2
             .as_deref()
-            .is_some_and(|note| note.contains("9_Scratch")),
+            .is_some_and(|note| note.contains("99_Scratch")),
         "the demotion has to explain itself: {by_path:?}"
     );
 }

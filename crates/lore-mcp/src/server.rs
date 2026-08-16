@@ -12,7 +12,7 @@
 //! # Scoping is automatic and not negotiable
 //!
 //! Every query is scoped to exactly one project (the scoping resolution in
-//! `design/9_Scratch/2026-08-16_project-scoping-decision-brief.md`), and the
+//! `design/99_Scratch/2026-08-16_project-scoping-decision-brief.md`), and the
 //! agent does not choose it: the server resolves *its own* project once per
 //! process and sends it on every call. Cross-project search is therefore not
 //! reachable from here at all — the `project` parameter is gone rather than

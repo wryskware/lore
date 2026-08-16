@@ -102,7 +102,7 @@ fn a_full_scan_stamps_the_policy_onto_every_file() {
         doc("decided", "", "Bare body"),
     );
     fixture.write(
-        "design/9_Scratch/notes.md",
+        "design/99_Scratch/notes.md",
         doc(
             "decided",
             "decision_refs: [D-0001]\n",
@@ -147,7 +147,7 @@ fn a_full_scan_stamps_the_policy_onto_every_file() {
         [1]
     );
     assert_eq!(
-        tiers(&fixture, "design/9_Scratch/notes.md", "Heading"),
+        tiers(&fixture, "design/99_Scratch/notes.md", "Heading"),
         [0],
         "a valid citation does not lift scratch material"
     );
@@ -170,7 +170,7 @@ fn status_counts_and_names_the_refused_declarations() {
         doc("decided", "decision_refs: [D-0004]\n", "Fine body"),
     );
     // Capped by path, not a false claim: policy, so not a violation.
-    fixture.write("design/9_Scratch/c.md", doc("leaning", "", "C body"));
+    fixture.write("design/99_Scratch/c.md", doc("leaning", "", "C body"));
 
     full_scan(&fixture.context(), &fixture.project);
 
@@ -340,7 +340,7 @@ fn min_authority_filters_on_the_effective_tier() {
     let fixture = Fixture::new("authority");
     fixture.write(LEDGER, ledger_body());
     fixture.write(
-        "design/9_Scratch/notes.md",
+        "design/99_Scratch/notes.md",
         doc("decided", "decision_refs: [D-0001]\n", "Scratch body"),
     );
     fixture.write(
@@ -363,7 +363,7 @@ fn min_authority_filters_on_the_effective_tier() {
         .collect();
     assert!(paths.contains(&"design/1.1.md".to_string()), "{paths:?}");
     assert!(
-        !paths.iter().any(|path| path.contains("9_Scratch")),
+        !paths.iter().any(|path| path.contains("99_Scratch")),
         "{paths:?}"
     );
 }
