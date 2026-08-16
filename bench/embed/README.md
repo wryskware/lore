@@ -28,7 +28,9 @@ running.** `run.ps1` refuses if `opencode` is alive (override with `-Force`).
 
 - `models.json` — candidate matrix (GGUF repo/file, dims, pooling, exact
   model-card prefixes; all card facts verified 2026-08-15). `ctx` is the
-  server-total context, split across `--parallel 4` slots.
+  server-total context, split across `--parallel` slots (per-model; 16 for
+  the causal models so forward passes fill the 8192-token ubatch, 2-4 for
+  the small non-causal nomics).
 - `corpora.json` — corpus name → root → answer key. lore-bench (Rust + design
   vault), terrarium-bench (TS/WebGPU), lexomancy (C#/Unity, the flagship
   target — 81k chunks, also the realistic throughput test).

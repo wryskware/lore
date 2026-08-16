@@ -91,6 +91,11 @@ foreach ($modelId in $Models) {
             "query_prefix = $($m.query_prefix | ConvertTo-Json)"
             "document_prefix = $($m.document_prefix | ConvertTo-Json)"
             'batch_max_items = 64'
+            # One worker batch (64 x max_embed_bytes) fits in a single wire
+            # POST, and 8 batches stay in flight: ~512 chunks queued
+            # server-side so the slots never run dry between round trips.
+            'batch_max_bytes = 262144'
+            'concurrency = 8'
             "max_embed_bytes = $($m.max_embed_bytes)"
         ) | Set-Content (Join-Path $dataDir 'config.toml')
     }
