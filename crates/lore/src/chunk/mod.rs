@@ -25,7 +25,6 @@ pub use common::{
 
 /// `D-NNNN` extraction, shared with [`crate::authority`]'s ledger parser so
 /// the two agree on what a decision reference looks like.
-
 use crate::types::Chunk;
 
 /// Bump whenever chunking policy changes in a way that should re-chunk

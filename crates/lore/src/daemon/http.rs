@@ -372,7 +372,9 @@ async fn search_route(
         .map_err(|err| ApiErr::internal("search", err))?;
     // Both the global aggregate and the per-corpus window: `status` shows the
     // aggregate by default and the labeled row on request.
-    state.latency.record("search_store", store_started.elapsed());
+    state
+        .latency
+        .record("search_store", store_started.elapsed());
     state.latency.record(&store_label, store_started.elapsed());
     state.latency.record("search", started.elapsed());
     match outcome {

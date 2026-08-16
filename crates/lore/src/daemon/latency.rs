@@ -136,8 +136,14 @@ mod tests {
         recorder.record("search_store:lore", Duration::from_millis(30));
         let snap = recorder.snapshot();
         assert_eq!(snap.len(), 2);
-        assert_eq!((snap[0].endpoint.as_str(), snap[0].p50_ms), ("search_store:Lexomancy", 1200));
-        assert_eq!((snap[1].endpoint.as_str(), snap[1].p50_ms), ("search_store:lore", 30));
+        assert_eq!(
+            (snap[0].endpoint.as_str(), snap[0].p50_ms),
+            ("search_store:Lexomancy", 1200)
+        );
+        assert_eq!(
+            (snap[1].endpoint.as_str(), snap[1].p50_ms),
+            ("search_store:lore", 30)
+        );
     }
 
     #[test]
