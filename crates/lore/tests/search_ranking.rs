@@ -18,6 +18,7 @@ use lore::chunk::{FileChunks, chunk_file};
 use lore::daemon::search::{
     self, DEFAULT_LIMIT, LEXICAL_CANDIDATES, MAX_LIMIT, RRF_K, VECTOR_CANDIDATES,
 };
+use lore::repo_config::Profile;
 use lore::store::{NewEmbedding, ProjectId, SearchFilter, Store};
 use lore::types::{Chunk, ChunkId, ChunkKind, WindowFamily};
 use lore_core::{SearchRequest, SearchResponse};
@@ -368,7 +369,7 @@ fn window_collapse_refills_the_page() {
 fn independently_windowed_overloads_survive_collapse_end_to_end() {
     let path = Utf8Path::new("Assets/Scripts/Parser.cs");
     let source = overloaded_parser();
-    let chunks = match chunk_file(path, source.as_bytes()) {
+    let chunks = match chunk_file(path, source.as_bytes(), Some(Profile::LoreV1)) {
         FileChunks::Chunked(chunks) => chunks,
         FileChunks::Skipped(reason) => panic!("unexpected skip: {reason:?}"),
     };

@@ -582,13 +582,28 @@ fn route(events: Vec<DebouncedEvent>, watches: &Watches, queue: &IndexQueue, dat
             // deterministically stale.
             for (project, rel) in watches.containing(abs) {
                 if walk::is_excluded_rel(&rel) {
-                    // Exception: the ignore rules themselves changed, so what
-                    // is indexable changed with them — only a rescan can tell
-                    // how. Both files, because `.loreignore` is the one a user
-                    // is actually invited to edit.
+                    // Exceptions: dot-files that are not content but *policy*,
+                    // and whose edit changes the meaning of files that are.
+                    //
+                    // - the ignore rules changed, so what is indexable changed
+                    //   with them — only a rescan can tell how. Both files,
+                    //   because `.loreignore` is the one a user is actually
+                    //   invited to edit;
+                    // - `.lore.toml` changed, so whether this repo has
+                    //   authority semantics at all may have changed (D-0012),
+                    //   and the project's Markdown has to be re-chunked under
+                    //   the new profile. Only at the root: a nested copy is
+                    //   not configuration.
                     let name = rel.file_name();
-                    if name == Some(".gitignore") || name == Some(walk::LORE_IGNORE_FILE) {
-                        tracing::info!(project = %project.name, "ignore rules changed; scheduling rescan");
+                    let ignore_rules =
+                        name == Some(".gitignore") || name == Some(walk::LORE_IGNORE_FILE);
+                    let repo_config = rel.as_str() == crate::repo_config::REPO_CONFIG_FILE;
+                    if ignore_rules || repo_config {
+                        tracing::info!(
+                            project = %project.name,
+                            file = %rel,
+                            "repository policy changed; scheduling rescan"
+                        );
                         queue.request_full(project.id);
                     }
                     continue;

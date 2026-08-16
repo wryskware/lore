@@ -8,10 +8,11 @@ use chunk_support::{anchor_label, chunk_fixture, render};
 use lore::chunk::{
     FileChunks, MAX_CHUNK_BYTES, TEXT_WINDOW_LINES, WINDOW_OVERLAP_LINES, chunk_file,
 };
+use lore::repo_config::Profile;
 use lore::types::{Chunk, ChunkKind, WindowFamily};
 
 fn chunk(name: &str, src: &str) -> Vec<Chunk> {
-    match chunk_file(Utf8Path::new(name), src.as_bytes()) {
+    match chunk_file(Utf8Path::new(name), src.as_bytes(), Some(Profile::LoreV1)) {
         FileChunks::Chunked(chunks) => chunks,
         FileChunks::Skipped(reason) => panic!("unexpected skip: {reason:?}"),
     }

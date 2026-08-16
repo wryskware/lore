@@ -26,7 +26,12 @@ struct Harness {
 }
 
 fn harness() -> Harness {
-    let fixture = Fixture::new("demo");
+    harness_from(Fixture::new("demo"))
+}
+
+/// The same harness over a caller-built project, for the tests that care
+/// about what the repo committed in its `.lore.toml` (D-0012).
+fn harness_from(fixture: Fixture) -> Harness {
     let queue = IndexQueue::new();
     let (watch_tx, watch) = watch::channel();
     let state = AppState {
@@ -662,6 +667,87 @@ async fn status_reports_refused_authority_declarations_over_the_wire() {
     // The provenance fields ride along on the same row.
     assert_eq!(project["key"], "demo");
     assert_eq!(project["kind"], "repo");
+}
+
+/// A repository's authority posture has to be legible from this row alone
+/// (D-0012): the profile it declared, how far that profile reaches, and how
+/// much canon Lore found. `lore status` and every other client render nothing
+/// but these fields.
+#[tokio::test]
+async fn status_reports_the_declared_profile_and_its_decision_corpus() {
+    // The default fixture commits `lore-v1` with `behavior = "rank"`.
+    let h = harness();
+    h.fixture.write(
+        "design/0_Canon/DECISIONS.md",
+        "# Ledger\n\n## D-0001 — Live\n\n- **Status:** Accepted\n\n\
+         ## D-0002 — Draft\n\n- **Status:** Proposed\n",
+    );
+    full_scan(&h.fixture.context(), &h.fixture.project);
+
+    let (status, body) = get(&h.router, "/v1/status").await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    let project = &body["projects"][0];
+    assert_eq!(project["authority_profile"], "lore-v1", "{body:#}");
+    assert_eq!(project["authority_behavior"], "rank", "{body:#}");
+    assert_eq!(project["authority_config_error"], Value::Null, "{body:#}");
+    assert_eq!(project["decisions_active"], 1, "{body:#}");
+    assert_eq!(project["decisions_total"], 2, "{body:#}");
+    assert_eq!(
+        project["decision_violations"],
+        Value::Null,
+        "an empty defect list is omitted, not an empty array: {body:#}"
+    );
+}
+
+/// A repository that never opted in reports *nothing* rather than a default,
+/// because "no profile" and "the neutral profile" are different claims and a
+/// client rendering the second would be inventing a judgement.
+#[tokio::test]
+async fn status_reports_an_unconfigured_repo_as_having_no_profile() {
+    let h = harness_from(Fixture::neutral("plain"));
+    h.fixture.write(
+        "design/0_Canon/DECISIONS.md",
+        "# Ledger\n\n## D-0001 — Live\n\n- **Status:** Accepted\n",
+    );
+    full_scan(&h.fixture.context(), &h.fixture.project);
+
+    let (status, body) = get(&h.router, "/v1/status").await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    let project = &body["projects"][0];
+    assert_eq!(project["authority_profile"], Value::Null, "{body:#}");
+    assert_eq!(project["authority_behavior"], Value::Null, "{body:#}");
+    assert_eq!(project["authority_config_error"], Value::Null, "{body:#}");
+    assert_eq!(project["decisions_active"], 0, "the ledger is not parsed");
+    assert_eq!(project["decisions_total"], 0, "nor even counted");
+}
+
+/// D-0012's loudness requirement, on the wire. A `.lore.toml` Lore cannot use
+/// indexes the repo neutrally — which is indistinguishable from having no
+/// file at all *except* for this field. If it did not reach the client, the
+/// only symptom of a typo would be a profile that mysteriously never turned
+/// on.
+#[tokio::test]
+async fn status_shouts_about_a_lore_toml_it_cannot_use() {
+    let fixture = Fixture::neutral("broken");
+    fixture.write(
+        lore::repo_config::REPO_CONFIG_FILE,
+        "[authority]\nprofile = \"adr\"\n",
+    );
+    let h = harness_from(fixture);
+    full_scan(&h.fixture.context(), &h.fixture.project);
+
+    let (status, body) = get(&h.router, "/v1/status").await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    let project = &body["projects"][0];
+    let error = project["authority_config_error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the error must be on the wire: {body:#}"));
+    assert!(error.contains("adr"), "it must name the problem: {error:?}");
+    assert_eq!(
+        project["authority_profile"],
+        Value::Null,
+        "and the repo is neutral, not half-configured: {body:#}"
+    );
 }
 
 /// Registration is the only thing that writes the registry outside startup, so

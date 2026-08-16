@@ -5,6 +5,7 @@
 //! re-implemented on Tantivy+arroy.
 
 use camino::{Utf8Path, Utf8PathBuf};
+use lore::repo_config::{Behavior, Profile, RepoAuthority};
 use lore::store::{
     EmbeddingFingerprint, NewEmbedding, SearchFilter, StatusFilter, Store, StoreError,
 };
@@ -325,6 +326,21 @@ fn seeded_lexical_store(dir: &TempDir) -> (Store, i64, i64) {
     let mut store = open(dir);
     let a = store.register_project(p("C:/repos/a"), "a").unwrap();
     let b = store.register_project(p("C:/repos/b"), "b").unwrap();
+    // Both corpora committed `lore-v1`, which is what the `min_authority`
+    // assertions below are about: without a profile a declared `deprecated`
+    // means nothing and the floor has nothing to drop (D-0012).
+    for project in [a, b] {
+        store
+            .set_project_authority(
+                project,
+                &RepoAuthority {
+                    profile: Some(Profile::LoreV1),
+                    behavior: Behavior::Rank,
+                    error: None,
+                },
+            )
+            .unwrap();
+    }
 
     store
         .replace_file_chunks(a, p("src/board.cs"), "h", &[code_chunk(

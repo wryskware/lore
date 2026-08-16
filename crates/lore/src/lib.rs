@@ -9,6 +9,8 @@
 //! - [`registry`] — the `projects.toml` source manifest and stable project keys.
 //! - [`store`] — SQLite SearchStore: metadata + FTS5 + vectors, one transaction domain.
 //! - [`config`] — optional `config.toml` in the data directory.
+//! - [`repo_config`] — the repo-committed `.lore.toml` that opts a repository
+//!   into authority semantics at all (D-0012).
 //! - [`embed`] — local embedding client, health and the backfill worker.
 //! - [`daemon`] — lifecycle, HTTP API, watcher and indexing.
 
@@ -18,5 +20,6 @@ pub mod config;
 pub mod daemon;
 pub mod embed;
 pub mod registry;
+pub mod repo_config;
 pub mod store;
 pub mod types;

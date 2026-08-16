@@ -140,7 +140,7 @@ fn a_decided_declaration_cannot_reach_the_top_tier_without_an_active_citation() 
     let results = search(&fixture, "ranking");
 
     let honest = find(&results, "design/1_Architecture/1.1.md");
-    assert_eq!(honest.effective_authority, "decided");
+    assert_eq!(honest.effective_authority.as_deref(), Some("decided"));
     assert_eq!(honest.authority_note, None);
 
     for (path, why) in [
@@ -156,7 +156,8 @@ fn a_decided_declaration_cannot_reach_the_top_tier_without_an_active_citation() 
             "{path}: Lore never edits the declaration"
         );
         assert_eq!(
-            forged.effective_authority, "neutral",
+            forged.effective_authority.as_deref(),
+            Some("neutral"),
             "{path}: {why}, so the claim must not be honored"
         );
         assert_eq!(
@@ -174,7 +175,7 @@ fn a_decided_declaration_cannot_reach_the_top_tier_without_an_active_citation() 
 
     // Quoting canon is metadata, never authority.
     let quoter = find(&results, "design/quoter.md");
-    assert_eq!(quoter.effective_authority, "neutral");
+    assert_eq!(quoter.effective_authority.as_deref(), Some("neutral"));
     assert_eq!(
         quoter.authority_note, None,
         "nothing was declared to refuse"
@@ -240,7 +241,7 @@ fn a_scratch_note_quoting_decisions_ranks_below_a_plainer_document_it_outmatches
     );
 
     let scratch = find(&results, "design/9_Scratch/session-notes.md");
-    assert_eq!(scratch.effective_authority, "deprecated");
+    assert_eq!(scratch.effective_authority.as_deref(), Some("deprecated"));
     assert_eq!(
         scratch.authority_note.as_deref(),
         Some("9_Scratch path cap")
@@ -279,7 +280,7 @@ fn a_scratch_note_declaring_validated_canon_is_still_capped_and_still_reported()
     let results = search(&fixture, "ranking");
 
     let valid = find(&results, "design/9_Scratch/claim.md");
-    assert_eq!(valid.effective_authority, "deprecated");
+    assert_eq!(valid.effective_authority.as_deref(), Some("deprecated"));
     assert_eq!(
         valid.authority_note.as_deref(),
         Some("9_Scratch path cap"),
@@ -289,7 +290,7 @@ fn a_scratch_note_declaring_validated_canon_is_still_capped_and_still_reported()
     // Two demotions apply at once. The tier takes the lower ceiling; the note
     // takes the one the author can act on.
     let over = find(&results, "design/9_Scratch/overclaim.md");
-    assert_eq!(over.effective_authority, "deprecated");
+    assert_eq!(over.effective_authority.as_deref(), Some("deprecated"));
     assert_eq!(
         over.authority_note.as_deref(),
         Some("decided declared but cites no active decision")
@@ -337,6 +338,6 @@ fn the_ledger_outranks_the_scratch_note_arguing_about_it() {
             .collect::<Vec<_>>()
     );
     let ledger = find(&results, LEDGER);
-    assert_eq!(ledger.effective_authority, "decided");
+    assert_eq!(ledger.effective_authority.as_deref(), Some("decided"));
     assert_eq!(ledger.authority_note, None);
 }

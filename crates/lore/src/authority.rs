@@ -44,11 +44,28 @@
 //! Citations carry **no** ranking weight of their own any more: they remain
 //! visible metadata on every result, and that is all. Authority flows *from*
 //! the ledger, never *to* it from whoever quotes a number.
+//!
+//! # None of this is on by default (D-0012)
+//!
+//! Every rule above is **profile-gated**. [`effective`] takes the repository's
+//! active [`Profile`], and `None` — an unconfigured repo, a broken
+//! `.lore.toml`, or a profile suspended with `behavior = "off"` — means the
+//! whole vault policy is skipped: no ledger pin, no `decided` validation, no
+//! path ceilings, and the declared status is not consulted at all (a neutral
+//! repo does not parse `design_status` in the first place, so there is nothing
+//! to consult). A repository that never adopted the vault workflow must not
+//! acquire accidental directory or frontmatter semantics.
+//!
+//! The one rule that is *not* gated is the `session` source cap: it is a
+//! statement about corpus provenance (D-0006/D-0008), not about a vault
+//! convention, and the session corpus is the daemon's own — it has no repo to
+//! commit a `.lore.toml` to.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 
+use crate::repo_config::Profile;
 use crate::types::{DesignStatus, SourceKind, authority_tier};
 
 /// Directory that contains a project's decision ledger, by convention.
@@ -56,6 +73,9 @@ pub const LEDGER_DIR: &str = "0_Canon";
 
 /// The ledger file itself, inside [`LEDGER_DIR`].
 pub const LEDGER_FILE: &str = "DECISIONS.md";
+
+/// Directory of one-decision-per-file records, inside [`LEDGER_DIR`] (D-0013).
+pub const RECORDS_DIR: &str = "decisions";
 
 /// The ledger is pinned here regardless of what its own frontmatter says.
 pub const LEDGER_TIER: u8 = 3;
@@ -215,6 +235,41 @@ pub fn is_ledger_path(path: &Utf8Path) -> bool {
         if segment_eq(f, LEDGER_FILE) && segment_eq(d, LEDGER_DIR))
 }
 
+/// Is this project-relative path a per-file decision record, and if so which
+/// decision does its **filename** claim (D-0013)?
+///
+/// Convention, positional like [`is_ledger_path`]: the last three segments
+/// must be `0_Canon/decisions/D-NNNN-<slug>.md`. The filename's `D-NNNN`
+/// prefix is authoritative for identity — a heading that disagrees is a
+/// violation, not an alternative source of truth — so this returns the id
+/// rather than a bare bool.
+///
+/// The `-<slug>` is required: `D-0012.md` is not a record. A record filename
+/// is meant to say what the decision is at a glance, and accepting the bare
+/// form would make `D-0012.md` and `D-0012-authority.md` two records for one
+/// id purely by accident.
+pub fn decision_record_id(path: &Utf8Path) -> Option<String> {
+    let mut segments = path.iter().rev();
+    let file = segments.next()?;
+    if !segment_eq(segments.next()?, RECORDS_DIR) || !segment_eq(segments.next()?, LEDGER_DIR) {
+        return None;
+    }
+    let stem = file
+        .strip_suffix(".md")
+        .or_else(|| file.strip_suffix(".MD"))?;
+    let id = leading_decision_id(stem)?;
+    // `D-0012` followed by anything other than `-slug` is not a record.
+    stem[id.len()..].strip_prefix('-')?;
+    Some(id)
+}
+
+/// Does this path feed the project's active-decision set — a mono ledger or a
+/// per-file record? The one predicate the incremental index pass asks before
+/// deciding whether a batch is worth a recompute.
+pub fn is_decision_source(path: &Utf8Path) -> bool {
+    is_ledger_path(path) || decision_record_id(path).is_some()
+}
+
 /// The effective authority of a file.
 ///
 /// Pure: every input is either persisted on the chunk row, derivable from the
@@ -225,9 +280,26 @@ pub fn effective(
     declared: Declared<'_>,
     active: &BTreeSet<String>,
     kind: SourceKind,
+    profile: Option<Profile>,
 ) -> Authority {
-    // The ledger outranks everything, including its own frontmatter.
-    if is_ledger_path(path) {
+    // No active profile: the vault policy below does not exist for this repo
+    // (D-0012). Everything is neutral, including files whose *path* happens to
+    // spell `9_Scratch` and files whose frontmatter happens to say `decided` —
+    // a repository that never opted in must not acquire either meaning.
+    let Some(Profile::LoreV1) = profile else {
+        let mut tier = authority_tier(None);
+        let mut demotion = None;
+        if kind == SourceKind::Session {
+            tier = SESSION_TIER_CEILING.min(tier);
+            demotion = Some(Demotion::SessionSource);
+        }
+        return Authority { tier, demotion };
+    };
+
+    // The ledger outranks everything, including its own frontmatter. Per-file
+    // decision records get the same pin: they are the same canon in a
+    // different file layout (D-0013).
+    if is_ledger_path(path) || decision_record_id(path).is_some() {
         return Authority {
             tier: LEDGER_TIER,
             demotion: None,
@@ -315,27 +387,214 @@ pub fn effective(
 /// to a smaller active set — which demotes over-claiming documents — rather
 /// than failing the index pass.
 pub fn parse_ledger(src: &str) -> BTreeSet<String> {
-    /// One `## D-NNNN` entry, accumulating until the next heading closes it.
-    struct Entry {
-        id: String,
-        accepted: bool,
-        supersedes: Vec<String>,
+    let mut index = DecisionIndex::default();
+    index.add_ledger(Utf8Path::new(LEDGER_FILE), src);
+    index.resolve().active
+}
+
+/// One parsed decision, before supersession is resolved. Identical shape
+/// whether it came from a mono-ledger heading or a per-file record (D-0013):
+/// same field grammar, same D-0010 supersession semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionEntry {
+    pub id: String,
+    pub accepted: bool,
+    pub supersedes: Vec<String>,
+}
+
+/// A decision-set problem worth putting in front of the author.
+///
+/// Distinct from [`Demotion`]: a demotion is a verdict about one *document's*
+/// ranking, this is a defect in the decision corpus itself — a record whose
+/// heading and filename disagree, or two records claiming one id. Both kinds
+/// end up in `lore status`, from different columns.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DecisionViolation {
+    /// Project-relative path of the offending file.
+    pub path: Utf8PathBuf,
+    pub detail: String,
+}
+
+impl std::fmt::Display for DecisionViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.path, self.detail)
+    }
+}
+
+/// The resolved decision corpus of one project.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Decisions {
+    /// Accepted and not retired — the set `decided` declarations are validated
+    /// against.
+    pub active: BTreeSet<String>,
+    /// Distinct decisions that survived identity checks, whatever their
+    /// status. `active.len() / total` is the "12/15 decisions active" figure
+    /// `lore status` reports; excluded records are counted as violations
+    /// instead, not as decisions.
+    pub total: usize,
+    pub violations: Vec<DecisionViolation>,
+}
+
+/// Accumulates every decision source in a project, then resolves them together.
+///
+/// Together, deliberately: a per-file record may supersede a mono-ledger entry
+/// and vice versa (D-0013 says the two formats coexist), so resolution cannot
+/// happen per file.
+#[derive(Debug, Default)]
+pub struct DecisionIndex {
+    entries: Vec<Origin>,
+    violations: Vec<DecisionViolation>,
+}
+
+#[derive(Debug)]
+struct Origin {
+    path: Utf8PathBuf,
+    entry: DecisionEntry,
+    /// From a mono ledger (as opposed to a per-file record). The duplicate-id
+    /// rule is asymmetric, so the provenance has to survive parsing.
+    mono: bool,
+}
+
+impl DecisionIndex {
+    /// Add every `## D-NNNN` entry of a mono ledger.
+    ///
+    /// Unparseable prose is skipped, never an error: a malformed ledger
+    /// degrades to a smaller active set — which demotes over-claiming
+    /// documents — rather than failing the index pass.
+    pub fn add_ledger(&mut self, path: &Utf8Path, src: &str) {
+        for entry in ledger_entries(src) {
+            self.entries.push(Origin {
+                path: path.to_owned(),
+                entry,
+                mono: true,
+            });
+        }
     }
 
-    let mut accepted: BTreeSet<String> = BTreeSet::new();
-    let mut superseded: BTreeSet<String> = BTreeSet::new();
-    let mut current: Option<Entry> = None;
-
-    let flush = |current: &mut Option<Entry>,
-                 accepted: &mut BTreeSet<String>,
-                 superseded: &mut BTreeSet<String>| {
-        if let Some(entry) = current.take()
-            && entry.accepted
-        {
-            accepted.insert(entry.id);
-            superseded.extend(entry.supersedes);
+    /// Add one per-file decision record (D-0013). `path` must have already
+    /// been recognized by [`decision_record_id`]; the id it yields is the
+    /// record's identity, and a heading that disagrees is a violation rather
+    /// than a second opinion.
+    pub fn add_record(&mut self, path: &Utf8Path, src: &str) {
+        let Some(id) = decision_record_id(path) else {
+            return;
+        };
+        match parse_record(&id, src) {
+            Ok(entry) => self.entries.push(Origin {
+                path: path.to_owned(),
+                entry,
+                mono: false,
+            }),
+            Err(detail) => self.violations.push(DecisionViolation {
+                path: path.to_owned(),
+                detail,
+            }),
         }
-    };
+    }
+
+    /// Resolve identity collisions, then supersession.
+    pub fn resolve(mut self) -> Decisions {
+        // -- identity ------------------------------------------------------
+        //
+        // Duplicate ids are resolved before anything is believed, because an
+        // ambiguous id makes both `Supersedes: D-NNNN` and a document's
+        // citation of it mean two different things at once.
+        let mut by_id: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+        for (index, origin) in self.entries.iter().enumerate() {
+            by_id
+                .entry(origin.entry.id.as_str())
+                .or_default()
+                .push(index);
+        }
+
+        let mut excluded: BTreeSet<usize> = BTreeSet::new();
+        let mut collisions: Vec<DecisionViolation> = Vec::new();
+        for (id, indices) in &by_id {
+            if indices.len() < 2 {
+                continue;
+            }
+            let mono: Vec<usize> = indices
+                .iter()
+                .copied()
+                .filter(|i| self.entries[*i].mono)
+                .collect();
+            let records: Vec<usize> = indices
+                .iter()
+                .copied()
+                .filter(|i| !self.entries[*i].mono)
+                .collect();
+
+            if !mono.is_empty() && !records.is_empty() {
+                // The mono ledger wins and stays active; every record claiming
+                // the same id is excluded. Deciding in favour of the ledger
+                // keeps the *existing* corpus authoritative during a migration,
+                // so half-migrating a vault cannot deactivate live canon.
+                let ledger = self.entries[mono[0]].path.clone();
+                for index in records {
+                    excluded.insert(index);
+                    collisions.push(DecisionViolation {
+                        path: self.entries[index].path.clone(),
+                        detail: format!(
+                            "duplicate decision id {id}: the ledger entry in {ledger} holds it, \
+                             so this record is excluded from the active set"
+                        ),
+                    });
+                }
+                continue;
+            }
+            if mono.is_empty() {
+                // Two records, no ledger entry: there is no principled winner,
+                // so neither is believed and both are named.
+                for index in records {
+                    excluded.insert(index);
+                    collisions.push(DecisionViolation {
+                        path: self.entries[index].path.clone(),
+                        detail: format!(
+                            "duplicate decision id {id} across per-file records; \
+                             all of them are excluded from the active set"
+                        ),
+                    });
+                }
+            }
+            // Two *mono* entries sharing an id means two ledgers in one repo.
+            // Their active sets are unioned rather than reconciled — see the
+            // note on `Decisions` and D-0012's deferred multi-root namespace
+            // resolution.
+        }
+        self.violations.extend(collisions);
+        self.violations
+            .sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.detail.cmp(&b.detail)));
+
+        // -- supersession --------------------------------------------------
+        let mut accepted: BTreeSet<String> = BTreeSet::new();
+        let mut superseded: BTreeSet<String> = BTreeSet::new();
+        let mut total: BTreeSet<String> = BTreeSet::new();
+        for (index, origin) in self.entries.iter().enumerate() {
+            if excluded.contains(&index) {
+                continue;
+            }
+            total.insert(origin.entry.id.clone());
+            if origin.entry.accepted {
+                accepted.insert(origin.entry.id.clone());
+                superseded.extend(origin.entry.supersedes.iter().cloned());
+            }
+        }
+
+        Decisions {
+            active: accepted
+                .into_iter()
+                .filter(|id| !superseded.contains(id))
+                .collect(),
+            total: total.len(),
+            violations: self.violations,
+        }
+    }
+}
+
+/// Every `## D-NNNN` entry of a mono ledger, in file order.
+fn ledger_entries(src: &str) -> Vec<DecisionEntry> {
+    let mut out: Vec<DecisionEntry> = Vec::new();
+    let mut current: Option<DecisionEntry> = None;
 
     for line in src.trim_start_matches('\u{feff}').lines() {
         let trimmed = line.trim_start();
@@ -343,9 +602,9 @@ pub fn parse_ledger(src: &str) -> BTreeSet<String> {
             // Any heading closes the previous entry; only a `D-NNNN` one opens
             // a new entry, so a trailing "## Notes" section cannot absorb
             // fields into the last decision.
-            flush(&mut current, &mut accepted, &mut superseded);
+            out.extend(current.take());
             let rest = rest.trim_start_matches('#');
-            current = leading_decision_id(rest).map(|id| Entry {
+            current = leading_decision_id(rest).map(|id| DecisionEntry {
                 id,
                 accepted: false,
                 supersedes: Vec::new(),
@@ -355,21 +614,88 @@ pub fn parse_ledger(src: &str) -> BTreeSet<String> {
         let Some(entry) = current.as_mut() else {
             continue;
         };
-        if let Some(value) = field_value(trimmed, "Status") {
-            entry.accepted = value
-                .trim()
-                .trim_end_matches(['*', '.', ' '])
-                .eq_ignore_ascii_case("accepted");
-        } else if let Some(value) = field_value(trimmed, "Supersedes") {
-            entry.supersedes.extend(bare_supersedes_list(value));
+        absorb_field(entry, trimmed);
+    }
+    out.extend(current);
+    out
+}
+
+/// Parse one per-file decision record (D-0013).
+///
+/// `file_id` is the authoritative identity, taken from the filename. The
+/// record's **first** heading identifies it: if that heading carries a
+/// `D-NNNN` it must be `file_id`, and the entry's fields are the lines between
+/// it and the next heading. A first heading with no id (a record titled after
+/// its subject rather than its number) is fine — the filename already said
+/// which decision this is — and the fields are then read from the whole file.
+///
+/// Only the first heading is consulted on purpose: a record that *quotes*
+/// `## D-0013 — something else` further down is discussing another decision,
+/// not claiming to be one, and flagging that as a mismatch would punish
+/// ordinary prose.
+///
+/// Both `# ` and `## ` are accepted as the heading level: a one-decision file
+/// has an equally good claim to either, and rejecting one would make the
+/// format a formatting trap.
+fn parse_record(file_id: &str, src: &str) -> Result<DecisionEntry, String> {
+    let mut entry = DecisionEntry {
+        id: file_id.to_string(),
+        accepted: false,
+        supersedes: Vec::new(),
+    };
+
+    let src = src.trim_start_matches('\u{feff}');
+    let mut lines = src.lines();
+    let mut scoped = false;
+    for line in lines.by_ref() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix('#') else {
+            continue;
+        };
+        let rest = rest.trim_start_matches('#');
+        match leading_decision_id(rest) {
+            Some(heading_id) if heading_id != file_id => {
+                return Err(format!(
+                    "decision record names {heading_id} in its heading but the filename \
+                     claims {file_id}; the filename is authoritative, so this record is \
+                     excluded from the active set until they agree"
+                ));
+            }
+            Some(_) => scoped = true,
+            // The first heading identifies the record whether or not it
+            // carries the id; a title-only heading simply scopes nothing.
+            None => {}
+        }
+        break;
+    }
+
+    if scoped {
+        // Fields belong to this entry until the next heading of any level.
+        for line in lines {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') {
+                break;
+            }
+            absorb_field(&mut entry, trimmed);
+        }
+    } else {
+        for line in src.lines() {
+            absorb_field(&mut entry, line.trim_start());
         }
     }
-    flush(&mut current, &mut accepted, &mut superseded);
+    Ok(entry)
+}
 
-    accepted
-        .into_iter()
-        .filter(|id| !superseded.contains(id))
-        .collect()
+/// Apply one `- **Status:** …` / `- **Supersedes:** …` line to an entry.
+fn absorb_field(entry: &mut DecisionEntry, trimmed: &str) {
+    if let Some(value) = field_value(trimmed, "Status") {
+        entry.accepted = value
+            .trim()
+            .trim_end_matches(['*', '.', ' '])
+            .eq_ignore_ascii_case("accepted");
+    } else if let Some(value) = field_value(trimmed, "Supersedes") {
+        entry.supersedes.extend(bare_supersedes_list(value));
+    }
 }
 
 /// IDs from a `Supersedes` field value, honored only when the value is a
@@ -438,7 +764,6 @@ fn field_value<'a>(line: &'a str, name: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use camino::Utf8PathBuf;
 
     fn active(ids: &[&str]) -> BTreeSet<String> {
         ids.iter().map(|id| (*id).to_string()).collect()
@@ -458,6 +783,7 @@ mod tests {
             },
             &active(live),
             SourceKind::Repo,
+            Some(Profile::LoreV1),
         )
     }
 
@@ -593,9 +919,62 @@ mod tests {
             },
             &active(&["D-0007"]),
             SourceKind::Session,
+            Some(Profile::LoreV1),
         );
         assert_eq!(session.tier, SESSION_TIER_CEILING);
         assert_eq!(session.demotion, Some(Demotion::SessionSource));
+
+        // The session cap is provenance, not a vault convention, so it is the
+        // one rule that survives a profile-less source (D-0006/D-0008): the
+        // session corpus is the daemon's own and has no repo to configure.
+        let neutral = effective(
+            &Utf8PathBuf::from("sessions/2026-08-14-thread.md"),
+            Declared {
+                status: Some(DesignStatus::Decided),
+                decision_refs: &cited,
+            },
+            &active(&["D-0007"]),
+            SourceKind::Session,
+            None,
+        );
+        assert_eq!(neutral.tier, SESSION_TIER_CEILING);
+        assert_eq!(neutral.demotion, Some(Demotion::SessionSource));
+    }
+
+    /// D-0012's core promise: a repository that never opted in acquires no
+    /// directory semantics, no frontmatter semantics, and no ledger pin.
+    #[test]
+    fn without_a_profile_nothing_declares_anything() {
+        let neutral = |path: &str, status: Option<DesignStatus>| {
+            let cited = refs(&["D-0001"]);
+            effective(
+                &Utf8PathBuf::from(path),
+                Declared {
+                    status,
+                    decision_refs: &cited,
+                },
+                &active(&["D-0001"]),
+                SourceKind::Repo,
+                None,
+            )
+        };
+        for (path, status) in [
+            ("design/0_Canon/DECISIONS.md", None),
+            ("design/0_Canon/decisions/D-0012-profiles.md", None),
+            ("design/9_Scratch/notes.md", Some(DesignStatus::Deprecated)),
+            ("design/7_Research/raw/E.md", Some(DesignStatus::Leaning)),
+            ("design/x.md", Some(DesignStatus::Decided)),
+            ("docs/y.md", None),
+        ] {
+            let verdict = neutral(path, status);
+            assert_eq!(
+                verdict.tier,
+                authority_tier(None),
+                "{path} must be neutral without a profile"
+            );
+            assert_eq!(verdict.demotion, None, "{path}");
+            assert!(!verdict.is_violation(), "{path}");
+        }
     }
 
     #[test]
@@ -753,6 +1132,173 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["D-0009"]
         );
+    }
+
+    // -- per-file decision records (D-0013) --------------------------------
+
+    fn record(id: &str) -> Utf8PathBuf {
+        Utf8PathBuf::from(format!("design/0_Canon/decisions/{id}-slug.md"))
+    }
+
+    #[test]
+    fn a_record_path_is_recognized_by_its_filename_and_position() {
+        assert_eq!(
+            decision_record_id(&record("D-0012")).as_deref(),
+            Some("D-0012")
+        );
+        assert_eq!(
+            decision_record_id(&Utf8PathBuf::from(
+                "Docs/0_Canon/decisions/D-0001-authority-model.md"
+            ))
+            .as_deref(),
+            Some("D-0001")
+        );
+        for not_a_record in [
+            "design/0_Canon/decisions/D-0012.md",    // no slug
+            "design/0_Canon/decisions/notes.md",     // no id
+            "design/0_Canon/D-0012-slug.md",         // wrong directory
+            "design/decisions/D-0012-slug.md",       // no 0_Canon
+            "design/0_Canon/decisions/D-12-a.md",    // malformed id
+            "design/0_Canon/decisions/D-0012-a.txt", // not Markdown
+        ] {
+            assert_eq!(
+                decision_record_id(&Utf8PathBuf::from(not_a_record)),
+                None,
+                "{not_a_record}"
+            );
+        }
+        assert!(is_decision_source(&record("D-0012")));
+        assert!(is_decision_source(&Utf8PathBuf::from(
+            "design/0_Canon/DECISIONS.md"
+        )));
+    }
+
+    /// Records and the mono ledger are one corpus: either may supersede the
+    /// other, and both are pinned to the ledger tier.
+    #[test]
+    fn records_and_the_mono_ledger_resolve_together() {
+        let mut index = DecisionIndex::default();
+        index.add_ledger(
+            Utf8Path::new("design/0_Canon/DECISIONS.md"),
+            "## D-0001 — First\n- **Status:** Accepted\n- **Supersedes:** None\n\n\
+             ## D-0002 — Second\n- **Status:** Accepted\n- **Supersedes:** None\n",
+        );
+        // `# ` heading level, and it retires a mono-ledger entry.
+        index.add_record(
+            &record("D-0003"),
+            "# D-0003 — Replaces the second\n\n- **Status:** Accepted\n- **Supersedes:** D-0002\n",
+        );
+        // `## ` heading level, and merely proposed.
+        index.add_record(
+            &record("D-0004"),
+            "## D-0004 — A draft\n\n- **Status:** Proposed\n- **Supersedes:** D-0001\n",
+        );
+        let resolved = index.resolve();
+        assert_eq!(
+            resolved
+                .active
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["D-0001", "D-0003"],
+            "a record supersedes exactly like a ledger entry, and an \
+             unpromoted one retires nothing"
+        );
+        assert_eq!(resolved.total, 4);
+        assert!(resolved.violations.is_empty());
+
+        // Both formats are pinned canon.
+        assert_eq!(
+            tier("design/0_Canon/decisions/D-0003-x.md", None, &[], &[]).tier,
+            LEDGER_TIER
+        );
+    }
+
+    #[test]
+    fn identity_defects_are_surfaced_and_excluded() {
+        // Heading disagrees with the filename: excluded, and named.
+        let mut index = DecisionIndex::default();
+        index.add_record(
+            &record("D-0005"),
+            "# D-0006 — Copy-pasted from another record\n- **Status:** Accepted\n",
+        );
+        let resolved = index.resolve();
+        assert!(resolved.active.is_empty());
+        assert_eq!(resolved.total, 0);
+        assert_eq!(resolved.violations.len(), 1);
+        assert!(
+            resolved.violations[0].detail.contains("D-0006")
+                && resolved.violations[0].detail.contains("D-0005"),
+            "{:?}",
+            resolved.violations[0]
+        );
+
+        // Duplicate against the mono ledger: the ledger keeps the decision.
+        let mut index = DecisionIndex::default();
+        index.add_ledger(
+            Utf8Path::new("design/0_Canon/DECISIONS.md"),
+            "## D-0007 — Interfaces\n- **Status:** Accepted\n",
+        );
+        index.add_record(
+            &record("D-0007"),
+            "# D-0007 — Same number, different file\n- **Status:** Accepted\n",
+        );
+        let resolved = index.resolve();
+        assert_eq!(
+            resolved
+                .active
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["D-0007"],
+            "the ledger entry stays active"
+        );
+        assert_eq!(resolved.total, 1);
+        assert_eq!(resolved.violations.len(), 1);
+
+        // Two records colliding with each other: neither is believed.
+        let mut index = DecisionIndex::default();
+        for slug in ["a", "b"] {
+            index.add_record(
+                &Utf8PathBuf::from(format!("design/0_Canon/decisions/D-0008-{slug}.md")),
+                "- **Status:** Accepted\n",
+            );
+        }
+        let resolved = index.resolve();
+        assert!(resolved.active.is_empty(), "{resolved:?}");
+        assert_eq!(resolved.total, 0);
+        assert_eq!(resolved.violations.len(), 2, "both are named");
+    }
+
+    /// A record whose first heading is a plain title is still identified by
+    /// its filename, and its fields are still read.
+    #[test]
+    fn a_record_without_an_id_heading_is_identified_by_its_filename() {
+        let mut index = DecisionIndex::default();
+        index.add_record(
+            &record("D-0009"),
+            "---\ndesign_status: decided\n---\n\n# Authority is repository-opt-in\n\n\
+             - **Status:** Accepted\n- **Supersedes:** None\n",
+        );
+        let resolved = index.resolve();
+        assert_eq!(
+            resolved
+                .active
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["D-0009"]
+        );
+        assert!(resolved.violations.is_empty());
+
+        // …and a `D-NNNN` heading further down is prose, not a claim.
+        let mut index = DecisionIndex::default();
+        index.add_record(
+            &record("D-0010"),
+            "# Supersession semantics\n\n- **Status:** Accepted\n\n\
+             ## D-0099 — quoted for contrast\n\nprose\n",
+        );
+        assert!(index.resolve().violations.is_empty());
     }
 
     #[test]

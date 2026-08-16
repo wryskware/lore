@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use camino::Utf8Path;
 use lore::chunk::{FileChunks, chunk_file};
+use lore::repo_config::Profile;
 use lore::types::{Chunk, ChunkKind};
 
 /// Every fixture, as a project-relative path under `tests/fixtures`.
@@ -37,7 +38,7 @@ pub fn read(name: &str) -> Vec<u8> {
 /// Chunks a fixture under its `tests/fixtures`-relative path.
 pub fn chunk_fixture(name: &str) -> Vec<Chunk> {
     let bytes = read(name);
-    match chunk_file(Utf8Path::new(name), &bytes) {
+    match chunk_file(Utf8Path::new(name), &bytes, Some(Profile::LoreV1)) {
         FileChunks::Chunked(chunks) => chunks,
         FileChunks::Skipped(reason) => panic!("{name} unexpectedly skipped: {reason:?}"),
     }

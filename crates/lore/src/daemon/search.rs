@@ -186,6 +186,17 @@ pub fn execute(
 
     let limit = request.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
 
+    // Which corpora let authority touch *ordering* (D-0012). `annotate`
+    // computes and reports every tier and note but leaves the ranking to pure
+    // retrieval, so the multiplier is keyed on the source, not applied
+    // globally — one repo opting into `rank` must not re-weight another's
+    // results in the same response.
+    let ranked: HashSet<ProjectId> = sources
+        .values()
+        .filter(|source| source.authority.ranks())
+        .map(|source| source.id)
+        .collect();
+
     // Candidate acquisition is a loop, not one fixed pull (see the module
     // header). Both arms are always asked for the same depth, because the stop
     // condition is stated in terms of a single `depth`. The floor keeps a
@@ -220,7 +231,7 @@ pub fn execute(
         // Honest by construction: an embedded query over a corpus with no
         // vectors in the filtered scope contributed nothing, and says so.
         let lexical_only = vector.is_empty();
-        let fusion = fuse_detailed(vec![lexical, vector], limit);
+        let fusion = fuse_detailed(vec![lexical, vector], limit, &ranked);
 
         if open == 0 {
             // Both arms are fully enumerated: this ranking is exact, not an
@@ -342,13 +353,16 @@ struct Outside {
 /// acquisition needs; this shape is what the ranking tests assert against.
 #[cfg(test)]
 fn fuse(lists: Vec<Vec<SearchHit>>, limit: usize) -> Vec<SearchHit> {
-    fuse_detailed(lists, limit).page
+    // Every project in the ranking tests is an authority-ranking one, which
+    // is what those tests were written against.
+    let ranked: HashSet<ProjectId> = lists.iter().flatten().map(|hit| hit.project).collect();
+    fuse_detailed(lists, limit, &ranked).page
 }
 
 /// [`fuse`], keeping the bookkeeping acquisition needs to decide whether to
 /// go deeper. Recomputed from scratch every round — nothing here is patched
 /// incrementally, so a deeper fetch cannot leave a stale ordering behind.
-fn fuse_detailed(lists: Vec<Vec<SearchHit>>, limit: usize) -> Fusion {
+fn fuse_detailed(lists: Vec<Vec<SearchHit>>, limit: usize, ranked: &HashSet<ProjectId>) -> Fusion {
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut seen: HashMap<(ProjectId, String), usize> = HashMap::new();
 
@@ -381,7 +395,11 @@ fn fuse_detailed(lists: Vec<Vec<SearchHit>>, limit: usize) -> Fusion {
     let mut scored: Vec<(f64, f64, Candidate)> = candidates
         .into_iter()
         .map(|candidate| {
-            let authority = authority_weight(candidate.authority.tier);
+            let authority = if ranked.contains(&candidate.project) {
+                authority_weight(candidate.authority.tier)
+            } else {
+                AUTHORITY_NEUTRAL
+            };
             (candidate.rrf * authority, authority, candidate)
         })
         .collect();
@@ -506,6 +524,12 @@ fn to_result(sources: &HashMap<ProjectId, Project>, hit: SearchHit) -> SearchRes
         None => (None, Vec::new()),
     };
     let (excerpt, excerpt_truncated) = excerpt(&chunk.text);
+    // A neutral repository is not "neutral authority", it is *unjudged*
+    // (D-0012). Reporting a tier for a repo that never opted in would put a
+    // verdict on the wire that nothing computed, so the fields are simply
+    // absent. `design_status` and `decision_refs` are already empty for such a
+    // repo — the chunker never parsed them.
+    let annotates = source.is_some_and(|source| source.authority.annotates());
 
     SearchResult {
         chunk_id: chunk.id.0,
@@ -520,11 +544,14 @@ fn to_result(sources: &HashMap<ProjectId, Project>, hit: SearchHit) -> SearchRes
         symbol_path,
         heading_path,
         design_status: design_status.map(str::to_string),
-        effective_authority: hit.authority.label().to_string(),
-        authority_note: hit
-            .authority
-            .demotion
-            .map(|demotion| demotion.note().to_string()),
+        effective_authority: annotates.then(|| hit.authority.label().to_string()),
+        authority_note: annotates
+            .then(|| {
+                hit.authority
+                    .demotion
+                    .map(|demotion| demotion.note().to_string())
+            })
+            .flatten(),
         decision_refs,
         score: f64::from(hit.score),
         excerpt,
@@ -566,6 +593,7 @@ fn status_label(status: DesignStatus) -> &'static str {
 mod tests {
     use super::*;
     use crate::authority::Demotion;
+    use crate::repo_config::{Behavior, Profile, RepoAuthority};
     use crate::types::{Chunk, ChunkId, VaultMeta, WindowFamily, authority_tier};
     use camino::Utf8PathBuf;
 
@@ -953,6 +981,13 @@ mod tests {
                 name: "lore".into(),
                 key: "lore".into(),
                 kind: SourceKind::Repo,
+                // The corpus these assertions were written against: a repo
+                // that committed `lore-v1` with authority-aware ranking.
+                authority: RepoAuthority {
+                    profile: Some(Profile::LoreV1),
+                    behavior: Behavior::Rank,
+                    error: None,
+                },
             },
         )]
         .into_iter()
@@ -970,7 +1005,7 @@ mod tests {
         assert_eq!(result.project, "lore");
         assert_eq!(result.project_key, "lore");
         assert_eq!(result.design_status.as_deref(), Some("decided"));
-        assert_eq!(result.effective_authority, "deprecated");
+        assert_eq!(result.effective_authority.as_deref(), Some("deprecated"));
         assert_eq!(result.authority_note.as_deref(), Some("9_Scratch path cap"));
         // Citations survive as metadata even though they earn nothing.
         assert_eq!(result.decision_refs, ["D-0007"]);
@@ -985,11 +1020,28 @@ mod tests {
                 3,
             ),
         );
-        assert_eq!(honest.effective_authority, "decided");
+        assert_eq!(honest.effective_authority.as_deref(), Some("decided"));
         assert_eq!(
             honest.authority_note, None,
             "no note when nothing was demoted"
         );
+
+        // The same hit from a repository that never opted in carries no
+        // authority reading at all — absent, not "neutral" (D-0012).
+        let neutral_sources: HashMap<ProjectId, Project> = sources
+            .iter()
+            .map(|(id, source)| {
+                let mut source = source.clone();
+                source.authority = RepoAuthority::default();
+                (*id, source)
+            })
+            .collect();
+        let unjudged = to_result(
+            &neutral_sources,
+            at_tier("z", "design/9_Scratch/notes.md", section("Notes"), None, 1),
+        );
+        assert_eq!(unjudged.effective_authority, None);
+        assert_eq!(unjudged.authority_note, None);
     }
 
     #[test]

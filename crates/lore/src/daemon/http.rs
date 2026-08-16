@@ -198,6 +198,25 @@ async fn status(
                     .into_iter()
                     .map(camino::Utf8PathBuf::into_string)
                     .collect(),
+                // The repo's own `.lore.toml` verdict (D-0012). The behavior
+                // is reported only alongside a profile: on its own it would
+                // claim a mode for a repo that declared nothing.
+                authority_profile: p
+                    .authority
+                    .profile
+                    .map(|profile| profile.as_str().to_string()),
+                authority_behavior: p
+                    .authority
+                    .profile
+                    .map(|_| p.authority.behavior.as_str().to_string()),
+                authority_config_error: p.authority.error,
+                decisions_active: p.decisions_active,
+                decisions_total: p.decisions_total,
+                decision_violations: p
+                    .decision_violations
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
                 // Same reasoning as `embeddings` below: a watch that is not
                 // armed degrades the daemon silently unless it is reported.
                 watch: state.watch_status.of(p.project),

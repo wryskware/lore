@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use camino::Utf8Path;
 use chunk_support::{FIXTURES, chunk_fixture, read};
 use lore::chunk::{MAX_CHUNK_BYTES, TEXT_WINDOW_MAX_BYTES, chunk_file};
+use lore::repo_config::Profile;
 use lore::types::ChunkKind;
 
 #[test]
@@ -71,7 +72,7 @@ fn rechunking_identical_content_is_idempotent() {
         // through a fresh parser instance and a differently-spelled path.
         let bytes = read(name);
         let windows_path = name.replace('/', "\\");
-        let again = chunk_file(Utf8Path::new(&windows_path), &bytes);
+        let again = chunk_file(Utf8Path::new(&windows_path), &bytes, Some(Profile::LoreV1));
         let ids: Vec<_> = again.chunks().iter().map(|c| c.id.clone()).collect();
         let expected: Vec<_> = first.iter().map(|c| c.id.clone()).collect();
         assert_eq!(ids, expected, "{name}: ids changed across re-chunk");

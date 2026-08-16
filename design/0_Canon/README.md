@@ -1,8 +1,10 @@
 ---
 design_status: decided
-last_reviewed: 2026-08-14
+last_reviewed: 2026-08-15
 decision_refs:
   - D-0001
+  - D-0012
+  - D-0013
 ---
 
 # Lore — Canon, Authority, and Certainty
@@ -39,5 +41,10 @@ Design is tentative by default. It becomes canon only through an explicit, user-
 
 - Only Wrysk (or an explicitly delegated agent, for a named choice) may append accepted entries, mark a document `decided`, or supersede canon.
 - [[DECISIONS]] is append-only. Supersession is a new entry with a `Supersedes` field, never a rewrite.
+- Decisions may also be authored one-per-file under `0_Canon/decisions/D-NNNN-<slug>.md` with the same field grammar; the filename ID is authoritative (D-0013). Accepted records are substantively immutable in either format.
 - Agents may draft proposed entries but must leave them unpromoted.
 - Research findings ([[../7_Research/00_summary|7_Research]]) are evidence, not decisions.
+
+## Tool interpretation is opt-in
+
+These conventions bind agents working in this vault regardless of tooling. Lore-the-daemon, however, only *interprets* them for repositories that commit a `.lore.toml` authority profile (D-0012); this repo declares `profile = "lore-v1"`, `behavior = "rank"`.

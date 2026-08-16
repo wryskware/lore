@@ -446,6 +446,8 @@ fn project(id: ProjectId, root: &str, name: &str) -> Project {
         name: name.to_string(),
         key: name.to_string(),
         kind: lore::types::SourceKind::Repo,
+        // Routing is what these tests are about; the profile never reaches it.
+        authority: lore::repo_config::RepoAuthority::default(),
     }
 }
 
@@ -486,6 +488,47 @@ async fn an_edit_under_a_nested_root_reaches_every_containing_project() {
             order.map(|p| p.id),
         );
     }
+}
+
+/// `.lore.toml` is policy, not content (D-0012): editing it can change
+/// whether the repo has authority semantics at all, and the whole project's
+/// Markdown has to be re-chunked under the new profile. A dot-file is
+/// otherwise excluded from indexing, so without this exception a repo that
+/// just opted in would keep serving unjudged results until something else
+/// happened to trigger a full scan — which, on a settled repo, is nothing.
+///
+/// Routing does not look at the event kind, so a create and an edit take the
+/// same path; what it does look at is *where* the file is.
+#[tokio::test]
+async fn a_root_lore_toml_edit_schedules_a_rescan() {
+    let mut seam = Seam::new(FakeBackend::default());
+    let project = project(1, r"C:\repo", "demo");
+    seam.want(&project);
+    seam.wait_armed(1).await;
+
+    seam.emit(&[r"C:\repo\.lore.toml"]);
+    wait_until("a full rescan of the project", || {
+        seam.collect();
+        seam.full_for(1)
+    })
+    .await;
+    assert!(
+        seam.paths_for(1).is_empty(),
+        "a rescan, not an incremental edit to an excluded file"
+    );
+
+    // Only at the registered root. A nested copy is an ordinary (excluded)
+    // dot-file, and honoring it would let any vendored subdirectory force
+    // full rescans of the repo that happens to contain it.
+    seam.forget_served();
+    seam.emit(&[r"C:\repo\vendor\thing\.lore.toml", r"C:\repo\src\lib.rs"]);
+    wait_until("the ordinary edit in the same batch to arrive", || {
+        seam.collect();
+        !seam.paths_for(1).is_empty()
+    })
+    .await;
+    assert_eq!(seam.paths_for(1), ["src/lib.rs"]);
+    assert!(!seam.full_for(1), "the nested config is inert");
 }
 
 /// A reconnecting volume or a transient Windows error refuses the arm once.

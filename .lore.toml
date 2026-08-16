@@ -1,0 +1,6 @@
+# Lore repo-side configuration (D-0012). Committed; follows the repo.
+[authority]
+profile = "lore-v1"
+# Default when absent is "annotate"; this repo opts into authority-aware
+# ranking to preserve dogfood behavior (D-0012).
+behavior = "rank"

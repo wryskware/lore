@@ -394,7 +394,9 @@ fn dropping_a_project_from_the_manifest_drops_its_index() {
     fixture.reconcile();
 
     let path = Utf8Path::new("src/lib.rs");
-    let chunks = lore::chunk::chunk_file(path, b"pub fn alpha() -> u32 {\n    41\n}\n");
+    // Code, so the profile changes nothing about the chunks; `None` keeps the
+    // fixture honest about what this test is (registry reconciliation).
+    let chunks = lore::chunk::chunk_file(path, b"pub fn alpha() -> u32 {\n    41\n}\n", None);
     fixture
         .store
         .replace_file_chunks(id, path, "h1", chunks.chunks())
