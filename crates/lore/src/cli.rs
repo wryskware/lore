@@ -24,6 +24,7 @@
 
 use std::fmt::Write as _;
 use std::future::Future;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -297,6 +298,60 @@ pub fn init(path: Option<String>) -> Result<()> {
     }
 }
 
+/// How long `lore stop` waits for the daemon to actually be gone.
+///
+/// The daemon gives its own tasks [`lore::daemon::SHUTDOWN_GRACE`] and then
+/// exits regardless, so anything past that plus a margin for the final writes
+/// means something is genuinely wrong rather than merely slow — and saying so
+/// is more useful than waiting forever.
+const STOP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How often the handshake is re-read while waiting. Frequent enough that the
+/// common case (a daemon with nothing in flight) feels instant.
+const STOP_POLL: Duration = Duration::from_millis(100);
+
+/// `lore stop` — ask the running daemon to shut down, and wait until it has.
+///
+/// The wait is the point. A killed daemon leaves a handshake whose heartbeat
+/// is still fresh, so every client follows it to a dead port until the record
+/// goes stale — 45 seconds the stop/rebuild/start loop pays every time (#8).
+/// A clean stop removes the record on the way out, and this command does not
+/// claim success until it is actually gone: reporting "stopped" while the old
+/// process still holds the ownership lock would just move the confusion into
+/// whatever the user runs next.
+///
+/// Gone is judged by the handshake, not by the port. The daemon removes it as
+/// its last act, and it removes it only if it is still *its* record — so a
+/// successor that published over it reads as "gone" here too, which is
+/// correct: the daemon we asked to stop is no longer the one being discovered.
+pub async fn stop() -> Result<()> {
+    let client = Client::connect()?;
+    let body = client.post("shutdown", &()).await?;
+    let stopping: lore_core::ShutdownResponse = parse(&body)?;
+    println!("asked the lore daemon (pid {}) to stop", stopping.pid);
+
+    match client.await_gone(STOP_TIMEOUT).await? {
+        true => {
+            println!(
+                "  stopped; {} removed",
+                discovery::handshake_path(&client.data_dir)
+            );
+            Ok(())
+        }
+        // Not an assertion that it is hung — a shutdown draining a very long
+        // request looks identical from here — so the message says what was
+        // observed and what to check, and exits non-zero so a script that
+        // chains a restart does not proceed on a guess.
+        false => bail!(
+            "the daemon (pid {pid}) accepted the stop but {path} still names it after {secs}s.\n\
+             Check the daemon's log; if the process is gone, delete that file and start a new one with: lore daemon",
+            pid = stopping.pid,
+            path = discovery::handshake_path(&client.data_dir),
+            secs = STOP_TIMEOUT.as_secs(),
+        ),
+    }
+}
+
 /// `lore index [project]` — queue a full rescan.
 pub async fn index(project: Option<String>) -> Result<()> {
     let client = Client::connect()?;
@@ -394,6 +449,13 @@ struct Client {
     /// Whether the handshake's heartbeat was recent when we resolved it. Only
     /// consulted if a request fails, to say *which* kind of gone the daemon is.
     heartbeat_fresh: bool,
+    /// Where the handshake lives. `lore stop` watches it; nothing else needs
+    /// it, but a client that found a daemon by reading a file should be able
+    /// to say which file.
+    data_dir: Utf8PathBuf,
+    /// The pid the handshake named, so `lore stop` can tell the daemon it
+    /// asked to stop from a successor that published over it.
+    pid: u32,
     http: reqwest::Client,
 }
 
@@ -433,6 +495,8 @@ impl Client {
             // Staleness is not a veto: a busy daemon can lag a heartbeat and
             // still answer. Liveness is decided by the request itself.
             heartbeat_fresh: discovery::is_fresh(&handshake, discovery::unix_now()),
+            data_dir: data_dir.to_owned(),
+            pid: handshake.pid,
             http: reqwest::Client::new(),
         })
     }
@@ -450,6 +514,29 @@ impl Client {
     async fn delete(&self, route: &str) -> Result<String> {
         let url = format!("{}/{route}", self.base_url);
         self.finish(self.http.delete(&url), &url).await
+    }
+
+    /// Wait until the daemon this client is talking to is no longer the one
+    /// `daemon.json` names. `Ok(false)` means the deadline passed first.
+    ///
+    /// A *replaced* record counts as gone: the pid moved on, so whatever is
+    /// there now is a different daemon and the one we asked to stop is done
+    /// being discovered. An unreadable record is treated as "not yet" rather
+    /// than "gone" — a half-written file is a moment, not an answer, and the
+    /// timeout is what stops the wait if it never resolves.
+    async fn await_gone(&self, timeout: Duration) -> Result<bool> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match discovery::read(&self.data_dir) {
+                Ok(None) => return Ok(true),
+                Ok(Some(current)) if current.pid != self.pid => return Ok(true),
+                _ => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(STOP_POLL).await;
+        }
     }
 
     /// The registered project containing the current directory.
@@ -974,6 +1061,48 @@ mod tests {
         let client = Client::connect_at(&data_dir).unwrap();
         assert_eq!(client.base_url, "http://127.0.0.1:53412/v1");
         assert!(client.heartbeat_fresh);
+    }
+
+    /// The half of `lore stop` that makes it worth having (#8): it does not
+    /// report success until the daemon is actually gone, and it gives up
+    /// honestly rather than waiting forever.
+    #[tokio::test]
+    async fn stop_waits_for_the_handshake_to_disappear_and_admits_a_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let publish = |pid: u32| {
+            std::fs::write(
+                discovery::handshake_path(&data_dir),
+                serde_json::to_string(&discovery::Handshake {
+                    pid,
+                    port: 53412,
+                    api_version: lore_core::API_VERSION,
+                    daemon_version: "0.1.0".into(),
+                    started_at: 0,
+                    heartbeat_at: discovery::unix_now(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        publish(4242);
+        let client = Client::connect_at(&data_dir).unwrap();
+        assert_eq!(client.pid, 4242);
+
+        // Still there when the deadline passes: no success is claimed, and the
+        // caller gets the failure rather than a hang.
+        let waited = std::time::Instant::now();
+        assert!(!client.await_gone(Duration::from_millis(250)).await.unwrap());
+        assert!(waited.elapsed() >= Duration::from_millis(250));
+
+        // Withdrawn — what a clean shutdown does last — is gone.
+        std::fs::remove_file(discovery::handshake_path(&data_dir)).unwrap();
+        assert!(client.await_gone(Duration::from_secs(5)).await.unwrap());
+
+        // A successor publishing over it is also gone, for our purposes: the
+        // daemon we asked to stop is no longer the one being discovered.
+        publish(9999);
+        assert!(client.await_gone(Duration::from_secs(5)).await.unwrap());
     }
 
     #[test]

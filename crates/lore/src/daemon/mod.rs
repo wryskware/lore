@@ -2,8 +2,8 @@
 //!
 //! ```text
 //!            ┌──────────────── CancellationToken + TaskTracker ─────────────┐
-//!            │                                                              │
-//!  ctrl-c ──▶│  http (axum, 127.0.0.1:0)  ──┐                               │
+//!  ctrl-c ──▶│                                                              │
+//!  /shutdown▶│  http (axum, 127.0.0.1:0)  ──┐                               │
 //!            │  heartbeat (daemon.json)     ├──▶ StoreHandle (Mutex<Store>) │
 //!            │  watcher pump ──▶ IndexQueue ─┤         on spawn_blocking    │
 //!            │  indexer      ◀──────────────┤                               │
@@ -100,7 +100,9 @@ pub struct DaemonOptions {
     /// The binary leaves this at its default and relies on the signal; having
     /// the seam means the full startup→serve→shutdown lifecycle is testable
     /// without a console, which is otherwise unreachable on Windows from a
-    /// test harness.
+    /// test harness. It is also what `POST /v1/shutdown` (and therefore
+    /// `lore stop`) cancels, so every way of stopping the daemon converges on
+    /// one path — including the withdrawal of the handshake.
     pub shutdown: CancellationToken,
 }
 
@@ -208,6 +210,9 @@ pub async fn run(options: DaemonOptions) -> Result<()> {
         embeddings,
         latency: latency::LatencyRecorder::default(),
         data_dir: data_dir.clone(),
+        // `POST /v1/shutdown` triggers exactly what ctrl-c does; there is one
+        // shutdown signal in this process and this is it.
+        shutdown: cancel.clone(),
     };
     let router = http::router(state);
     {

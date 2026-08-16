@@ -47,6 +47,9 @@ fn harness_from(fixture: Fixture) -> Harness {
         embeddings: Embedder::disabled(),
         latency: lore::daemon::latency::LatencyRecorder::default(),
         data_dir: fixture.data_dir.clone(),
+        // Nothing here drives a real shutdown; the token exists so the
+        // route can cancel something rather than reach for a global.
+        shutdown: fixture.cancel.clone(),
     };
     Harness {
         router: router(state),
@@ -396,6 +399,31 @@ async fn a_query_with_no_usable_terms_is_empty_not_an_error() {
     let (status, body) = search(&h.router, json!({ "query": ")))  ((" })).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["results"].as_array().unwrap().len(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// shutdown
+// ---------------------------------------------------------------------------
+
+/// `POST /v1/shutdown` cancels the daemon's one shutdown token — the same
+/// signal ctrl-c raises — and answers before going anywhere, because the
+/// response has to reach the caller through a server that is now draining.
+#[tokio::test]
+async fn shutdown_acknowledges_and_then_cancels_the_daemon() {
+    let h = harness();
+    assert!(!h.fixture.cancel.is_cancelled());
+
+    let (status, body) = post(&h.router, "/v1/shutdown", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    assert_eq!(
+        body["pid"].as_u64().unwrap() as u32,
+        std::process::id(),
+        "the answer names the process that is stopping"
+    );
+    assert!(
+        h.fixture.cancel.is_cancelled(),
+        "the shutdown token must actually be cancelled"
+    );
 }
 
 // ---------------------------------------------------------------------------

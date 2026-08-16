@@ -660,6 +660,9 @@ async fn v1_status_reports_per_project_watcher_state() {
         embeddings: Embedder::disabled(),
         latency: lore::daemon::latency::LatencyRecorder::default(),
         data_dir: fixture.data_dir.clone(),
+        // Nothing here drives a real shutdown; the token exists so the
+        // route can cancel something rather than reach for a global.
+        shutdown: fixture.cancel.clone(),
     };
     let router = router(state);
 

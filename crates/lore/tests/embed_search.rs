@@ -48,6 +48,9 @@ fn harness(embedder: Embedder) -> Harness {
         embeddings: embedder.clone(),
         latency: lore::daemon::latency::LatencyRecorder::default(),
         data_dir: fixture.data_dir.clone(),
+        // Nothing here drives a real shutdown; the token exists so the
+        // route can cancel something rather than reach for a global.
+        shutdown: fixture.cancel.clone(),
     };
     // The receiver is dropped; nothing under test watches the filesystem.
     Harness {

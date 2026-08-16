@@ -260,6 +260,21 @@ pub struct IndexResponse {
 }
 
 // ---------------------------------------------------------------------------
+// POST /v1/shutdown  (clean stop — CLI-only, not exposed via MCP)
+// ---------------------------------------------------------------------------
+
+/// Acknowledgement that a clean shutdown has begun. Answered *before* the
+/// daemon is gone — it is still serving this very request — so a caller that
+/// needs "actually stopped" waits for the handshake file to disappear, which
+/// the daemon removes as its last act.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShutdownResponse {
+    /// The process that is stopping, so a client can tell a daemon that obeyed
+    /// from a successor that replaced it while it was waiting.
+    pub pid: u32,
+}
+
+// ---------------------------------------------------------------------------
 // POST /v1/search
 // ---------------------------------------------------------------------------
 

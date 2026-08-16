@@ -132,6 +132,62 @@ async fn the_daemon_starts_serves_and_withdraws_its_handshake() {
     assert!(!handshake::probe(record.port).await);
 }
 
+/// Issue #8, end to end: a daemon stopped over the API removes its handshake,
+/// releases its port, and lets a fresh one start immediately — where a killed
+/// daemon leaves a fresh-looking record that costs every client up to
+/// `STALE_AFTER` before they stop believing it.
+///
+/// The real `lore stop` also *waits* for exactly what this asserts; the wait
+/// itself is unit-tested in `cli.rs`, since it needs a data directory the CLI
+/// discovers for itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_shutdown_endpoint_stops_the_daemon_and_withdraws_its_handshake() {
+    let data = tempfile::tempdir().unwrap();
+    let data_dir = utf8(&data);
+
+    let daemon = tokio::spawn(run(DaemonOptions::new(data_dir.clone())));
+    let record = await_handshake(&data_dir).await;
+
+    let ack: lore_core::ShutdownResponse = reqwest::Client::new()
+        .post(format!("{}/shutdown", record.base_url()))
+        .send()
+        .await
+        .expect("the shutdown request is answered, not dropped")
+        .json()
+        .await
+        .expect("shutdown body");
+    assert_eq!(ack.pid, record.pid);
+
+    tokio::time::timeout(PATIENCE, daemon)
+        .await
+        .expect("the daemon exits on its own after acknowledging")
+        .expect("daemon task did not panic")
+        .expect("daemon returned Ok");
+
+    assert_eq!(
+        discover(&data_dir).unwrap(),
+        None,
+        "the handshake is withdrawn, so no client follows it to a dead port"
+    );
+    assert!(!handshake::probe(record.port).await);
+
+    // The whole point: a successor starts at once, rather than waiting out a
+    // stale window it should never have had to.
+    let shutdown = CancellationToken::new();
+    let next = tokio::spawn(run(DaemonOptions {
+        data_dir: data_dir.clone(),
+        shutdown: shutdown.clone(),
+    }));
+    let restarted = await_handshake(&data_dir).await;
+    assert_ne!(restarted.port, 0);
+    shutdown.cancel();
+    tokio::time::timeout(PATIENCE, next)
+        .await
+        .expect("successor exits")
+        .unwrap()
+        .unwrap();
+}
+
 /// One owner per data directory (D-0003). The second daemon must fail to
 /// start rather than open the same database.
 #[tokio::test(flavor = "multi_thread")]

@@ -75,6 +75,10 @@ pub struct AppState {
     /// Query-surface latency windows, reported by `status`.
     pub latency: crate::daemon::latency::LatencyRecorder,
     pub data_dir: Utf8PathBuf,
+    /// The daemon's shutdown token — the same one the workers and the server's
+    /// own graceful-shutdown future watch. `POST /v1/shutdown` cancels it;
+    /// nothing else here reads it.
+    pub shutdown: tokio_util::sync::CancellationToken,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -84,6 +88,7 @@ pub fn router(state: AppState) -> Router {
         .route("/projects/{project}", delete(remove_project))
         .route("/resolve", get(resolve))
         .route("/index", post(index))
+        .route("/shutdown", post(shutdown))
         .route("/search", post(search_route))
         .route("/expand", post(expand_route))
         .with_state(state);
@@ -570,6 +575,29 @@ async fn index(
     Ok(Json(IndexResponse {
         queued: targets.into_iter().map(info).collect(),
     }))
+}
+
+/// `POST /v1/shutdown` — stop this daemon cleanly.
+///
+/// It exists because the alternative is killing the process, and a killed
+/// daemon leaves behind a handshake whose heartbeat is still fresh: every
+/// client then follows it to a dead port for up to `STALE_AFTER`, which the
+/// stop/rebuild/start loop pays every single time (#8).
+///
+/// The token cancelled here is the daemon's one shutdown signal, so the same
+/// thing happens as on ctrl-c: axum stops accepting and drains the requests
+/// already in flight (this one included, which is why the response is sent at
+/// all), the workers wind down, and the handshake is withdrawn last. The
+/// answer is therefore an acknowledgement, not a completion — the caller
+/// learns the daemon is *gone* by watching `daemon.json` disappear.
+///
+/// CLI-only by convention, exactly like registration: an agent that could stop
+/// the daemon could stop every other agent's index.
+async fn shutdown(State(state): State<AppState>) -> ApiResult<lore_core::ShutdownResponse> {
+    let pid = std::process::id();
+    tracing::info!(pid, "clean shutdown requested over the API");
+    state.shutdown.cancel();
+    Ok(Json(lore_core::ShutdownResponse { pid }))
 }
 
 async fn search_route(

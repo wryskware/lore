@@ -17,6 +17,11 @@ struct Cli {
 enum Command {
     /// Run the daemon in the foreground.
     Daemon,
+    /// Stop the running daemon cleanly and wait until it is gone.
+    ///
+    /// Killing it instead leaves a fresh handshake behind, which every client
+    /// follows to a dead port until it goes stale.
+    Stop,
     /// Register a project directory with the daemon.
     ///
     /// The name is written into the project's `.lore.toml` so it follows the
@@ -63,6 +68,7 @@ fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
     match args.command {
         Command::Daemon => daemon(),
+        Command::Stop => cli::run(cli::stop()),
         Command::Add { path, name } => cli::run(cli::add(path, name)),
         Command::Remove { project } => cli::run(cli::remove(project)),
         Command::Init { path } => cli::init(path),
