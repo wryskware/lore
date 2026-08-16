@@ -4,3 +4,6 @@ profile = "lore-v1"
 # Default when absent is "annotate"; this repo opts into authority-aware
 # ranking to preserve dogfood behavior (D-0012).
 behavior = "rank"
+
+[project]
+name = "lore"
