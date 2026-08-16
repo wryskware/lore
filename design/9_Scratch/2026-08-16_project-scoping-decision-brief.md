@@ -276,3 +276,16 @@ is remote, any `.lore.toml` identity table, collision rules, and whether
 `lore add` writes anything into a repo. No canon changed; no ledger entry. The
 #18 comment recording an earlier leaning toward `.lore.toml` identity is
 corrected there — that leaning is now formally open, not the plan of record.
+
+### Addendum (Wrysk, 2026-08-16, follow-up): `lore add` names the project
+
+One of the open items above is now decided: **`lore add` writes the project
+name into `.lore.toml` when none exists** — the name is passable at add time,
+defaulting to the local-most folder's name. Precedence: explicit argument > an
+existing `.lore.toml` name > root basename; a name already registered to a
+different root is a hard error at registration. This gives the *registry* a
+committed, human-chosen name per project. It is deliberately **not** a ruling
+on the identity *mechanism* (how a client names its project to a remote
+daemon), which stays held on #18's ingestion fork — where Wrysk's stated
+direction is a flavor of ingestion inversion (client pushes file content), with
+the local walk/watch placement still open.
