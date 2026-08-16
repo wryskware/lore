@@ -1,6 +1,11 @@
 {
   // E2E round 1 — retrieval-ON arm. Select via OPENCODE_CONFIG.
   "$schema": "https://opencode.ai/config.json",
+  // Mirror of the off arm: allow junction-crossing into Lexomancy-alt, since
+  // headless `run` cannot answer the external_directory ask (deadlock).
+  "permission": {
+    "external_directory": "allow"
+  },
   "provider": {
     "ollama": {
       "npm": "@ai-sdk/openai-compatible",

@@ -2,6 +2,12 @@
   // E2E round 1 — retrieval-OFF arm. Configs MERGE with the global one (verified
   // 2026-08-15), so lore must be explicitly disabled here, not merely omitted.
   "$schema": "https://opencode.ai/config.json",
+  // Lexomancy-bench reaches Lexomancy-alt through junctions; headless `run`
+  // has no UI to answer the external_directory ask, so it deadlocks the cell
+  // (qwen lexomancy-off-T1 wedged twice on this, 2026-08-16).
+  "permission": {
+    "external_directory": "allow"
+  },
   "mcp": {
     "lore": {
       "type": "local",
