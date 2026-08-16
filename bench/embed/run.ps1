@@ -95,7 +95,7 @@ foreach ($modelId in $Models) {
             # POST, and 8 batches stay in flight: ~512 chunks queued
             # server-side so the slots never run dry between round trips.
             'batch_max_bytes = 262144'
-            'concurrency = 8'
+            'concurrency = 16'
             "max_embed_bytes = $($m.max_embed_bytes)"
         ) | Set-Content (Join-Path $dataDir 'config.toml')
     }
@@ -115,8 +115,19 @@ foreach ($modelId in $Models) {
             # under Windows WDDM, so llama's footprint is whole-GPU delta.
             $vramBaseline = 0
             try { $vramBaseline = [int](& nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits) } catch {}
+            # --kv-unified is load-bearing for the causal embedders (qwen3,
+            # jina): with per-slot KV streams the core splits a batch via
+            # split_equal, which shreds variable-length embedding sequences
+            # into ~one-sequence decodes (measured: GPU ~33%, throughput flat
+            # from 4 to 16 slots). One unified stream takes split_simple —
+            # dense 8192-token packing, legal for causal+last-pooling. The
+            # non-causal nomics are memory-less and ignore it.
+            # -ub 2048 beats 8192 by ~17-19% on both qwen sizes (unique-text
+            # matrix, 2026-08-15); --no-cache-prompt adds ~10% — embedding
+            # inputs never repeat, so the prompt cache is pure bookkeeping.
             $args = @('-m', $gguf, '--embedding', '--pooling', $m.pooling,
-                      '-c', $m.ctx, '-b', 8192, '-ub', 8192, '--parallel', $m.parallel,
+                      '-c', $m.ctx, '-b', 2048, '-ub', 2048, '--parallel', $m.parallel,
+                      '--kv-unified', '--no-cache-prompt',
                       '-ngl', 999, '--metrics', '--host', '127.0.0.1', '--port', $LlamaPort)
             $llama = Start-Process -FilePath $llamaExe.FullName -ArgumentList $args -PassThru -WindowStyle Hidden `
                 -RedirectStandardOutput (Join-Path $outDir 'llama.out.log') -RedirectStandardError (Join-Path $outDir 'llama.err.log')

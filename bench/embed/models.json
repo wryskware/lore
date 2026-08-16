@@ -37,13 +37,13 @@
     "gguf_file": "Qwen3-Embedding-0.6B-f16.gguf",
     "dimensions": 1024,
     "pooling": "last",
-    "ctx": 65536,
+    "ctx": 16384,
     "parallel": 16,
     "max_embed_bytes": 3584,
     "query_prefix": "Instruct: Given a natural language query, retrieve relevant code snippets or documentation passages\nQuery: ",
     "document_prefix": "",
     "license": "Apache-2.0",
-    "notes": "Card template is 'Instruct: {task}\\nQuery: {q}', documents unprefixed; task wording tailored to code+docs retrieval per card guidance (custom instructions +1-5%). Slots raised 4->16 (ctx scaled to keep 4096/slot): at ~325 avg tokens/chunk, 4 slots fed ~1.3k tokens per pass into an 8192-token ubatch (~16% full) and the GPU idled between small POSTs; measured 2026-08-15, qwen3-0.6b at 13.2k tok/s vs Brief C's 'tens to low hundreds of k' band."
+    "notes": "Card template is 'Instruct: {task}\\nQuery: {q}', documents unprefixed; task wording tailored to code+docs retrieval per card guidance (custom instructions +1-5%). Slots 16 + --kv-unified (run.ps1): unified KV takes the dense split_simple ubatch path; per-slot streams shred pooled variable-length seqs into ~1-seq decodes (measured 2026-08-15: 13.2k tok/s at p4, flat to p16 without kvu; ~32k tok/s synthetic ceiling at p16+kvu). ctx stays 16384: unified cache needs to hold in-flight seqs only, and an oversized cell pool was the residual drag in the real drain."
   },
   {
     "id": "qwen3-4b",
@@ -51,13 +51,13 @@
     "gguf_file": "Qwen3-Embedding-4B-Q8_0.gguf",
     "dimensions": 2560,
     "pooling": "last",
-    "ctx": 65536,
+    "ctx": 16384,
     "parallel": 16,
     "max_embed_bytes": 3584,
     "query_prefix": "Instruct: Given a natural language query, retrieve relevant code snippets or documentation passages\nQuery: ",
     "document_prefix": "",
     "license": "Apache-2.0",
-    "notes": "Brief C's pick for mixed code+prose on a 5090. Slots raised 4->16 (ctx scaled to keep 4096/slot): at ~325 avg tokens/chunk, 4 slots fed ~1.3k tokens per pass into an 8192-token ubatch (~16% full) and the GPU idled between small POSTs; measured 2026-08-15, qwen3-0.6b at 13.2k tok/s vs Brief C's 'tens to low hundreds of k' band."
+    "notes": "Brief C's pick for mixed code+prose on a 5090. Slots 16 + --kv-unified (run.ps1): unified KV takes the dense split_simple ubatch path; per-slot streams shred pooled variable-length seqs into ~1-seq decodes (measured 2026-08-15: 13.2k tok/s at p4, flat to p16 without kvu; ~32k tok/s synthetic ceiling at p16+kvu). ctx stays 16384: unified cache needs to hold in-flight seqs only, and an oversized cell pool was the residual drag in the real drain."
   },
   {
     "id": "qwen3-8b",
@@ -66,13 +66,13 @@
     "gguf_file": "Qwen3-Embedding-8B-Q8_0.gguf",
     "dimensions": 4096,
     "pooling": "last",
-    "ctx": 65536,
+    "ctx": 16384,
     "parallel": 16,
     "max_embed_bytes": 3584,
     "query_prefix": "Instruct: Given a natural language query, retrieve relevant code snippets or documentation passages\nQuery: ",
     "document_prefix": "",
     "license": "Apache-2.0",
-    "notes": "Quality-ceiling probe (~8.6 GB Q8_0). skip: card shows only +0.6 MTEB-Code over 4B for ~2x the drain and VRAM — dropped 2026-08-15. Slots raised 4->16 (ctx scaled to keep 4096/slot): at ~325 avg tokens/chunk, 4 slots fed ~1.3k tokens per pass into an 8192-token ubatch (~16% full) and the GPU idled between small POSTs; measured 2026-08-15, qwen3-0.6b at 13.2k tok/s vs Brief C's 'tens to low hundreds of k' band."
+    "notes": "Quality-ceiling probe (~8.6 GB Q8_0). skip: card shows only +0.6 MTEB-Code over 4B for ~2x the drain and VRAM — dropped 2026-08-15. Slots 16 + --kv-unified (run.ps1): unified KV takes the dense split_simple ubatch path; per-slot streams shred pooled variable-length seqs into ~1-seq decodes (measured 2026-08-15: 13.2k tok/s at p4, flat to p16 without kvu; ~32k tok/s synthetic ceiling at p16+kvu). ctx stays 16384: unified cache needs to hold in-flight seqs only, and an oversized cell pool was the residual drag in the real drain."
   },
   {
     "id": "jina-code-1.5b",
@@ -80,12 +80,12 @@
     "gguf_file": "jina-code-embeddings-1.5b-Q8_0.gguf",
     "dimensions": 1536,
     "pooling": "last",
-    "ctx": 65536,
+    "ctx": 16384,
     "parallel": 16,
     "max_embed_bytes": 3584,
     "query_prefix": "Find the most relevant code snippet given the following query:\n",
     "document_prefix": "Candidate code snippet:\n",
     "license": "CC-BY-NC-4.0",
-    "notes": "nl2code task prefixes; the code specialist with explicit C# coverage. Caveat: doc prefix says 'code snippet' but the corpus includes markdown — noted as a fairness caveat, the card offers no mixed-corpus task. Slots raised 4->16 (ctx scaled to keep 4096/slot): at ~325 avg tokens/chunk, 4 slots fed ~1.3k tokens per pass into an 8192-token ubatch (~16% full) and the GPU idled between small POSTs; measured 2026-08-15, qwen3-0.6b at 13.2k tok/s vs Brief C's 'tens to low hundreds of k' band."
+    "notes": "nl2code task prefixes; the code specialist with explicit C# coverage. Caveat: doc prefix says 'code snippet' but the corpus includes markdown — noted as a fairness caveat, the card offers no mixed-corpus task. Slots 16 + --kv-unified (run.ps1): unified KV takes the dense split_simple ubatch path; per-slot streams shred pooled variable-length seqs into ~1-seq decodes (measured 2026-08-15: 13.2k tok/s at p4, flat to p16 without kvu; ~32k tok/s synthetic ceiling at p16+kvu). ctx stays 16384: unified cache needs to hold in-flight seqs only, and an oversized cell pool was the residual drag in the real drain."
   }
 ]
