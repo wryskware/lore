@@ -28,7 +28,10 @@
 //!
 //! `concurrency` batches are in flight at once (`1` = the serial pipeline).
 //! A local server serves several requests at a time, and one batch at a time
-//! leaves it idle for every round-trip and every upsert.
+//! leaves it idle for every round-trip and every upsert. A batch whose text
+//! overflows the wire budget fans out further: [`EmbedClient::embed`] sends
+//! its wire batches concurrently, so the server-side queue depth is
+//! `concurrency` × the wire batches per worker batch.
 //!
 //! Claiming stays single-threaded. Chunks only leave
 //! `chunks_missing_embeddings` when their batch is upserted, so a second

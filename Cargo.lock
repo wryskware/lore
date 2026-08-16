@@ -1037,6 +1037,7 @@ dependencies = [
  "camino",
  "clap",
  "dirs",
+ "futures-util",
  "ignore",
  "insta",
  "lore-core",

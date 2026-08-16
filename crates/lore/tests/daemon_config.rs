@@ -1,7 +1,9 @@
 //! `config.toml` parsing. Config is the one thing a user edits by hand, so
 //! its failure modes matter more than its happy path.
 
-use lore::config::{Config, DEFAULT_BATCH_MAX_ITEMS, DEFAULT_EMBED_CONCURRENCY};
+use lore::config::{
+    Config, DEFAULT_BATCH_MAX_BYTES, DEFAULT_BATCH_MAX_ITEMS, DEFAULT_EMBED_CONCURRENCY,
+};
 use lore_core::EmbeddingStatus;
 
 /// Exactly the example from design/3_Retrieval/3.1 §"Embedding provider
@@ -36,16 +38,28 @@ fn documented_example_parses_field_for_field() {
     // Not in the documented example, and adding a key must stay additive for
     // files written before it existed.
     assert_eq!(embeddings.concurrency, DEFAULT_EMBED_CONCURRENCY);
+    assert_eq!(embeddings.batch_max_bytes, DEFAULT_BATCH_MAX_BYTES);
 }
 
 #[test]
 fn concurrency_is_optional_and_defaults_to_several_batches_in_flight() {
-    assert_eq!(DEFAULT_EMBED_CONCURRENCY, 4);
+    assert_eq!(DEFAULT_EMBED_CONCURRENCY, 8);
     let config = Config::parse("[embeddings]\nconcurrency = 1\n").expect("an explicit 1 parses");
     assert_eq!(config.embeddings.concurrency, 1);
     let config = Config::parse("[embeddings]\nconcurrency = 0\n").expect("a zero parses");
     // Clamped where it is used, not at parse time, so the file round-trips.
     assert_eq!(config.embeddings.concurrency, 0);
+}
+
+#[test]
+fn batch_max_bytes_is_optional_and_round_trips_unclamped() {
+    let config = Config::parse("[embeddings]\nbatch_max_bytes = 262144\n")
+        .expect("an explicit value parses");
+    assert_eq!(config.embeddings.batch_max_bytes, 262_144);
+    let config = Config::parse("[embeddings]\nbatch_max_bytes = 0\n").expect("a zero parses");
+    // Clamped where it is used ([`EmbedSettings::from_config`]), not at parse
+    // time, so the file round-trips.
+    assert_eq!(config.embeddings.batch_max_bytes, 0);
 }
 
 #[test]

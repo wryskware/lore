@@ -12,6 +12,7 @@ blake3.workspace = true
 camino.workspace = true
 clap.workspace = true
 dirs.workspace = true
+futures-util.workspace = true
 ignore.workspace = true
 lore-core.workspace = true
 notify.workspace = true

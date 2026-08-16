@@ -21,6 +21,10 @@ clap = { version = "4.6", features = ["derive"] }
 # Platform data directory (`%LOCALAPPDATA%\lore` on Windows). Tiny, no
 # transitive weight; the alternative is hand-rolling KNOWNFOLDERID lookups.
 dirs = "6"
+# Only `future::try_join_all`, for fanning one embed call's wire batches out
+# concurrently. Already in the tree transitively (reqwest, axum), so the
+# direct pin adds no weight; default features off keeps it that way.
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 # ripgrep's walker: gitignore semantics (including nested and parent
 # `.gitignore` files) for free, which the indexer needs to match what a
 # developer expects to be searchable.

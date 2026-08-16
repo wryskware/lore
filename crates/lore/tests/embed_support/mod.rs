@@ -343,6 +343,7 @@ pub fn settings(base: &str) -> lore::embed::EmbedSettings {
         query_prefix: String::new(),
         document_prefix: String::new(),
         batch_max_items: 8,
+        batch_max_bytes: lore::embed::client::BATCH_MAX_BYTES,
         // Serial by default so a test that counts requests, or that walks the
         // backlog batch by batch, sees exactly the order it asks for. The
         // tests that are *about* overlap raise it themselves.

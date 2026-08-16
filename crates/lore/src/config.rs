@@ -20,11 +20,19 @@ pub const CONFIG_FILE: &str = "config.toml";
 /// Batch size used by the embedding pipeline when the file says nothing.
 pub const DEFAULT_BATCH_MAX_ITEMS: usize = 64;
 
+/// Wire-batch byte budget when the file says nothing — the historical 64 KiB
+/// constant from [`crate::embed::client::BATCH_MAX_BYTES`], sized for a
+/// modest local server. A GPU-backed server draining a large backlog wants
+/// this several times larger, so fewer round trips carry the same corpus.
+pub const DEFAULT_BATCH_MAX_BYTES: usize = crate::embed::client::BATCH_MAX_BYTES;
+
 /// Batches the embed worker keeps in flight at once when the file says
-/// nothing. Local servers serve several requests at a time (llama-server's
-/// default is four slots), and a serial worker leaves those slots idle for the
-/// whole round-trip of every batch.
-pub const DEFAULT_EMBED_CONCURRENCY: usize = 4;
+/// nothing. Local servers serve several requests at a time and queue the
+/// rest; a serial worker leaves the server idle for the whole round-trip of
+/// every batch, and each in-flight batch also spends time off the wire
+/// (response parsing, the store upsert), so keeping more batches in flight
+/// than the server has slots is what keeps its queue from running dry.
+pub const DEFAULT_EMBED_CONCURRENCY: usize = 8;
 
 /// Embed-text byte budget when the file says nothing — the historical 8 KiB
 /// ceiling from [`crate::embed::text::MAX_EMBED_TEXT_BYTES`]. Keeping the
@@ -59,6 +67,11 @@ pub struct EmbeddingsConfig {
     pub query_prefix: String,
     pub document_prefix: String,
     pub batch_max_items: usize,
+    /// Byte budget for one HTTP request's total input text. A worker batch
+    /// larger than this is split into several wire batches, sent
+    /// concurrently. Like `concurrency`, not part of the fingerprint: it
+    /// changes how vectors arrive, never what they are.
+    pub batch_max_bytes: usize,
     /// Batches the worker may have in flight at once; `1` is the serial
     /// pipeline. Deliberately *not* part of the embedding fingerprint: it
     /// changes when vectors arrive, never what they are.
@@ -85,6 +98,7 @@ impl Default for EmbeddingsConfig {
             query_prefix: String::new(),
             document_prefix: String::new(),
             batch_max_items: DEFAULT_BATCH_MAX_ITEMS,
+            batch_max_bytes: DEFAULT_BATCH_MAX_BYTES,
             concurrency: DEFAULT_EMBED_CONCURRENCY,
             max_embed_bytes: DEFAULT_MAX_EMBED_BYTES,
             api_key: None,

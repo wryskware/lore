@@ -20,6 +20,9 @@
 //! - **Batches are bounded twice**, by item count *and* by total bytes. Item
 //!   count alone lets 64 four-kilobyte chunks become a quarter-megabyte
 //!   request that a small local server answers with a 500 or a timeout.
+//!   A call that splits into several wire batches sends them **concurrently**
+//!   — they are independent requests, and sending them one after another
+//!   leaves the server idle for every round trip between them.
 //! - **Failures are classified, not merely counted.** Transient (network,
 //!   408, 429, 5xx) means retry with backoff; anything else 4xx means *this
 //!   request will never succeed*, so retrying it forever would wedge the
@@ -33,10 +36,18 @@ use crate::config::EmbeddingsConfig;
 
 use super::text::truncate_bytes;
 
-/// Total request-text budget for one batch. Independent of item count: the
-/// point is to keep a single POST small enough that a modest local server
-/// answers it comfortably.
+/// Default total request-text budget for one wire batch
+/// ([`EmbedSettings::batch_max_bytes`]). Independent of item count: the point
+/// is to keep a single POST small enough that a modest local server answers
+/// it comfortably. A GPU-backed server working through a big backlog wants a
+/// budget several times larger (fewer, fuller round trips), which is why this
+/// is a config default and not a ceiling.
 pub const BATCH_MAX_BYTES: usize = 64 * 1024;
+
+/// Floor for the configured wire-batch budget. Purely a sanity clamp — an
+/// item bigger than the budget still gets its own batch, so any value makes
+/// progress; below this the split is all overhead.
+pub const MIN_BATCH_MAX_BYTES: usize = 1024;
 
 /// Attempts per batch, including the first. Four attempts with the default
 /// backoff spans a few seconds — long enough to ride out a model reload,
@@ -116,9 +127,12 @@ pub struct EmbedSettings {
     pub query_prefix: String,
     pub document_prefix: String,
     pub batch_max_items: usize,
+    /// Byte budget for one wire batch; an `embed` call over more text than
+    /// this fans out into concurrent POSTs.
+    pub batch_max_bytes: usize,
     /// Batches the worker may have in flight at once. Read by
-    /// [`crate::embed::worker`], not by the client — one `embed` call is still
-    /// one sequence of POSTs.
+    /// [`crate::embed::worker`], not by the client. Total concurrent POSTs is
+    /// this times the wire batches one worker batch splits into.
     pub concurrency: usize,
     /// Per-input byte budget; every input is clipped to this before the wire.
     pub max_embed_bytes: usize,
@@ -136,6 +150,7 @@ impl std::fmt::Debug for EmbedSettings {
             .field("query_prefix", &self.query_prefix)
             .field("document_prefix", &self.document_prefix)
             .field("batch_max_items", &self.batch_max_items)
+            .field("batch_max_bytes", &self.batch_max_bytes)
             .field("concurrency", &self.concurrency)
             .field("max_embed_bytes", &self.max_embed_bytes)
             .field("retry", &self.retry)
@@ -159,6 +174,7 @@ impl EmbedSettings {
             query_prefix: config.query_prefix.clone(),
             document_prefix: config.document_prefix.clone(),
             batch_max_items: config.batch_max_items.max(1),
+            batch_max_bytes: config.batch_max_bytes.max(MIN_BATCH_MAX_BYTES),
             concurrency: config.concurrency.max(1),
             // Floor: prefix + header must survive the clip, or every input
             // for a chunk collapses to the same truncated stub.
@@ -212,8 +228,13 @@ impl EmbedClient {
 
     /// Embed `texts`, returning one vector per input **in input order**.
     ///
-    /// Splits into batches internally; a batch failure fails the whole call,
-    /// because the caller's unit of work is the batch it handed in.
+    /// Splits into wire batches internally and sends them **concurrently** —
+    /// `try_join_all` keeps results in future order regardless of arrival
+    /// order, so the concatenation below is input order by construction. A
+    /// batch failure fails the whole call (the caller's unit of work is the
+    /// batch it handed in); the sibling requests still in flight are dropped,
+    /// which aborts them. Fan-out is bounded by configuration: at most
+    /// ⌈`batch_max_items` · `max_embed_bytes` / `batch_max_bytes`⌉ requests.
     pub async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
         if texts.is_empty() {
             return Ok(Vec::new());
@@ -223,11 +244,16 @@ impl EmbedClient {
             .map(|text| truncate_bytes(text, self.settings.max_embed_bytes))
             .collect();
 
-        let mut out = Vec::with_capacity(texts.len());
-        for batch in batches(&clipped, self.settings.batch_max_items, BATCH_MAX_BYTES) {
-            out.extend(self.embed_batch(batch).await?);
-        }
-        Ok(out)
+        let wire = batches(
+            &clipped,
+            self.settings.batch_max_items,
+            self.settings.batch_max_bytes,
+        );
+        let results = futures_util::future::try_join_all(
+            wire.into_iter().map(|batch| self.embed_batch(batch)),
+        )
+        .await?;
+        Ok(results.into_iter().flatten().collect())
     }
 
     /// Cheapest honest health check: embed one tiny input.
@@ -572,12 +598,14 @@ mod tests {
         let config = EmbeddingsConfig {
             endpoint: Some("http://127.0.0.1:8080/v1".into()),
             batch_max_items: 0,
+            batch_max_bytes: 0,
             concurrency: 0,
             max_embed_bytes: 0,
             ..EmbeddingsConfig::default()
         };
         let settings = EmbedSettings::from_config(&config).unwrap();
         assert_eq!(settings.batch_max_items, 1);
+        assert_eq!(settings.batch_max_bytes, MIN_BATCH_MAX_BYTES);
         assert_eq!(settings.concurrency, 1);
         assert_eq!(settings.max_embed_bytes, 256);
 
@@ -589,6 +617,10 @@ mod tests {
         assert_eq!(
             settings.concurrency,
             crate::config::DEFAULT_EMBED_CONCURRENCY
+        );
+        assert_eq!(
+            settings.batch_max_bytes,
+            crate::config::DEFAULT_BATCH_MAX_BYTES
         );
         assert_eq!(
             settings.max_embed_bytes,
