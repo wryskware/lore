@@ -101,23 +101,29 @@ fn status(fixture: &Fixture) -> ProjectStatus {
 
 /// Distinct effective tiers stored for a file, read back through the search
 /// path — the reader whose behavior the tier exists to change.
-fn tiers(fixture: &Fixture, path: &str) -> Vec<u8> {
+fn tiers_matching(fixture: &Fixture, path: &str, term: &str) -> Vec<u8> {
     let filter = SearchFilter {
         project: Some(fixture.project.id),
         path_prefix: Some(path.to_string()),
         ..SearchFilter::default()
     };
+    let query = term.to_string();
     let mut found: Vec<u8> = fixture
         .store
-        .blocking(move |store| store.lexical_search("widget", &filter, 100))
+        .blocking(move |store| store.lexical_search(&query, &filter, 100))
         .expect("search")
         .into_iter()
         .map(|hit| hit.authority.tier)
         .collect();
-    assert!(!found.is_empty(), "no chunk of {path} matched");
+    assert!(!found.is_empty(), "no chunk of {path} matched `{term}`");
     found.sort_unstable();
     found.dedup();
     found
+}
+
+/// The two vault documents both carry the query term, so this covers them.
+fn tiers(fixture: &Fixture, path: &str) -> Vec<u8> {
+    tiers_matching(fixture, path, "widget")
 }
 
 fn chunk_ids(fixture: &Fixture) -> Vec<ChunkId> {
@@ -399,9 +405,13 @@ fn annotate_labels_every_result_but_leaves_the_order_to_retrieval() {
         "annotate must not touch ordering"
     );
 
-    // …while every judgement is still computed and reported.
+    // …while every judgement is still computed and reported. Including the
+    // ledger's pin, which D-0012 keeps under `annotate` deliberately: the
+    // label is a claim about what the document *is*, and suspending it would
+    // make the annotation lie about the one file that defines canon.
     assert_eq!(tiers(&fixture, CANON), [3]);
     assert_eq!(tiers(&fixture, SCRATCH), [0]);
+    assert_eq!(tiers_matching(&fixture, LEDGER, "Accepted"), [3]);
     assert_eq!(status(&fixture).decisions_active, 1);
 
     let by_path: Vec<(String, Option<String>, Option<String>)> = search(&fixture, "widget")
