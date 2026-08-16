@@ -138,3 +138,27 @@ Append-only. Newest entries at the bottom. Schema per [[README]].
 - **Consequences:** `design/9_Scratch/2026-08-15_e2e-round-1-plan.md` is the round-1 protocol; the bench harness lives in `bench/`.
 - **Supersedes:** D-0009's fixture-corpora clause only ("a few mid-size repos from established OSS projects"); its early-benchmarks posture and driving-model choices stand.
 - **Canonical sources:** [[../9_Scratch/2026-08-15_e2e-round-1-plan]]
+
+## D-0012 — Authority is repository-opt-in via a committed profile config
+
+- **Date:** 2026-08-15
+- **Status:** Accepted
+- **Scope:** Authority activation, repo-side configuration, behavior modes
+- **Decided by:** Wrysk (authority-profiles grilling session, 2026-08-15)
+- **Decision:** Authority semantics activate only through a repo-committed `.lore.toml` `[authority]` table (`profile = "lore-v1"`; `behavior = off | annotate | rank`, defaulting to `annotate`). Repositories without the file receive neutral retrieval with **no** `design_status`/`decision_refs` parsing at all; enabling a profile later triggers a re-index of the repo's Markdown. Unknown profiles or malformed config fail visibly (surfaced in `lore status` and refresh diagnostics) while the repo indexes neutrally. `annotate` computes and exposes authority metadata without touching result ordering; `rank` additionally applies the authority weights. Lore and Lexomancy commit `behavior = "rank"` to preserve dogfood behavior.
+- **Rationale:** Repositories that never adopted the vault workflow should not pay parsing cycles or acquire accidental path/frontmatter semantics (independent review, [[../9_Scratch/2026-08-15_authority-profiles-review-handoff]]); the always-on default was already mispricing latent-music-terrarium inside the round-1 bench corpus. Annotation's value (visible canon-vs-scratch labels) is far better evidenced than reranking's, so the conservative half is the default.
+- **Consequences:** The `adr`/MADR-based conventional profile remains a leaning; query-level authority intent (`ignore|prefer|require`) and ranking-weight validation are deferred pending authority-sensitive e2e evidence; multi-root ID-namespace resolution is deferred and tracked as a known limitation.
+- **Supersedes:** D-0004's schema-awareness clause only ("understands `design_status` frontmatter and D-NNNN references from day one" — parsing is now profile-gated); its retrieval-first vertical-slice scoping stands.
+- **Canonical sources:** [[../9_Scratch/2026-08-15_authority-profiles-review-handoff]]
+
+## D-0013 — `lore-v1` recognizes per-file decision records
+
+- **Date:** 2026-08-15
+- **Status:** Accepted
+- **Scope:** `lore-v1` decision-record format
+- **Decided by:** Wrysk (authority-profiles grilling session, 2026-08-15)
+- **Decision:** In addition to the mono ledger, `lore-v1` recognizes one decision record per file at `**/0_Canon/decisions/D-NNNN-<slug>.md`, using the identical field grammar and D-0010 supersession semantics. The filename's `D-NNNN` prefix is authoritative for identity; a heading that disagrees with the filename, or a duplicate ID (across files or against the mono ledger), is a surfaced violation excluded from the active set. Per-file records receive the same pinned ledger tier as the mono ledger. The mono ledger remains fully valid; each vault migrates (or doesn't) at its own pace.
+- **Rationale:** Small immutable files beat one growing monolith for review, diffing, and the accepted-records-are-substantively-immutable rule; additive recognition avoids coupling a Lexomancy vault migration to a Lore refactor wave.
+- **Consequences:** New decisions may be authored per-file once parser support lands; if both dogfood vaults migrate voluntarily, mono-ledger deprecation becomes a `lore-v2` candidate.
+- **Supersedes:** None (extends D-0001's ledger convention).
+- **Canonical sources:** [[../9_Scratch/2026-08-15_authority-profiles-review-handoff]]
