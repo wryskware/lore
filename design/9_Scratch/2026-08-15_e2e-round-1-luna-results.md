@@ -12,10 +12,45 @@ thread against the frozen keys, packets only, no repo access
 
 ## Headline
 
-| Arm | Score | Notes |
-| --- | --- | --- |
-| retrieval-on | **15 / 15** | two quality wins the off arm didn't get |
-| retrieval-off | **13 / 15** | −0.5 terrarium T3 recall, −0.5 lexomancy T5 diff quality |
+| Arm | Score | Wall | Tokens (in+out) | Tool calls |
+| --- | ---: | ---: | ---: | ---: |
+| retrieval-on | **15 / 15** | 33.1 min | 1,106,969 | 512 |
+| retrieval-off | **14 / 15** | 38.8 min | 1,281,728 | 561 |
+
+(The grader's prose said 13/15 for off; its own per-cell table sums to 14 —
+two 0.5s: terrarium T3 recall, lexomancy T5 diff quality. 14 is correct.)
+
+## Per-repo numbers
+
+### lore
+
+| Task | off wall | off tok | off tools | off score | on wall | on tok | on tools (lore) | on score | Δwall | Δtok |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| T1 | 357s | 106,637 | 34 | 1 | 99s | 106,439 | 31 (2) | 1 | -72% | -0% |
+| T2 | 49s | 34,825 | 17 | 1 | 37s | 35,694 | 11 (3) | 1 | -25% | +2% |
+| T3 | 113s | 77,764 | 26 | 1 | 110s | 78,760 | 27 (1) | 1 | -2% | +1% |
+| T4 | 25s | 20,113 | 9 | 1 | 29s | 25,694 | 8 (4) | 1 | +14% | +28% |
+| T5 | 245s | 63,018 | 37 | 1 | 274s | 84,577 | 31 (1) | 1 | +12% | +34% |
+
+### terrarium
+
+| Task | off wall | off tok | off tools | off score | on wall | on tok | on tools (lore) | on score | Δwall | Δtok |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| T1 | 169s | 125,700 | 65 | 1 | 224s | 148,520 | 77 (2) | 1 | +33% | +18% |
+| T2 | 87s | 52,158 | 32 | 1 | 78s | 74,415 | 27 (3) | 1 | -10% | +43% |
+| T3 | 113s | 78,222 | 39 | 0.5 | 136s | 111,366 | 46 (1) | 1 | +21% | +42% |
+| T4 | 47s | 43,305 | 17 | 1 | 52s | 31,028 | 15 (1) | 1 | +11% | -28% |
+| T5 | 158s | 60,554 | 44 | 1 | 193s | 73,624 | 38 (1) | 1 | +23% | +22% |
+
+### lexomancy
+
+| Task | off wall | off tok | off tools | off score | on wall | on tok | on tools (lore) | on score | Δwall | Δtok |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| T1 | 189s | 143,692 | 66 | 1 | 136s | 106,006 | 56 (3) | 1 | -28% | -26% |
+| T2 | 61s | 43,689 | 25 | 1 | 17s | 19,557 | 4 (4) | 1 | -73% | -55% |
+| T3 | 401s | 95,656 | 66 | 1 | 171s | 65,600 | 48 (3) | 1 | -57% | -31% |
+| T4 | 82s | 84,144 | 36 | 1 | 52s | 28,041 | 19 (6) | 1 | -36% | -67% |
+| T5 | 235s | 252,251 | 48 | 0.5 | 381s | 117,648 | 74 (6) | 1 | +62% | -53% |
 
 - **Quality separations (on-arm wins):** terrarium T3 full recall (off
   missed `explore/rig.ts`, exactly the key's predicted drop); lexomancy T5
