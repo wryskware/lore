@@ -383,6 +383,19 @@ fn render_status(status: &DaemonStatus) -> String {
         generation = status.generation,
     );
     let _ = writeln!(out, "{}", render_embeddings(&status.embeddings));
+    for l in &status.latency {
+        let _ = writeln!(
+            out,
+            "latency {endpoint}: p50 {p50}ms  p90 {p90}ms  p95 {p95}ms  p99 {p99}ms  max {max}ms  ({n} requests)",
+            endpoint = l.endpoint,
+            p50 = l.p50_ms,
+            p90 = l.p90_ms,
+            p95 = l.p95_ms,
+            p99 = l.p99_ms,
+            max = l.max_ms,
+            n = l.samples,
+        );
+    }
 
     if status.projects.is_empty() {
         out.push_str("projects: none registered (run `lore add <path>`)\n");
@@ -749,6 +762,7 @@ mod tests {
             generation: 0,
             projects: vec![],
             embeddings: EmbeddingStatus::Unconfigured,
+            latency: Vec::new(),
         });
         assert!(rendered.contains("projects: none registered (run `lore add <path>`)"));
         assert!(rendered.starts_with("lore daemon 0.1.0  api v1  generation 0\n"));
@@ -786,6 +800,7 @@ mod tests {
                 watch: WatchState::Armed,
             }],
             embeddings: EmbeddingStatus::Unconfigured,
+            latency: Vec::new(),
         };
 
         // Clean vault: not a word about authority.

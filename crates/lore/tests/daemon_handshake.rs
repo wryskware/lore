@@ -186,6 +186,7 @@ async fn probe_believes_a_real_lore_status_body() {
                 generation: 7,
                 projects: Vec::new(),
                 embeddings: lore_core::EmbeddingStatus::Unconfigured,
+                latency: Vec::new(),
             })
         }),
     );

@@ -310,7 +310,7 @@ pub fn effective(
 ///
 /// Deliberately lenient about decoration (`- `, `* `, bold markers, the `:`
 /// inside or outside the emphasis) and deliberately strict about the id shape
-/// (`D-` + exactly four digits), matching [`crate::chunk::decision_refs`].
+/// (`D-` + exactly four digits), matching the chunker's `decision_refs`.
 /// Unparseable prose is skipped, never an error: a malformed ledger degrades
 /// to a smaller active set — which demotes over-claiming documents — rather
 /// than failing the index pass.

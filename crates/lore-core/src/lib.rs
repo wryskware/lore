@@ -38,6 +38,25 @@ pub struct DaemonStatus {
     pub generation: u64,
     pub projects: Vec<ProjectStatus>,
     pub embeddings: EmbeddingStatus,
+    /// Request-latency percentiles per endpoint over a rolling window.
+    /// Empty/absent from a daemon that predates latency metrics (additive on
+    /// the wire in both directions).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub latency: Vec<EndpointLatency>,
+}
+
+/// Nearest-rank latency percentiles for one endpoint (`search`,
+/// `search_embed` — the embed-query wait inside search — or `expand`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EndpointLatency {
+    pub endpoint: String,
+    /// Lifetime request count; percentiles cover the most recent window.
+    pub samples: u64,
+    pub p50_ms: u64,
+    pub p90_ms: u64,
+    pub p95_ms: u64,
+    pub p99_ms: u64,
+    pub max_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -169,6 +169,7 @@ fn canned_status() -> DaemonStatus {
             endpoint: "http://127.0.0.1:11434".into(),
             error: "connection refused".into(),
         },
+        latency: Vec::new(),
     }
 }
 

@@ -46,6 +46,7 @@ fn harness(embedder: Embedder) -> Harness {
         watch_status: watch::WatchStatus::new(),
         config: Arc::new(Config::default()),
         embeddings: embedder.clone(),
+        latency: lore::daemon::latency::LatencyRecorder::default(),
         data_dir: fixture.data_dir.clone(),
     };
     // The receiver is dropped; nothing under test watches the filesystem.

@@ -25,7 +25,6 @@ pub use common::{
 
 /// `D-NNNN` extraction, shared with [`crate::authority`]'s ledger parser so
 /// the two agree on what a decision reference looks like.
-pub(crate) use common::decision_refs;
 
 use crate::types::Chunk;
 

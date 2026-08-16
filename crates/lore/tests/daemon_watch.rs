@@ -615,6 +615,7 @@ async fn v1_status_reports_per_project_watcher_state() {
         watch_status: seam.status.clone(),
         config: Arc::new(Config::default()),
         embeddings: Embedder::disabled(),
+        latency: lore::daemon::latency::LatencyRecorder::default(),
         data_dir: fixture.data_dir.clone(),
     };
     let router = router(state);

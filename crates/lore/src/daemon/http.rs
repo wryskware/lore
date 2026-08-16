@@ -58,6 +58,8 @@ pub struct AppState {
     /// Live embedding capability and health. Shared with the embed worker,
     /// which is the thing that actually probes the endpoint.
     pub embeddings: Embedder,
+    /// Query-surface latency windows, reported by `status`.
+    pub latency: crate::daemon::latency::LatencyRecorder,
     pub data_dir: Utf8PathBuf,
 }
 
@@ -193,6 +195,7 @@ async fn status(State(state): State<AppState>) -> ApiResult<DaemonStatus> {
         // whole point of D-0007 is that a user can see *why* results are
         // lexical-only.
         embeddings: state.embeddings.status(),
+        latency: state.latency.snapshot(),
     }))
 }
 
@@ -327,16 +330,20 @@ async fn search_route(
     State(state): State<AppState>,
     ApiJson(request): ApiJson<SearchRequest>,
 ) -> ApiResult<lore_core::SearchResponse> {
+    let started = std::time::Instant::now();
+
     // Embedding the query is network I/O, so it happens *before* the store
     // lock is taken — never while holding it. `None` simply means this
     // request runs lexical-only (D-0007); it is never an error.
     let query_vector = state.embeddings.embed_query(&request.query).await;
+    state.latency.record("search_embed", started.elapsed());
 
     let outcome = state
         .store
         .with(move |store| search::execute(store, &request, query_vector.as_deref()))
         .await
         .map_err(|err| ApiErr::internal("search", err))?;
+    state.latency.record("search", started.elapsed());
     match outcome {
         Ok(response) => Ok(Json(response)),
         Err(err @ search::SearchError::UnknownProject(_)) => {
@@ -353,6 +360,7 @@ async fn expand_route(
     State(state): State<AppState>,
     ApiJson(request): ApiJson<ExpandRequest>,
 ) -> ApiResult<lore_core::ExpandResponse> {
+    let started = std::time::Instant::now();
     let projects = projects_of(&state).await?;
     // Key first: it is exact. The display-name path stays for humans, older
     // clients, and anyone typing a command by hand.
@@ -377,6 +385,7 @@ async fn expand_route(
         .await
         .map_err(|err| ApiErr::internal("expand", err))?
         .map_err(|err| ApiErr::internal("expand", err))?;
+    state.latency.record("expand", started.elapsed());
 
     found
         .map(Json)

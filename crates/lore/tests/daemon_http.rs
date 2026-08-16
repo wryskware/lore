@@ -40,6 +40,7 @@ fn harness() -> Harness {
         // No embedding endpoint: this file covers the lexical-only daemon.
         // Hybrid ranking and health transitions live in `embed_search.rs`.
         embeddings: Embedder::disabled(),
+        latency: lore::daemon::latency::LatencyRecorder::default(),
         data_dir: fixture.data_dir.clone(),
     };
     Harness {

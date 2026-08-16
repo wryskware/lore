@@ -412,6 +412,7 @@ mod tests {
             generation: 42,
             projects: vec![],
             embeddings: EmbeddingStatus::Unconfigured,
+            latency: Vec::new(),
         };
         assert!(status(&base).contains("embeddings: UNCONFIGURED"));
         assert!(
@@ -473,6 +474,7 @@ mod tests {
                 },
             ],
             embeddings: EmbeddingStatus::Unconfigured,
+            latency: Vec::new(),
         });
         assert!(rendered.contains("  lexomancy  files 812  chunks 9134  embedded 0/9134 (0%)"));
         assert!(rendered.contains("  lore       files 96  chunks 1204  embedded 1204/1204 (100%)"));
@@ -501,6 +503,7 @@ mod tests {
                 watch: WatchState::Armed,
             }],
             embeddings: EmbeddingStatus::Unconfigured,
+            latency: Vec::new(),
         };
         assert!(!status(&status_body).contains("WATCH RETRYING"));
 
@@ -537,6 +540,7 @@ mod tests {
                 watch: WatchState::Armed,
             }],
             embeddings: EmbeddingStatus::Unconfigured,
+            latency: Vec::new(),
         };
 
         assert!(!status(&body(0, Vec::new())).contains("AUTHORITY"));

@@ -27,6 +27,7 @@ pub mod expand;
 pub mod handshake;
 pub mod http;
 pub mod index;
+pub mod latency;
 pub mod ownership;
 pub mod paths;
 pub mod queue;
@@ -204,6 +205,7 @@ pub async fn run(options: DaemonOptions) -> Result<()> {
         watch_status,
         config,
         embeddings,
+        latency: latency::LatencyRecorder::default(),
         data_dir: data_dir.clone(),
     };
     let router = http::router(state);
