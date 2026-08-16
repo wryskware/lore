@@ -27,9 +27,13 @@ const MAX_TERMS: usize = 64;
 /// this layer; if an advanced mode is ever wanted it belongs behind an
 /// explicit opt-in in the daemon, not in the default path.
 ///
-/// Returns an empty string when the input contains no usable terms; callers
+/// Returns an empty vector when the input contains no usable terms; callers
 /// treat that as "no results" rather than running a MATCH.
-pub(crate) fn sanitize_fts_query(input: &str) -> String {
+///
+/// Terms are returned rather than pre-joined because juxtaposition is AND in
+/// FTS5, and the caller needs to be able to relax that — see
+/// [`or_fts_query`].
+pub(crate) fn sanitize_fts_terms(input: &str) -> Vec<String> {
     fn flush(current: &mut String, prefix: bool, terms: &mut Vec<String>) {
         if current.is_empty() {
             return;
@@ -57,7 +61,27 @@ pub(crate) fn sanitize_fts_query(input: &str) -> String {
     }
     flush(&mut current, false, &mut terms);
 
-    terms.join(" ")
+    terms
+}
+
+/// The same terms joined with `OR` instead of by juxtaposition.
+///
+/// FTS5 reads `"a" "b"` as `"a" AND "b"`, so a five-word natural-language
+/// question only matches a chunk containing all five words — which for prose
+/// questions is usually no chunk at all. The lexical arm then contributes
+/// nothing to fusion, silently, on exactly the queries the MCP `search`
+/// description tells agents to ask. Relaxing to OR keeps BM25 in charge of
+/// ranking: it already scores chunks carrying more (and rarer) of the terms
+/// above chunks carrying one common one.
+///
+/// Returns an empty string for fewer than two terms — a single-term query is
+/// identical under either operator, and the caller should not pay for a
+/// second round trip to learn that.
+pub(crate) fn or_fts_query(terms: &[String]) -> String {
+    if terms.len() < 2 {
+        return String::new();
+    }
+    terms.join(" OR ")
 }
 
 /// A `WHERE`-clause fragment plus its positional parameters, in order.
@@ -166,6 +190,12 @@ pub(crate) fn filter_sql(filter: &SearchFilter) -> FilterSql {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The conjunctive expression `lexical_search` builds first, so these
+    /// assertions read as the string that actually reaches FTS5.
+    fn sanitize_fts_query(input: &str) -> String {
+        sanitize_fts_terms(input).join(" ")
+    }
 
     #[test]
     fn sanitize_keeps_identifier_terms() {

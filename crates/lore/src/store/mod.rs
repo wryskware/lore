@@ -48,7 +48,7 @@ use crate::types::{
     Chunk, ChunkId, ChunkKind, DesignStatus, SourceKind, VaultMeta, authority_tier,
 };
 
-use query::{filter_sql, sanitize_fts_query};
+use query::{filter_sql, or_fts_query, sanitize_fts_terms};
 use vector::{Scored, TopK};
 
 /// Opaque project handle. Stable for the life of the database.
@@ -1044,19 +1044,49 @@ impl Store {
     /// BM25 lexical search over chunk text, path and symbol/heading anchor.
     ///
     /// `query` is arbitrary user text: it is sanitized into a safe FTS5 MATCH
-    /// expression (see [`query::sanitize_fts_query`]), so malformed input
+    /// expression (see [`query::sanitize_fts_terms`]), so malformed input
     /// returns `Ok` with sensible-or-empty results rather than an error or a
     /// panic. Returned scores are `-bm25(...)`, i.e. higher is better.
+    ///
+    /// Multi-term queries are tried as a conjunction first and retried as a
+    /// disjunction only when the conjunction matches nothing. Precise queries
+    /// therefore keep their exact behaviour and cost one statement; prose
+    /// questions that would otherwise return nothing (see
+    /// [`query::or_fts_query`]) pay a second statement to get a ranked list
+    /// instead of an empty one. Scores are not comparable between the two
+    /// passes, but nothing needs them to be: the caller fuses by rank.
     pub fn lexical_search(
         &self,
         query: &str,
         filter: &SearchFilter,
         limit: usize,
     ) -> Result<Vec<SearchHit>> {
-        let match_expr = sanitize_fts_query(query);
+        let terms = sanitize_fts_terms(query);
+        let match_expr = terms.join(" ");
         if match_expr.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
+
+        let hits = self.lexical_match(&match_expr, filter, limit)?;
+        if !hits.is_empty() {
+            return Ok(hits);
+        }
+        let relaxed = or_fts_query(&terms);
+        if relaxed.is_empty() {
+            return Ok(hits);
+        }
+        self.lexical_match(&relaxed, filter, limit)
+    }
+
+    /// Run one already-built MATCH expression. Split out of
+    /// [`Self::lexical_search`] so the conjunction and its disjunctive retry
+    /// cannot drift apart in filters, ordering, or row decoding.
+    fn lexical_match(
+        &self,
+        match_expr: &str,
+        filter: &SearchFilter,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>> {
         let f = filter_sql(filter);
         let sql = format!(
             "SELECT {CHUNK_COLS}, -bm25(chunks_fts, {BM25_WEIGHTS}) AS score
@@ -1067,7 +1097,7 @@ impl Store {
             f.sql
         );
 
-        let mut params: Vec<Value> = vec![Value::Text(match_expr)];
+        let mut params: Vec<Value> = vec![Value::Text(match_expr.to_string())];
         params.extend(f.params);
         params.push(Value::Integer(limit as i64));
 
