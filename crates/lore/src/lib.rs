@@ -13,6 +13,8 @@
 //!   into authority semantics at all (D-0012).
 //! - [`embed`] — local embedding client, health and the backfill worker.
 //! - [`daemon`] — lifecycle, HTTP API, watcher and indexing.
+//! - [`setup`] — the agent-side assets `lore setup` installs into a coding
+//!   agent host, and the never-clobber rule that governs updating them.
 
 pub mod authority;
 pub mod chunk;
@@ -21,5 +23,6 @@ pub mod daemon;
 pub mod embed;
 pub mod registry;
 pub mod repo_config;
+pub mod setup;
 pub mod store;
 pub mod types;

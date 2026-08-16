@@ -110,19 +110,30 @@ pub const RRF_K: f64 = 60.0;
 //
 // The **ordering** — decided > leaning > exploration/unclassified >
 // deprecated — is the canon requirement (3.1, and `types::authority_tier`).
-// These exact numbers are tuning: they are deliberately gentle, so authority
-// breaks ties and lifts a near-miss, and never resurrects an irrelevant
-// document. Expect them to move during dogfooding.
+// The numbers are tuning, and they must be read in *rank* space, not score
+// space: RRF scores are a pure function of rank and `RRF_K`, compressed to
+// within ~15% of each other over the whole first page, so a multiplier `m`
+// on a fused score moves a rank-`r` hit to the equivalent of rank
+// `(RRF_K + r)/m − RRF_K`. The original values (1.15 / 1.05 / 0.7) looked
+// gentle but shifted hits by 10–30 ranks — a demoted top lexical match for a
+// *navigational* query landed below two dozen mediocre hits, and decided docs
+// leapfrogged the query's actual target from rank 20. The values below are
+// derived from the shift we actually want at the top of the list: decided
+// lifts ~3 ranks, leaning ~1, deprecated loses ~3–4. Authority breaks ties
+// and lifts a near-miss; a decisive match wins regardless of tier.
+//
+// Because RRF scores carry no corpus statistics, these rank shifts are the
+// same for every repo — the multipliers transfer without per-corpus retuning.
 /// Effective tier 3 — validated `decided`, and the ledger itself.
-pub const AUTHORITY_DECIDED: f64 = 1.15;
+pub const AUTHORITY_DECIDED: f64 = 1.05;
 /// Effective tier 2 — `leaning`.
-pub const AUTHORITY_LEANING: f64 = 1.05;
+pub const AUTHORITY_LEANING: f64 = 1.02;
 /// Effective tier 1 — `exploration`, unclassified, non-vault (code) chunks,
 /// `7_Research`, and any declaration that failed validation.
 pub const AUTHORITY_NEUTRAL: f64 = 1.0;
 /// Effective tier 0 — `deprecated` and `9_Scratch`: still searchable,
 /// deliberately demoted.
-pub const AUTHORITY_DEPRECATED: f64 = 0.7;
+pub const AUTHORITY_DEPRECATED: f64 = 0.95;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SearchError {

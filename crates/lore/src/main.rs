@@ -46,6 +46,19 @@ enum Command {
         /// Project directory. Defaults to the current directory.
         path: Option<String>,
     },
+    /// Install Lore's agent-side assets into a coding agent host.
+    ///
+    /// Bare `lore setup` reports what is installed and writes nothing.
+    Setup {
+        /// Host to install into, as `lore setup` names it (`claude-code`).
+        host: Option<String>,
+        /// Print what would change without writing it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Replace assets that have been edited since they were installed.
+        #[arg(long)]
+        force: bool,
+    },
     /// Trigger (re)indexing of a registered project.
     Index { project: Option<String> },
     /// Show daemon and index status.
@@ -72,6 +85,11 @@ fn main() -> anyhow::Result<()> {
         Command::Add { path, name } => cli::run(cli::add(path, name)),
         Command::Remove { project } => cli::run(cli::remove(project)),
         Command::Init { path } => cli::init(path),
+        Command::Setup {
+            host,
+            dry_run,
+            force,
+        } => cli::setup(host, dry_run, force),
         Command::Index { project } => cli::run(cli::index(project)),
         Command::Status { json, project } => cli::run(cli::status(json, project)),
         Command::Search(search) => cli::run(cli::search(search)),

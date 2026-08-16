@@ -30,6 +30,7 @@ use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use lore::daemon::ignorefile;
 use lore::repo_config::{self, DeclaredName};
+use lore::setup;
 use lore_core::discovery;
 use lore_core::{
     DaemonStatus, EmbeddingStatus, ExpandResponse, IndexRequest, IndexResponse, ProjectInfo,
@@ -147,6 +148,12 @@ pub async fn add(path: Option<String>, name: Option<String>) -> Result<()> {
             root.join(repo_config::REPO_CONFIG_FILE)
         ),
     }
+
+    // Registration is exactly when the generated `.loreignore` is about to be
+    // written and exactly when nobody is thinking about it. Marker detection
+    // cannot see a vendored SDK, a corpus, or a checked-in credential, so the
+    // one place a user will read this is here.
+    println!("  {}", setup::ignore_nudge());
     Ok(())
 }
 
@@ -296,6 +303,84 @@ pub fn init(path: Option<String>) -> Result<()> {
         ),
         Err(err) => Err(anyhow::Error::new(err)),
     }
+}
+
+/// `lore setup [host]` — install Lore's agent-side assets, or report on them.
+///
+/// Daemon-free for the same reason `init` is: these files belong to the user's
+/// agent host, not to the index, and being able to install them before anything
+/// is registered is the point — the skill they carry is what a user needs at
+/// the moment they add their first project.
+///
+/// Bare `lore setup` never writes. Discovery that mutates is a trap: the
+/// command a user runs to find out what a command does must be the safe one.
+pub fn setup(host: Option<String>, dry_run: bool, force: bool) -> Result<()> {
+    let Some(host) = host else {
+        return setup_report();
+    };
+    let host = setup::Host::parse(&host)?;
+    let dir = host.skills_dir()?;
+    let items = setup::plan(&dir);
+
+    if !setup::pending(&items, force) {
+        println!("{host}: nothing to do");
+        for item in &items {
+            println!("  {:<14}{}", item.name, item.state.label());
+        }
+        // The one state a user can act on, so it gets the instruction rather
+        // than leaving them to guess that a flag exists.
+        if items
+            .iter()
+            .any(|item| item.state == setup::State::Modified)
+        {
+            println!("\nrun `lore setup {host} --force` to replace your edited copies");
+        }
+        return Ok(());
+    }
+
+    for item in &items {
+        if dry_run {
+            println!("  would write {:<14}{}", item.name, item.path);
+            continue;
+        }
+        match setup::apply(item, force)? {
+            setup::Outcome::Installed => println!("  installed {} -> {}", item.name, item.path),
+            setup::Outcome::Updated => println!("  updated   {} -> {}", item.name, item.path),
+            setup::Outcome::Overwrote => println!("  replaced  {} -> {}", item.name, item.path),
+            setup::Outcome::Unchanged => println!("  {:<14}already up to date", item.name),
+            setup::Outcome::Kept => println!(
+                "  kept      {} (edited since install; --force replaces it)",
+                item.name
+            ),
+        }
+    }
+    if !dry_run {
+        println!("\nstart a new agent session to pick them up");
+    }
+    Ok(())
+}
+
+/// The read-only half: every host Lore ships for, whether it is on this
+/// machine, and what state each asset is in.
+fn setup_report() -> Result<()> {
+    for host in setup::Host::ALL {
+        if !host.detected() {
+            println!("{host}   not detected");
+            continue;
+        }
+        let dir = host.skills_dir()?;
+        println!("{host}   detected  {dir}");
+        for item in setup::plan(&dir) {
+            println!(
+                "  {:<14}{:<18}{}",
+                item.name,
+                item.state.label(),
+                item.summary
+            );
+        }
+    }
+    println!("\nrun `lore setup <host>` to install; nothing above was written",);
+    Ok(())
 }
 
 /// How long `lore stop` waits for the daemon to actually be gone.
