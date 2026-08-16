@@ -132,7 +132,9 @@ async fn chunks_are_embedded_with_their_provenance_header() {
 }
 
 /// A chunk the endpoint refuses must not be retried forever, and must not
-/// block the chunks queued behind it.
+/// block the chunks queued behind it. It does get exactly one retry first —
+/// see [`a_refused_chunk_is_retried_once_before_it_is_abandoned`] — which the
+/// long retry window here keeps out of the way.
 #[tokio::test]
 async fn a_refused_chunk_is_skipped_and_the_rest_still_drain() {
     let rig = Rig::with("demo", |settings| {
@@ -150,6 +152,9 @@ async fn a_refused_chunk_is_skipped_and_the_rest_still_drain() {
     assert_eq!(chunks, 3);
 
     let mut worker = rig.worker();
+    // Short enough that the retry lands inside this test, long enough that it
+    // cannot land in the middle of a pass and confuse the counts below.
+    worker.set_poison_windows(Duration::from_millis(20), Duration::from_secs(600));
     worker.reconcile_fingerprint().await.unwrap();
 
     // The rejection stops the pass and marks the endpoint unhealthy — a 4xx
@@ -157,11 +162,12 @@ async fn a_refused_chunk_is_skipped_and_the_rest_still_drain() {
     // that must be visible rather than silently poisoning the corpus.
     worker.probe().await;
     let mut passes = 0;
-    while rig.counts().1 < 2 && passes < 10 {
+    while (rig.counts().1 < 2 || worker.skipped() < 1) && passes < 10 {
         if !worker.probe().await {
             break;
         }
         worker.drain().await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
         passes += 1;
     }
 
@@ -200,10 +206,15 @@ async fn poisoned_fetch_window_does_not_report_idle() {
 
     let mut worker = rig.worker();
     worker.set_page_rows(PAGE);
+    // A retry window short enough that the second strike lands on the next
+    // pass: this test is about the paging walk, not the retry cadence, so it
+    // wants every chunk in the page fully abandoned as quickly as possible.
+    worker.set_poison_windows(Duration::ZERO, Duration::from_secs(600));
     worker.reconcile_fingerprint().await.unwrap();
 
-    // Fill exactly one fetch page with poison.
-    for _ in 0..PAGE {
+    // Fill exactly one fetch page with poison. Two passes each: a rejection is
+    // a suspicion the first time and a verdict the second.
+    for _ in 0..2 * PAGE {
         assert!(worker.probe().await);
         assert_eq!(worker.drain().await, Drained::Interrupted);
     }
@@ -232,6 +243,105 @@ async fn poisoned_fetch_window_does_not_report_idle() {
     let before = rig.stub.state.attempts();
     assert_eq!(worker.drain().await, Drained::Idle);
     assert_eq!(rig.stub.state.attempts(), before);
+    rig.stub.shutdown().await;
+}
+
+/// #6: a 4xx is the endpoint's opinion, and Ollama on Windows has been seen to
+/// answer a valid request with a 400 wrapping a dial error. So a rejection
+/// buys a delayed retry before it costs the chunk its vector — and a chunk
+/// that is genuinely refused is abandoned on the second telling, not retried
+/// forever.
+#[tokio::test]
+async fn a_refused_chunk_is_retried_once_before_it_is_abandoned() {
+    const RETRY_IN: Duration = Duration::from_millis(50);
+
+    let rig = Rig::with("demo", |settings| settings.batch_max_items = 1).await;
+    // Lowest rowid, so it is the batch every pass reaches first.
+    rig.fixture
+        .write("docs/a.md", format!("# A\n\n{POISON} document.\n"));
+    rig.fixture.write("docs/b.md", "# B\n\nSecond document.\n");
+    full_scan(&rig.fixture.context(), &rig.fixture.project);
+
+    let refused = |rig: &Rig| {
+        rig.stub
+            .state
+            .inputs()
+            .iter()
+            .filter(|input| input.contains(POISON))
+            .count()
+    };
+
+    let mut worker = rig.worker();
+    worker.set_poison_windows(RETRY_IN, Duration::from_secs(600));
+    worker.reconcile_fingerprint().await.unwrap();
+
+    assert!(worker.probe().await);
+    assert_eq!(worker.drain().await, Drained::Interrupted);
+    assert_eq!(refused(&rig), 1, "the chunk was sent once");
+    assert_eq!(worker.skipped(), 0, "one rejection is only a suspicion");
+
+    // Inside the retry window it is held back, exactly like an abandoned one:
+    // a rejection stops a pass, so without this the retry would be immediate
+    // and the endpoint would see the same doomed batch in a tight loop.
+    assert!(worker.probe().await);
+    worker.drain().await;
+    assert_eq!(refused(&rig), 1, "the retry was not delayed");
+    assert_eq!(rig.counts(), (2, 1), "the chunk behind it still drained");
+
+    // Past the window it gets its one retry, is refused again, and is now
+    // abandoned for the whole (long) TTL.
+    tokio::time::sleep(RETRY_IN * 2).await;
+    assert!(worker.probe().await);
+    assert_eq!(worker.drain().await, Drained::Interrupted);
+    assert_eq!(refused(&rig), 2, "the delayed retry never happened");
+    assert_eq!(worker.skipped(), 1, "the second rejection is the verdict");
+
+    tokio::time::sleep(RETRY_IN * 2).await;
+    assert!(worker.probe().await);
+    assert_eq!(worker.drain().await, Drained::Idle);
+    assert_eq!(refused(&rig), 2, "an abandoned chunk was sent a third time");
+    rig.stub.shutdown().await;
+}
+
+/// …and abandonment expires. The misclassification that started #6 poisoned 64
+/// healthy chunks for the life of the process; it must instead cost them one
+/// TTL. Same failure, same chunk — the only thing that changes is the clock.
+#[tokio::test]
+async fn an_abandoned_chunk_is_offered_again_once_its_poison_expires() {
+    const WINDOW: Duration = Duration::from_millis(50);
+
+    let rig = Rig::with("demo", |settings| settings.batch_max_items = 1).await;
+    rig.fixture.write("docs/a.md", "# A\n\nFirst document.\n");
+    full_scan(&rig.fixture.context(), &rig.fixture.project);
+
+    let mut worker = rig.worker();
+    // The TTL is the longer of the two so the "still abandoned" check below
+    // cannot lose a race with its own expiry on a busy machine.
+    worker.set_poison_windows(WINDOW, WINDOW * 4);
+    worker.reconcile_fingerprint().await.unwrap();
+    assert!(worker.probe().await);
+    // Two rejections: enough to abandon it, and nothing wrong with the chunk.
+    // Nothing probes in between — a probe would eat a scripted reply.
+    rig.stub
+        .state
+        .script(std::iter::repeat_n(Reply::Status(400), 2));
+
+    assert_eq!(worker.drain().await, Drained::Interrupted);
+    tokio::time::sleep(WINDOW * 2).await;
+    assert_eq!(worker.drain().await, Drained::Interrupted);
+    assert_eq!(worker.skipped(), 1, "abandoned after its retry");
+    assert_eq!(rig.counts(), (1, 0));
+
+    // Still abandoned while the TTL runs: nothing is sent.
+    let sent = rig.stub.state.inputs().len();
+    assert_eq!(worker.drain().await, Drained::Idle);
+    assert_eq!(rig.stub.state.inputs().len(), sent, "the TTL was ignored");
+
+    // Once it expires the chunk is ordinary work again, and the endpoint —
+    // which was never really refusing it — embeds it.
+    tokio::time::sleep(WINDOW * 8).await;
+    assert_eq!(worker.drain().await, Drained::Idle);
+    assert_eq!(rig.counts(), (1, 1), "the chunk never recovered");
     rig.stub.shutdown().await;
 }
 
@@ -414,7 +524,10 @@ async fn a_rejected_batch_stops_the_pass_without_discarding_its_peers() {
 
     assert_eq!(worker.drain().await, Drained::Interrupted);
     assert!(rig.stub.state.max_in_flight() > 1, "nothing was concurrent");
-    assert_eq!(worker.skipped(), 1, "only the refused batch is poison");
+    // Suspected, not yet abandoned — one rejection buys a delayed retry, and
+    // the default window outlasts this test, so the chunk stays held back
+    // either way.
+    assert_eq!(worker.skipped(), 0, "one rejection is not a verdict");
     assert!(
         rig.counts().1 >= (LIMIT - 1) as u64,
         "the peers of the rejected batch were discarded: {:?}",
@@ -513,7 +626,9 @@ async fn concurrency_of_one_is_the_serial_pipeline() {
 
 /// A query embedding can stall for seconds while a probe answers in
 /// milliseconds. The slow one's verdict must not land on top of the fast one's
-/// — D-0007 wants the *current* state reported, not the last one written.
+/// — D-0007 wants the *current* state reported, not the last one written. Its
+/// timeout no longer publishes at all (#5), but everything else it can observe
+/// still does, and still from a ticket claimed before the request.
 #[tokio::test]
 async fn a_stale_failure_cannot_demote_a_newer_probe() {
     let rig = Rig::new("demo").await;
@@ -525,10 +640,10 @@ async fn a_stale_failure_cannot_demote_a_newer_probe() {
     assert!(worker.probe().await);
     assert!(health.is_ready());
 
-    in_flight.set_unreachable(&rig.stub.base, "query embedding timed out after 3000ms");
+    in_flight.set_unreachable(&rig.stub.base, "query embedding failed: connection reset");
     assert!(
         health.is_ready(),
-        "a stale timeout demoted a newer successful probe"
+        "a stale failure demoted a newer successful probe"
     );
     assert!(matches!(
         rig.embedder.status(),
@@ -579,6 +694,59 @@ async fn an_idle_pass_reprobes_a_stale_unreachable_instead_of_sleeping() {
     })
     .await;
     assert_eq!(rig.counts().1 as usize, CHUNKS);
+
+    rig.cancel.cancel();
+    task.await.expect("the worker stops on cancellation");
+    rig.stub.shutdown().await;
+}
+
+/// #5: the first search after the endpoint idles out its model pays a reload
+/// the query has no patience for. Running out of *this request's* patience is
+/// an observation about the deadline, not about the endpoint — a reloading
+/// model and a dead server look identical from here — so health survives it,
+/// and the worker is asked to go and settle the question now rather than at
+/// the next idle tick a minute away.
+#[tokio::test]
+async fn a_query_timeout_leaves_health_alone_and_asks_for_a_probe() {
+    // Nothing is indexed, so the only requests this worker makes are probes.
+    let mut rig = Rig::new("demo").await;
+    rig.embedder.set_query_timeout(Duration::from_millis(50));
+    // Slower than the query will wait, faster than a probe will.
+    rig.stub.state.set_delay(Duration::from_millis(250));
+
+    let probes = || {
+        rig.stub
+            .state
+            .inputs()
+            .iter()
+            .filter(|input| input.contains(lore::embed::client::PROBE_INPUT))
+            .count()
+    };
+
+    let task = tokio::spawn(rig.worker().run());
+    until("the worker's first probe to land", || {
+        rig.embedder.health().is_ready()
+    })
+    .await;
+    let before = probes();
+
+    assert!(
+        rig.embedder.embed_query("results ordering").await.is_none(),
+        "the query outlasted its own deadline, so it has no vector"
+    );
+    assert!(
+        rig.embedder.health().is_ready(),
+        "a query timeout demoted the endpoint: {:?}",
+        rig.embedder.status()
+    );
+
+    // Nothing pulses the worker and IDLE_TICK is 60s, so a probe arriving
+    // inside the helper's deadline can only be the one the timeout asked for.
+    until("the requested probe", || probes() > before).await;
+    assert!(
+        rig.embedder.health().is_ready(),
+        "the probe answered, so the endpoint was never unhealthy"
+    );
 
     rig.cancel.cancel();
     task.await.expect("the worker stops on cancellation");

@@ -11,8 +11,16 @@
 //!                                   │             → embed → upsert_embeddings
 //!                                   │        │ nothing left
 //!                                   │        ▼
-//!                                   └──── wait: indexer pulse | 60s tick | cancel
+//!                                   └──── wait: indexer pulse | probe request
+//!                                               | 60s tick | cancel
 //! ```
+//!
+//! The probe request is [`Health::request_probe`], raised by a query embedding
+//! that timed out (#5). Such a query publishes no verdict of its own — a model
+//! reloading after an idle timeout is indistinguishable from a dead server at
+//! that distance — so the worker goes and asks, now rather than at the next
+//! idle tick. It is the one wake-up that probes even while health says
+//! `Ready`, because doubting a `Ready` is exactly what it is for.
 //!
 //! # Why it cannot starve search
 //!
@@ -43,19 +51,38 @@
 //!
 //! # Poison chunks
 //!
-//! A batch the endpoint answers with a non-retryable 4xx is remembered and
-//! never re-sent, because `chunks_missing_embeddings` would otherwise hand it
-//! back forever and the entire backlog behind it would never drain. The same
-//! failure also marks health unreachable: a 4xx is far more often a
-//! configuration error (wrong model id) affecting *every* batch than one bad
-//! input, and the next probe distinguishes the two — if the endpoint answers a
-//! trivial probe, the problem really was that input and draining resumes past
-//! it; if it does not, the daemon is visibly degraded in `/v1/status` instead
-//! of quietly poisoning the corpus 64 chunks at a time.
+//! A batch the endpoint answers with a non-retryable 4xx is held back, because
+//! `chunks_missing_embeddings` would otherwise hand it straight back and the
+//! entire backlog behind it would never drain. The same failure also marks
+//! health unreachable: a 4xx is far more often a configuration error (wrong
+//! model id) affecting *every* batch than one bad input, and the next probe
+//! distinguishes the two — if the endpoint answers a trivial probe, the
+//! problem really was that input and draining resumes past it; if it does not,
+//! the daemon is visibly degraded in `/v1/status` instead of quietly poisoning
+//! the corpus 64 chunks at a time.
+//!
+//! Held back, though, is not the same as condemned. A 4xx is the endpoint's
+//! *opinion*, and it can be wrong: Ollama on Windows answers a valid request
+//! with a 400 whose body is a dial error when the machine runs out of
+//! ephemeral ports, which cost 64 healthy chunks their vectors for a whole
+//! process lifetime (#6). So poisoning is graded, and nothing here is
+//! permanent:
+//!
+//! ```text
+//!   1st rejection ─▶ suspected: retried once after POISON_RETRY_DELAY
+//!   2nd rejection ─▶ abandoned: counted in `skipped`, retried after POISON_TTL
+//! ```
+//!
+//! One delayed retry costs one request and settles the question; the expiry
+//! costs two requests per abandoned batch per [`POISON_TTL`] and means a
+//! misclassification heals on its own instead of surviving until the daemon
+//! restarts. A genuinely permanent rejection therefore stays negligible — it
+//! is a couple of requests every ten-odd minutes — while still being retried
+//! often enough that "poisoned" never means "written off".
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
@@ -85,6 +112,21 @@ pub const PROBE_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// cannot grow this set without limit.
 pub const MAX_POISONED: usize = 10_000;
 
+/// How long a once-rejected chunk waits for its retry. Long enough for the
+/// transport failures a 4xx can wrap — port exhaustion, a proxy blip, a
+/// half-loaded model — to clear, and short enough that the retry still lands
+/// inside the same drain of a large backlog.
+pub const POISON_RETRY_DELAY: Duration = Duration::from_secs(60);
+
+/// How long an abandoned chunk stays abandoned before it is offered again.
+/// Bounds how long a misclassification can cost recall: minutes, not the
+/// lifetime of the process.
+pub const POISON_TTL: Duration = Duration::from_secs(12 * 60);
+
+/// Rejections a chunk survives before it is abandoned. The first is a
+/// suspicion; the second is a verdict.
+const ABANDON_STRIKES: u32 = 2;
+
 /// Rows hydrated per `chunks_missing_embeddings` page. Poisoned chunks are
 /// filtered after the query, so pages — not one widened fetch — are what
 /// carries the scan past them; this only bounds how many full chunk rows are
@@ -111,10 +153,22 @@ pub struct EmbedWorker {
     health: Health,
     notify: Arc<Notify>,
     cancel: CancellationToken,
-    poisoned: HashSet<(ProjectId, ChunkId)>,
+    poisoned: HashMap<(ProjectId, ChunkId), Poison>,
     /// Chunks abandoned this process lifetime; logged, not persisted.
     skipped: usize,
     page_rows: usize,
+    retry_delay: Duration,
+    poison_ttl: Duration,
+}
+
+/// What the worker remembers about a chunk the endpoint would not embed.
+#[derive(Debug)]
+struct Poison {
+    /// Rejections seen for this chunk. At [`ABANDON_STRIKES`] it is abandoned
+    /// rather than merely suspected.
+    strikes: u32,
+    /// When it may be offered to the endpoint again.
+    retry_at: Instant,
 }
 
 impl EmbedWorker {
@@ -131,9 +185,11 @@ impl EmbedWorker {
             health,
             notify,
             cancel,
-            poisoned: HashSet::new(),
+            poisoned: HashMap::new(),
             skipped: 0,
             page_rows: PAGE_ROWS,
+            retry_delay: POISON_RETRY_DELAY,
+            poison_ttl: POISON_TTL,
         }
     }
 
@@ -144,7 +200,18 @@ impl EmbedWorker {
         self.page_rows = rows.max(1);
     }
 
-    /// Chunks abandoned after a non-retryable rejection.
+    /// Shorten the two poison windows. Exists so a test can watch the
+    /// retry-then-abandon cadence and the expiry without waiting minutes;
+    /// nothing in the daemon calls it.
+    pub fn set_poison_windows(&mut self, retry_delay: Duration, ttl: Duration) {
+        self.retry_delay = retry_delay;
+        self.poison_ttl = ttl;
+    }
+
+    /// Chunks abandoned this process lifetime: rejected, retried once, and
+    /// rejected again. They are not gone for good — each is offered again once
+    /// its [`POISON_TTL`] is up — so this is the count of chunks the worker
+    /// has given up on at least once, not of chunks it will never send.
     pub fn skipped(&self) -> usize {
         self.skipped
     }
@@ -156,12 +223,16 @@ impl EmbedWorker {
         }
 
         let mut backoff = PROBE_BACKOFF_START;
+        // Someone doubts the stored verdict — a query that timed out — so the
+        // next turn of the loop probes even if health currently reads `Ready`.
+        let mut recheck = false;
         loop {
             if self.cancel.is_cancelled() {
                 break;
             }
 
-            if !self.health.is_ready() {
+            if recheck || !self.health.is_ready() {
+                recheck = false;
                 if self.probe().await {
                     backoff = PROBE_BACKOFF_START;
                 } else {
@@ -186,6 +257,7 @@ impl EmbedWorker {
             tokio::select! {
                 () = self.cancel.cancelled() => break,
                 () = self.notify.notified() => {}
+                () = self.health.probe_requested() => recheck = true,
                 _ = tokio::time::sleep(IDLE_TICK) => {}
             }
         }
@@ -322,11 +394,15 @@ impl EmbedWorker {
         }
         match batch.outcome {
             Outcome::Stored { degenerate } => {
-                self.poison(&degenerate);
+                // No retry: the endpoint answered, and the answer was a vector
+                // the store cannot use. Sending the same text buys the same
+                // vector, so this goes straight to abandoned — the TTL is the
+                // only second chance a model that has been fixed needs.
+                self.poison(&degenerate, ABANDON_STRIKES);
                 None
             }
             Outcome::Rejected => {
-                self.poison(&batch.candidates);
+                self.poison(&batch.candidates, 1);
                 Some(Drained::Interrupted)
             }
             Outcome::Failed | Outcome::StoreFailed | Outcome::Cancelled => {
@@ -345,7 +421,10 @@ impl EmbedWorker {
     /// them starves. The walk terminates because each page either yields work
     /// or consumes rows from two bounded sets: poison, capped at
     /// [`MAX_POISONED`], and the claims of at most `concurrency` batches.
+    /// Poison is judged against one instant taken here, so the filtered set
+    /// cannot grow mid-walk.
     async fn next_batch(&self, claimed: &Claimed) -> Option<Vec<EmbedCandidate>> {
+        let now = Instant::now();
         let want = self.client.settings().batch_max_items.max(1);
         // Independent of `want`: the walk fills a batch larger than one page
         // from several pages, so hydrated rows stay bounded whatever the
@@ -375,7 +454,7 @@ impl EmbedWorker {
             for candidate in fetched {
                 cursor = cursor.max(candidate.rowid);
                 let key = key(&candidate);
-                if !self.poisoned.contains(&key) && !claimed.contains(&key) {
+                if !self.held_back(&key, now) && !claimed.contains(&key) {
                     batch.push(candidate);
                     if batch.len() == want {
                         return Some(batch);
@@ -389,16 +468,53 @@ impl EmbedWorker {
         }
     }
 
-    fn poison(&mut self, batch: &[EmbedCandidate]) {
+    /// Is this chunk serving a poison window right now?
+    fn held_back(&self, key: &(ProjectId, ChunkId), now: Instant) -> bool {
+        self.poisoned
+            .get(key)
+            .is_some_and(|poison| now < poison.retry_at)
+    }
+
+    /// Record `strikes` rejections against every chunk in `batch`, and set
+    /// when each may be offered again: [`POISON_RETRY_DELAY`] while it is
+    /// merely suspected, [`POISON_TTL`] once it is abandoned.
+    ///
+    /// `skipped` counts each chunk the first time it crosses into abandoned,
+    /// so a chunk re-rejected after its TTL expires is not counted twice.
+    fn poison(&mut self, batch: &[EmbedCandidate], strikes: u32) {
+        let now = Instant::now();
+        let (retry_delay, ttl) = (self.retry_delay, self.poison_ttl);
+        if self.poisoned.len() >= MAX_POISONED {
+            // Suspicions that have already had their retry are spent: the
+            // chunk was either embedded or is about to earn a fresh strike.
+            // Dropping them keeps a transport blip that touched thousands of
+            // healthy chunks from filling the map and leaving no room to
+            // remember a genuinely bad one.
+            self.poisoned
+                .retain(|_, poison| poison.strikes >= ABANDON_STRIKES || now < poison.retry_at);
+        }
+
         for candidate in batch {
-            if self.poisoned.len() >= MAX_POISONED {
+            let key = key(candidate);
+            if !self.poisoned.contains_key(&key) && self.poisoned.len() >= MAX_POISONED {
                 tracing::error!(
                     limit = MAX_POISONED,
                     "too many chunks rejected by the embedding endpoint; stopping the skip list"
                 );
                 break;
             }
-            if self.poisoned.insert(key(candidate)) {
+            let entry = self.poisoned.entry(key).or_insert(Poison {
+                strikes: 0,
+                retry_at: now,
+            });
+            let before = entry.strikes;
+            entry.strikes += strikes;
+            entry.retry_at = now
+                + match entry.strikes >= ABANDON_STRIKES {
+                    true => ttl,
+                    false => retry_delay,
+                };
+            if before < ABANDON_STRIKES && entry.strikes >= ABANDON_STRIKES {
                 self.skipped += 1;
             }
         }
@@ -433,8 +549,9 @@ enum Outcome {
     Stored { degenerate: Vec<EmbedCandidate> },
     /// The store itself refused the write.
     StoreFailed,
-    /// A 4xx: this exact request will never succeed, so these chunks are
-    /// poison.
+    /// A 4xx: the endpoint says this exact request will never succeed. Taken
+    /// as a suspicion the first time and as a verdict the second — see the
+    /// poison grading in the module documentation.
     Rejected,
     /// Unreachable or still failing after every retry; retry the chunks later.
     Failed,
@@ -477,7 +594,7 @@ async fn embed_batch(
                 error = %err,
                 chunks = candidates.len(),
                 first_path = %candidates[0].chunk.path,
-                "endpoint rejected a batch outright; those chunks stay unembedded"
+                "endpoint rejected a batch outright; those chunks are held back and retried once"
             );
             ticket.set_unreachable(client.endpoint(), err.to_string());
             Outcome::Rejected

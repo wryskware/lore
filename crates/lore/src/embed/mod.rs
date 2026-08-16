@@ -19,7 +19,7 @@
 //!            ┌──────────── Embedder (cloned into AppState) ───────────┐
 //!            │  Option<Arc<EmbedClient>>          Health (RwLock)     │
 //!            └───────┬───────────────────────────────────┬────────────┘
-//!  /v1/search ───────┘  embed_query (3s cap, fail→lexical)│ read by /v1/status
+//!  /v1/search ───────┘  embed_query (5s cap, fail→lexical)│ read by /v1/status
 //!  daemon child ─── EmbedWorker::run ─────────────────────┘ written by probes
 //! ```
 //!
@@ -47,30 +47,44 @@ pub use client::{EmbedClient, EmbedError, EmbedSettings, RetryPolicy};
 pub use health::{Health, Ticket};
 pub use worker::{EmbedWorker, fingerprint};
 
-/// Ceiling on embedding a *query*. Search is interactive: three seconds is
-/// already a long time to wait, and past it lexical-only results now beat
-/// hybrid results later (D-0007's degradation is the designed behaviour, not
-/// an emergency).
-pub const QUERY_EMBED_TIMEOUT: Duration = Duration::from_secs(3);
+/// Ceiling on embedding a *query*. Search is interactive: past this,
+/// lexical-only results now beat hybrid results later (D-0007's degradation is
+/// the designed behaviour, not an emergency).
+///
+/// Five seconds rather than three because exceeding it no longer costs
+/// anything but this one query's recall (see [`Embedder::embed_query`]): the
+/// only thing a shorter ceiling buys is a faster answer, and the only thing it
+/// costs is the vector arm on every query that lands while a model is
+/// reloading after an idle timeout, or behind a worker batch on a busy local
+/// server. Deliberately not configurable — a knob whose worst setting is
+/// invisible (silently lexical-only answers) is worse than a constant that is
+/// merely imperfect.
+pub const QUERY_EMBED_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The daemon's embedding capability: a client (or not) plus shared health.
 #[derive(Clone, Debug)]
 pub struct Embedder {
     client: Option<Arc<EmbedClient>>,
     health: Health,
+    query_timeout: Duration,
 }
 
 impl Embedder {
+    fn assembled(client: Option<Arc<EmbedClient>>, health: Health) -> Self {
+        Self {
+            client,
+            health,
+            query_timeout: QUERY_EMBED_TIMEOUT,
+        }
+    }
+
     /// Build from configuration. Never fails: a broken configuration becomes
     /// a *visible* unreachable state, because refusing to start the daemon
     /// over an optional feature would be worse than running without it.
     pub fn new(config: &EmbeddingsConfig) -> Self {
         let health = Health::new(config_status(config));
         let Some(settings) = EmbedSettings::from_config(config) else {
-            return Self {
-                client: None,
-                health,
-            };
+            return Self::assembled(None, health);
         };
         if config.model.is_none() {
             tracing::info!(
@@ -79,26 +93,17 @@ impl Embedder {
             );
         }
         match EmbedClient::new(settings.clone()) {
-            Ok(client) => Self {
-                client: Some(Arc::new(client)),
-                health,
-            },
+            Ok(client) => Self::assembled(Some(Arc::new(client)), health),
             Err(err) => {
                 health.set_unreachable(&settings.endpoint, err.to_string());
-                Self {
-                    client: None,
-                    health,
-                }
+                Self::assembled(None, health)
             }
         }
     }
 
     /// An embedder that will never produce vectors — the lexical-only daemon.
     pub fn disabled() -> Self {
-        Self {
-            client: None,
-            health: Health::new(EmbeddingStatus::Unconfigured),
-        }
+        Self::assembled(None, Health::new(EmbeddingStatus::Unconfigured))
     }
 
     /// Test/embedding-side seam: build directly from settings, bypassing the
@@ -109,18 +114,19 @@ impl Embedder {
             error: "endpoint not probed yet; search is lexical-only until it answers".to_string(),
         });
         match EmbedClient::new(settings.clone()) {
-            Ok(client) => Self {
-                client: Some(Arc::new(client)),
-                health,
-            },
+            Ok(client) => Self::assembled(Some(Arc::new(client)), health),
             Err(err) => {
                 health.set_unreachable(&settings.endpoint, err.to_string());
-                Self {
-                    client: None,
-                    health,
-                }
+                Self::assembled(None, health)
             }
         }
+    }
+
+    /// Shorten the query-embed ceiling. Exists so a test can drive the timeout
+    /// path in milliseconds instead of seconds; the daemon always runs with
+    /// [`QUERY_EMBED_TIMEOUT`].
+    pub fn set_query_timeout(&mut self, timeout: Duration) {
+        self.query_timeout = timeout;
     }
 
     /// What `GET /v1/status` reports.
@@ -157,12 +163,26 @@ impl Embedder {
     /// Embed a search query, or `None` — which the search path reads as "run
     /// lexical-only for this request".
     ///
-    /// A failure here also demotes health, so a server that died between the
-    /// last probe and this request costs one slow search rather than one slow
+    /// A *failure* here — refused, unreachable, still failing after every
+    /// retry — also demotes health, so a server that died between the last
+    /// probe and this request costs one slow search rather than one slow
     /// search per query until the worker notices. The demotion goes through a
     /// ticket taken before the request: this is the slowest health writer in
-    /// the daemon, and a three-second-old verdict must not overwrite a probe
+    /// the daemon, and a five-second-old verdict must not overwrite a probe
     /// that has since said the endpoint is back.
+    ///
+    /// A *timeout* does not demote, and that asymmetry is the point. Running
+    /// out of this request's patience is an observation about the deadline,
+    /// not about the endpoint: a model reloading after an idle timeout looks
+    /// exactly like one that has died, and demoting on it made the first
+    /// search after an idle period flap the daemon between `Ready` and
+    /// `Unreachable` (#5). The query still degrades to lexical-only, visibly,
+    /// via the `lexical_only` flag on the response. What replaces the demotion
+    /// is [`Health::request_probe`]: the worker probes immediately instead of
+    /// waiting out its idle tick, so an endpoint that really is gone is
+    /// reported within one probe rather than one minute — and because that
+    /// probe *is* an embedding call, it doubles as the warm-up that makes the
+    /// next query fast.
     pub async fn embed_query(&self, query: &str) -> Option<Vec<f32>> {
         let client = self.client.as_ref()?;
         if !self.health.is_ready() || query.trim().is_empty() {
@@ -170,7 +190,7 @@ impl Embedder {
         }
         let text = text::query_text(query, &client.settings().query_prefix);
         let ticket = self.health.ticket();
-        match tokio::time::timeout(QUERY_EMBED_TIMEOUT, client.embed(&[text])).await {
+        match tokio::time::timeout(self.query_timeout, client.embed(&[text])).await {
             Ok(Ok(vectors)) => vectors.into_iter().next(),
             Ok(Err(err)) => {
                 tracing::debug!(error = %err, "query embedding failed; this search is lexical-only");
@@ -179,16 +199,10 @@ impl Embedder {
             }
             Err(_) => {
                 tracing::debug!(
-                    timeout_ms = QUERY_EMBED_TIMEOUT.as_millis() as u64,
-                    "query embedding timed out; this search is lexical-only"
+                    timeout_ms = self.query_timeout.as_millis() as u64,
+                    "query embedding timed out; this search is lexical-only and the endpoint will be re-probed"
                 );
-                ticket.set_unreachable(
-                    client.endpoint(),
-                    format!(
-                        "query embedding timed out after {}ms",
-                        QUERY_EMBED_TIMEOUT.as_millis()
-                    ),
-                );
+                self.health.request_probe();
                 None
             }
         }

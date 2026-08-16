@@ -26,7 +26,9 @@
 //! - **Failures are classified, not merely counted.** Transient (network,
 //!   408, 429, 5xx) means retry with backoff; anything else 4xx means *this
 //!   request will never succeed*, so retrying it forever would wedge the
-//!   pipeline behind one poison input.
+//!   pipeline behind one poison input. The one exception is a 4xx whose
+//!   *body* is a transport error the endpoint failed to translate — see
+//!   [`TRANSPORT_SIGNATURES`].
 
 use std::time::Duration;
 
@@ -71,8 +73,21 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// for seconds before the stack gives up.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Sent as the probe input. Deliberately trivial and content-free.
-const PROBE_INPUT: &str = "lore health probe";
+/// Sent as the probe input. Deliberately trivial and content-free. Public so
+/// a test can tell a probe apart from real work in a server's request log.
+pub const PROBE_INPUT: &str = "lore health probe";
+
+/// Substrings that betray a *transport* failure inside an error body,
+/// whatever status the endpoint wrapped it in. Ollama on Windows answers a
+/// perfectly valid request with HTTP 400 carrying a Go dial error when the
+/// machine has run out of ephemeral ports; taken at face value that poisons a
+/// batch of entirely healthy chunks for the life of the process.
+///
+/// Matching one of these only buys the request the ordinary retry budget — if
+/// every attempt still fails, the verdict reverts to what the status said,
+/// because a genuinely permanent 4xx that merely *mentions* "timeout" must not
+/// become a chunk the worker retries forever.
+const TRANSPORT_SIGNATURES: [&str; 4] = ["dial", "connectex", "bind", "timeout"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum EmbedError {
@@ -283,11 +298,14 @@ impl EmbedClient {
                 Err(Attempt::Retryable {
                     message,
                     retry_after,
+                    permanent_if_exhausted,
                 }) => {
                     if attempt >= self.settings.retry.max_attempts {
-                        return Err(EmbedError::Transient(format!(
-                            "{message} (after {attempt} attempts)"
-                        )));
+                        let message = format!("{message} (after {attempt} attempts)");
+                        return Err(match permanent_if_exhausted {
+                            true => EmbedError::Permanent(message),
+                            false => EmbedError::Transient(message),
+                        });
                     }
                     let delay = retry_after
                         .unwrap_or_else(|| backoff(attempt, self.settings.retry.base_delay))
@@ -324,14 +342,24 @@ impl EmbedClient {
         if !status.is_success() {
             let retry_after = parse_retry_after(response.headers());
             let body = response.text().await.unwrap_or_default();
+            let wrapped_transport = looks_like_transport(&body);
             let message = format!("HTTP {} {}", status.as_u16(), snippet(&body));
             // 408/429/5xx are the server saying "not now"; every other 4xx is
-            // the server saying "not ever" for this exact request.
+            // the server saying "not ever" for this exact request — unless its
+            // body says otherwise, in which case it gets the retry budget and
+            // the status has the last word if that runs out.
             return Err(
                 if status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error() {
                     Attempt::Retryable {
                         message,
                         retry_after,
+                        permanent_if_exhausted: false,
+                    }
+                } else if wrapped_transport {
+                    Attempt::Retryable {
+                        message,
+                        retry_after,
+                        permanent_if_exhausted: true,
                     }
                 } else {
                     Attempt::Permanent(message)
@@ -405,6 +433,12 @@ enum Attempt {
     Retryable {
         message: String,
         retry_after: Option<Duration>,
+        /// Report [`EmbedError::Permanent`] rather than
+        /// [`EmbedError::Transient`] once the attempts run out. Set only for a
+        /// 4xx that was *given* the benefit of the doubt by
+        /// [`TRANSPORT_SIGNATURES`]: retrying is cheap, but calling it
+        /// transient forever would let one bad input wedge the pipeline.
+        permanent_if_exhausted: bool,
     },
 }
 
@@ -413,6 +447,7 @@ impl Attempt {
         Attempt::Retryable {
             message,
             retry_after: None,
+            permanent_if_exhausted: false,
         }
     }
 }
@@ -497,6 +532,20 @@ pub fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duratio
     Some(Duration::from_secs(seconds))
 }
 
+/// Does this error body read as the endpoint's *own* network call failing?
+///
+/// Only the head is examined: the signatures appear in the error line, and a
+/// megabyte of HTML is not worth scanning. Deliberately a substring test — the
+/// wording varies by server, language and OS, and the cost of a false positive
+/// is three extra attempts, not a wrong verdict (see [`Attempt::Retryable`]).
+fn looks_like_transport(body: &str) -> bool {
+    const HEAD: usize = 512;
+    let head = truncate_bytes(body, HEAD).to_ascii_lowercase();
+    TRANSPORT_SIGNATURES
+        .iter()
+        .any(|signature| head.contains(signature))
+}
+
 /// Error bodies go into logs; a model server's 500 can be a megabyte of HTML.
 fn snippet(body: &str) -> String {
     const MAX: usize = 200;
@@ -574,6 +623,31 @@ mod tests {
             let nominal = base * (1 << (attempt - 1));
             assert!(delay >= nominal / 2 && delay <= nominal, "{delay:?}");
         }
+    }
+
+    /// The body that started this: Ollama's 400 during Windows ephemeral-port
+    /// exhaustion (#6). Ordinary rejections must stay unmatched, or every
+    /// permanent 4xx pays the retry budget for nothing.
+    #[test]
+    fn transport_errors_are_recognised_inside_an_error_body() {
+        assert!(looks_like_transport(
+            "Post \"http://127.0.0.1:11434/api/embed\": dial tcp 127.0.0.1:11434: \
+             connectex: Only one usage of each socket address is normally permitted."
+        ));
+        assert!(looks_like_transport("BIND: address already in use"));
+        assert!(looks_like_transport("upstream request timeout"));
+
+        assert!(!looks_like_transport("model \"nomic\" not found"));
+        assert!(!looks_like_transport(
+            "{\"error\":{\"message\":\"input exceeds the context window\"}}"
+        ));
+        assert!(!looks_like_transport(""));
+        // Past the head, so it does not count — the signature belongs in the
+        // error line, not in a megabyte of trailing HTML.
+        assert!(!looks_like_transport(&format!(
+            "{} dial tcp",
+            "x".repeat(600)
+        )));
     }
 
     #[test]
