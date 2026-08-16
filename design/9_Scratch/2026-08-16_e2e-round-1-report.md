@@ -8,12 +8,41 @@ was re-run 2026-08-16 on the qwen3-4b embedding backend** so that pair is
 apples-to-apples with the qwen day, and the re-run is canonical for it.
 Luna's lore-bench and Lexomancy cells still carry the old nomic backend
 (see Validity). Protocol authority:
-`2026-08-15_e2e-round-1-{plan,answer-key}.md`. Quality **scores are not in
-this report** — grading against the answer key is Wrysk's pass; every
-`metrics.json` has `score: null` until then. Everything below is what the
-harness measures: wall, tokens, tool calls, lore adoption.
+`2026-08-15_e2e-round-1-{plan,answer-key}.md`. **All 60 cells are now
+scored** — luna's 08-15 half by the earlier blind Fable packet pass, the
+qwen matrix and luna/terrarium re-run by a blind Opus packet pass on 08-16
+(15 packets, anonymized shuffled answers, key + answers only, no repo
+access; T5 by diff inspection, suites not run). Scores are LLM-graded and
+await Wrysk's spot-check; audit trail in
+`bench/results/grading-2026-08-16-*.json` and `bench/results/grades.md`.
 
-## Headline (pending grading)
+## Scores
+
+| repo | luna off | luna on | qwen off | qwen on |
+|---|---|---|---|---|
+| lore | 5/5 | 5/5 | 4.5/5 | 4.5/5 |
+| terrarium | 4.5/5 | 5/5 | 3.5/5 | 3.5/5 |
+| lexomancy | 4.5/5 | 5/5 | 4.5/5 | 4.5/5 |
+| **total** | **14/15** | **15/15** | **12.5/15** | **12.5/15** |
+
+- **Qwen: exact quality parity between arms** — 12.5 both ways, and
+  cell-for-cell identical on lore and lexomancy. The unsteered on-arm
+  neither helped nor hurt qwen's correctness at this sample size; the two
+  terrarium differences cancel (off dropped T5 to a non-verifying
+  regression test, on dropped T1).
+- **Luna: on-arm edges it 15 vs 14** — the off arm's misses are exactly the
+  key's predicted traps (terrarium T3 recall on the nomic day, T4 citation
+  on the re-run, lexomancy T5 diff pollution). Small margins, but always in
+  lore's favor, never against.
+- **No cell anywhere scored worse with lore on.** The "actively worse on
+  small repos" worry is not supported by quality data — the on-arm cost is
+  tokens, not correctness.
+- Both T4 "why" cells (lore, lexomancy) scored a symmetric 0.5/0.5 for
+  citing code instead of the key-named prose source — a strict-reading
+  call the graders flagged as promotable; it cannot skew the arm
+  comparison either way.
+
+## Headline
 
 - **Luna + lore: cheaper and faster overall** (−17% input tokens, −24%
   wall on the canonical set), with the entire win concentrated in
@@ -192,11 +221,17 @@ stand.)
 - **No compaction anywhere**: `time_compacting` is null for all 60 cells;
   qwen's 128k protocol never engaged.
 
-## Open questions for grading
+## Grading answers to the open questions
 
-1. Does luna's Lexomancy token/wall win come with equal-or-better answer
-   quality? (The efficiency story is only real if scores hold.)
-2. Do qwen's four zero-lore on-cells score worse than off-arm equivalents
-   — i.e. did ignoring the tool cost it correctness, not just tokens?
-3. lore-on-T1 (qwen, 12/12 lore calls) vs lore-off-T1: purest available
-   retrieval-vs-grep comparison in the qwen set.
+1. **Luna's Lexomancy win holds up**: on-arm 5/5 vs off 4.5/5 while
+   spending −55% tokens — cheaper *and* no worse, slightly better.
+2. **Qwen's zero-lore on-cells did not lose correctness** — every one
+   scored the same as its off-arm twin. Ignoring the tool cost tokens
+   (or nothing), not answers.
+3. **qwen lore-T1 (12/12 lore calls)**: both arms scored 1; the on-arm
+   was marginally faster (65s vs 68s) at +25% tokens. Retrieval matched
+   grep quality on the purest head-to-head, didn't beat it.
+
+Remaining for Wrysk: spot-check the LLM grades (suggested: both T4 0.5s,
+terrarium-T5 off's non-verifying test, one random 1) and decide whether
+the strict-citation 0.5s promote.
