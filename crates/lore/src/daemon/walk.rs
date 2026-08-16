@@ -12,7 +12,13 @@
 //! 2. Never a directory named in [`HARD_EXCLUDES`] — build output and tool
 //!    caches that are frequently enormous, frequently churning, and never
 //!    worth retrieving.
-//! 3. Otherwise ripgrep's rules via the `ignore` crate: `.gitignore`
+//! 3. [`LORE_IGNORE_FILE`] (`.loreignore`) — gitignore syntax, nested like
+//!    `.gitignore`, and honored **regardless of VCS**. This is the
+//!    user-visible knob: a Unity VCS or Perforce workspace has no
+//!    `.gitignore`, so without it the only filtering such a project gets is
+//!    rule 2, and telemetry dumps or serialized-asset YAML index as if they
+//!    were code.
+//! 4. Otherwise ripgrep's rules via the `ignore` crate: `.gitignore`
 //!    (including nested and parent files), `.git/info/exclude`, hidden files
 //!    skipped.
 
@@ -26,6 +32,11 @@ use super::paths;
 /// `.gitignore` says. Unity (`Library`, `Temp`, `obj`) is the flagship case
 /// (D-0003): those trees are machine-generated, gigantic, and rewritten on
 /// every editor launch.
+/// Per-directory ignore file, gitignore syntax. Named for lore rather than
+/// reusing `.ignore` (ripgrep's convention) so that a rule meant for search
+/// tools and a rule meant for the index can differ.
+pub const LORE_IGNORE_FILE: &str = ".loreignore";
+
 pub const HARD_EXCLUDES: &[&str] = &[
     ".git",
     "target",
@@ -99,6 +110,10 @@ pub fn walk_files(
         // it would make what Lore indexes depend on unrelated machine state,
         // and make this walk untestable.
         .git_global(false);
+    // Registered after the builder chain because it returns `&mut` rather
+    // than the builder. Custom ignore files outrank `.gitignore`, so a
+    // `.loreignore` can also *re-include* (`!pattern`) something git ignores.
+    builder.add_custom_ignore_filename(LORE_IGNORE_FILE);
 
     let data_dir = data_dir.to_owned();
     builder.filter_entry(move |entry| {
@@ -136,4 +151,73 @@ pub fn walk_files(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Walk a fixture tree with no data-dir overlap and no cancellation.
+    fn walk(root: &Utf8Path) -> Vec<String> {
+        let far_away = Utf8PathBuf::from("Z:/nowhere/lore-data");
+        let mut files: Vec<String> = walk_files(root, root, None, &far_away, None)
+            .into_iter()
+            .map(|p| p.to_string())
+            .collect();
+        files.sort();
+        files
+    }
+
+    fn fixture(spec: &[(&str, &str)]) -> (tempfile::TempDir, Utf8PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        for (path, contents) in spec {
+            let abs = root.join(path);
+            std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+            std::fs::write(abs, contents).unwrap();
+        }
+        (dir, root)
+    }
+
+    #[test]
+    fn loreignore_excludes_without_any_git_metadata() {
+        // A VCS-less workspace: no .git anywhere, so gitignore semantics
+        // alone would index the telemetry.
+        let (_dir, root) = fixture(&[
+            ("src/main.rs", "fn main() {}"),
+            ("telemetry/run1.jsonl", "{\"tick\":1}"),
+            ("assets/big.asset", "yaml: 1"),
+            (".loreignore", "telemetry/\n*.asset\n"),
+        ]);
+        assert_eq!(walk(&root), ["src/main.rs"]);
+    }
+
+    #[test]
+    fn loreignore_nests_like_gitignore() {
+        let (_dir, root) = fixture(&[
+            ("a/keep.txt", "k"),
+            ("a/logs/noise.txt", "n"),
+            ("a/.loreignore", "logs/\n"),
+            ("b/logs/kept.txt", "k"),
+        ]);
+        // Only `a`'s logs are ignored; `b` has no rule.
+        assert_eq!(walk(&root), ["a/keep.txt", "b/logs/kept.txt"]);
+    }
+
+    #[test]
+    fn loreignore_outranks_gitignore_for_reinclusion() {
+        let (_dir, root) = fixture(&[
+            ("data/model.onnx", "bin"),
+            ("data/readme.md", "docs"),
+            (".gitignore", "data/\n"),
+            (".loreignore", "!data/\n!data/readme.md\ndata/*.onnx\n"),
+        ]);
+        assert_eq!(walk(&root), ["data/readme.md"]);
+    }
+
+    #[test]
+    fn the_ignore_file_itself_is_hidden_from_the_index() {
+        let (_dir, root) = fixture(&[("kept.rs", "x"), (".loreignore", "")]);
+        assert_eq!(walk(&root), ["kept.rs"]);
+    }
 }
