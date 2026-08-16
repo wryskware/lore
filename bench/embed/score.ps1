@@ -38,7 +38,12 @@ foreach ($r in $runs) {
 
         $per = foreach ($s in $searches) {
             $rel = $key[$s.id]; if (-not $rel) { continue }
-            $paths = @($s.results | ForEach-Object { Norm $_.path })
+            # Results are chunks; several chunks of one file must count as one
+            # ranked entry or DCG exceeds its ideal. Collapse to unique paths,
+            # first occurrence wins.
+            $seen = @{}
+            $paths = @($s.results | ForEach-Object { Norm $_.path } | Where-Object {
+                if ($seen.ContainsKey($_)) { $false } else { $seen[$_] = 1; $true } })
             $firstHit = 0
             for ($i = 0; $i -lt [math]::Min($paths.Count, 10); $i++) {
                 if ($paths[$i] -in $rel) { $firstHit = $i + 1; break }
