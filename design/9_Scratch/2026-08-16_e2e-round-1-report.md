@@ -3,7 +3,11 @@
 **Round 1 of D-0009's e2e benchmark is complete: 60 canonical cells** — 2
 models (luna = openai/gpt-5.6-luna high, qwen = ollama qwen3.8 128k) × 3
 repos (lore-bench, terrarium-bench, Lexomancy) × 2 arms (lore MCP on/off) ×
-5 tasks. Luna ran 2026-08-15, qwen 2026-08-16. Protocol authority:
+5 tasks. Luna ran 2026-08-15, qwen 2026-08-16; **luna/terrarium (both arms)
+was re-run 2026-08-16 on the qwen3-4b embedding backend** so that pair is
+apples-to-apples with the qwen day, and the re-run is canonical for it.
+Luna's lore-bench and Lexomancy cells still carry the old nomic backend
+(see Validity). Protocol authority:
 `2026-08-15_e2e-round-1-{plan,answer-key}.md`. Quality **scores are not in
 this report** — grading against the answer key is Wrysk's pass; every
 `metrics.json` has `score: null` until then. Everything below is what the
@@ -11,10 +15,11 @@ harness measures: wall, tokens, tool calls, lore adoption.
 
 ## Headline (pending grading)
 
-- **Luna + lore: cheaper and faster overall** (−14% input tokens, −15%
-  wall), with the entire win concentrated in Lexomancy — the one repo too
-  big to grep casually. On the two small repos the on-arm was flat to
-  mildly *more* expensive.
+- **Luna + lore: cheaper and faster overall** (−17% input tokens, −24%
+  wall on the canonical set), with the entire win concentrated in
+  Lexomancy — the one repo too big to grep casually. On the two small
+  repos the on-arm was flat to mildly *more* expensive, on both embedding
+  backends.
 - **Qwen + lore (unsteered): no cost win** (+23% input tokens overall). It
   adopted lore in 11/15 on-cells but shallowly (1–3 calls), and its
   run-to-run variance (up to 3× input tokens on the same cell) dominates
@@ -26,12 +31,14 @@ harness measures: wall, tokens, tool calls, lore adoption.
 
 ## Totals
 
-| model | arm | wall | input tok | output tok | tool calls | lore calls |
-|---|---|---|---|---|---|---|
-| luna | off | 38m49s | 1,236,914 | 44,814 | 561 | 0 |
-| luna | on  | 33m08s | 1,065,459 | 41,510 | 512 | 41 |
-| qwen | off | 31m23s | 6,733,968 | 111,617 | 266 | 0 |
-| qwen | on  | 34m46s | 8,296,570 | 146,441 | 292 | 29 |
+Luna rows use the canonical set (terrarium = the 08-16 re-run).
+
+| model | arm | wall   | input tok | output tok | tool calls | lore calls |
+| ----- | --- | ------ | --------- | ---------- | ---------- | ---------- |
+| luna  | off | 42m34s | 1,250,863 | 45,573     | 562        | 0          |
+| luna  | on  | 32m11s | 1,033,208 | 41,479     | 513        | 40         |
+| qwen  | off | 31m23s | 6,733,968 | 111,617    | 266        | 0          |
+| qwen  | on  | 34m46s | 8,296,570 | 146,441    | 292        | 29         |
 
 Qwen burns ~6× luna's input tokens for the same matrix — no prompt caching
 through ollama and much noisier exploration; free locally, but the 128k
@@ -53,15 +60,22 @@ noise-dominated** (see Replicates); luna's are stable enough to read.
 | T4 | 25s | 19,471 | 9 | 28s | 25,055 | 8 | 4 | +29% |
 | T5 | 245s | 59,894 | 37 | 273s | 81,704 | 31 | 1 | +36% |
 
-### luna / terrarium-bench
+### luna / terrarium-bench (canonical = 08-16 re-run, qwen3-4b embeddings)
 
 | task | off wall | off in | off tools | on wall | on in | on tools | lore | din |
 |---|---|---|---|---|---|---|---|---|
-| T1 | 168s | 121,130 | 65 | 223s | 143,077 | 77 | 2 | +18% |
-| T2 | 86s | 50,178 | 32 | 77s | 72,585 | 27 | 3 | +45% |
-| T3 | 112s | 75,531 | 39 | 136s | 107,930 | 46 | 1 | +43% |
-| T4 | 46s | 42,152 | 17 | 51s | 29,926 | 15 | 1 | −29% |
-| T5 | 157s | 56,911 | 44 | 193s | 69,918 | 38 | 1 | +23% |
+| T1 | 184s | 133,539 | 78 | 192s | 131,818 | 70 | 2 | −1% |
+| T2 | 55s | 47,305 | 22 | 91s | 76,475 | 31 | 2 | +62% |
+| T3 | 364s | 84,290 | 43 | 131s | 87,233 | 49 | 1 | +3% |
+| T4 | 45s | 37,960 | 18 | 32s | 30,739 | 8 | 1 | −19% |
+| T5 | 147s | 56,757 | 37 | 179s | 64,920 | 46 | 1 | +14% |
+
+Backend effect (same cells on the 08-15 nomic run, din old → new):
+T1 +18%→−1%, T2 +45%→+62%, T3 +43%→+3%, T4 −29%→−19%, T5 +23%→+14%.
+Adoption unchanged (7 vs 8 lore calls). Direction favors qwen3-4b mildly
+(arm total: on-arm din +22% nomic → +9% qwen3-4b) but single runs of a
+noisy measure — the T3 off-cell alone swung 112s→364s between days. Read
+it as "backend didn't change the story," not as a measured improvement.
 
 ### luna / Lexomancy
 
@@ -98,20 +112,20 @@ T2 finishes in 4 tool calls instead of 25.
 
 ### qwen / Lexomancy
 
-| task | off wall | off in | off tools | on wall | on in | on tools | lore | din |
-|---|---|---|---|---|---|---|---|---|
-| T1 | 91s | 298,691 | 30 | 85s | 462,198 | 25 | 2 | +55% |
-| T2 | 36s | 81,905 | 8 | 33s | 48,435 | 3 | 3 | −41% |
-| T3 | 72s | 47,380 | 7 | 81s | 421,659 | 21 | 2 | +790% |
-| T4 | 35s | 207,872 | 14 | 12s | 43,358 | 2 | 2 | −79% |
-| T5 | 979s | 4,314,299 | 89 | 883s | 3,797,663 | 78 | 2 | −12% |
+| task | off wall | off in    | off tools | on wall | on in     | on tools | lore | din   |
+| ---- | -------- | --------- | --------- | ------- | --------- | -------- | ---- | ----- |
+| T1   | 91s      | 298,691   | 30        | 85s     | 462,198   | 25       | 2    | +55%  |
+| T2   | 36s      | 81,905    | 8         | 33s     | 48,435    | 3        | 3    | −41%  |
+| T3   | 72s      | 47,380    | 7         | 81s     | 421,659   | 21       | 2    | +790% |
+| T4   | 35s      | 207,872   | 14        | 12s     | 43,358    | 2        | 2    | −79%  |
+| T5   | 979s     | 4,314,299 | 89        | 883s    | 3,797,663 | 78       | 2    | −12%  |
 
 ## Lore adoption (on-arm: lore calls / total tool calls)
 
 | repo | luna T1 | T2 | T3 | T4 | T5 | qwen T1 | T2 | T3 | T4 | T5 |
 |---|---|---|---|---|---|---|---|---|---|---|
 | lore | 2/31 | 3/11 | 1/27 | 4/8 | 1/31 | 12/12 | 2/8 | 0/17 | 2/2 | 0/46 |
-| terrarium | 2/77 | 3/27 | 1/46 | 1/15 | 1/38 | 1/19 | 0/12 | 0/13 | 1/2 | 0/32 |
+| terrarium | 2/70 | 2/31 | 1/49 | 1/8 | 1/46 | 1/19 | 0/12 | 0/13 | 1/2 | 0/32 |
 | lexomancy | 3/56 | 4/4 | 3/48 | 6/19 | 6/74 | 2/25 | 3/3 | 2/21 | 2/2 | 2/78 |
 
 Luna touched lore in **15/15** on-cells; qwen in **11/15**. The on-arm ran
@@ -140,14 +154,21 @@ stand.)
 
 ## Validity notes / incidents
 
-- **Embedding backend (qwen day only)**: daemon embeddings served by a
-  RunPod TEI pod (Qwen3-Embedding-4B fp16) via `scripts/embed-remote-proxy.py`
-  (commit 1697ef0) — the 5090 can't hold qwen3.8 + the local embedder.
-  Store vectors untouched (fingerprint unchanged; GGUF↔fp16 cosine
-  ≥0.9995 verified on probes). Local stack restored after the run. Luna day
-  used the local llama-server. Query-embedding latency differs a little
-  between days; retrieval results should not.
-- **Canonical cell set**: 30 luna (all first-run) + 30 qwen. For qwen,
+- **Embedding backends are mixed across the luna set**: the qwen matrix
+  and the canonical luna/terrarium re-run used a RunPod TEI pod
+  (Qwen3-Embedding-4B fp16) via `scripts/embed-remote-proxy.py`
+  (commit 1697ef0) — the 5090 can't hold qwen3.8 + the local embedder, and
+  the luna re-run kept the same backend for comparability. Store vectors
+  untouched throughout (fingerprint unchanged; GGUF↔fp16 cosine ≥0.9995
+  verified on probes). **Luna's lore-bench and Lexomancy cells (08-15)
+  still ran on the old nomic-embed-text index** — cross-model comparison
+  on those two repos carries that caveat; re-run them the same way if
+  grading makes them load-bearing. Local llama-server stack restored after
+  each stint.
+- **Canonical cell set**: 30 luna (lore/lexomancy first-run 08-15;
+  terrarium = the 08-16 re-run, both arms) + 30 qwen. The superseded 08-15
+  luna/terrarium cells remain on disk as the nomic-backend observation
+  (used in the backend-effect note). For qwen,
   the graded T5 cells are the re-runs (see next point) and lexomancy-off-T1
   is the 020450 re-run; `x-`-prefixed dirs and the two dead wedge cells
   (003804, 013529 — exit −1, killed by hand) are excluded from every table.
