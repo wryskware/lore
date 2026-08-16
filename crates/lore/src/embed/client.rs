@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::EmbeddingsConfig;
 
-use super::text::{MAX_EMBED_TEXT_BYTES, truncate_bytes};
+use super::text::truncate_bytes;
 
 /// Total request-text budget for one batch. Independent of item count: the
 /// point is to keep a single POST small enough that a modest local server
@@ -120,6 +120,8 @@ pub struct EmbedSettings {
     /// [`crate::embed::worker`], not by the client — one `embed` call is still
     /// one sequence of POSTs.
     pub concurrency: usize,
+    /// Per-input byte budget; every input is clipped to this before the wire.
+    pub max_embed_bytes: usize,
     pub retry: RetryPolicy,
     pub request_timeout: Duration,
 }
@@ -135,6 +137,7 @@ impl std::fmt::Debug for EmbedSettings {
             .field("document_prefix", &self.document_prefix)
             .field("batch_max_items", &self.batch_max_items)
             .field("concurrency", &self.concurrency)
+            .field("max_embed_bytes", &self.max_embed_bytes)
             .field("retry", &self.retry)
             .field("request_timeout", &self.request_timeout)
             .finish()
@@ -157,6 +160,9 @@ impl EmbedSettings {
             document_prefix: config.document_prefix.clone(),
             batch_max_items: config.batch_max_items.max(1),
             concurrency: config.concurrency.max(1),
+            // Floor: prefix + header must survive the clip, or every input
+            // for a chunk collapses to the same truncated stub.
+            max_embed_bytes: config.max_embed_bytes.max(256),
             retry: RetryPolicy::default(),
             request_timeout: REQUEST_TIMEOUT,
         })
@@ -214,7 +220,7 @@ impl EmbedClient {
         }
         let clipped: Vec<&str> = texts
             .iter()
-            .map(|text| truncate_bytes(text, MAX_EMBED_TEXT_BYTES))
+            .map(|text| truncate_bytes(text, self.settings.max_embed_bytes))
             .collect();
 
         let mut out = Vec::with_capacity(texts.len());
@@ -233,7 +239,7 @@ impl EmbedClient {
     /// guess. Returns the observed vector width.
     pub async fn probe(&self) -> Result<usize, EmbedError> {
         let vectors = self
-            .embed_batch(&[truncate_bytes(PROBE_INPUT, MAX_EMBED_TEXT_BYTES)])
+            .embed_batch(&[truncate_bytes(PROBE_INPUT, self.settings.max_embed_bytes)])
             .await?;
         vectors
             .first()
@@ -406,7 +412,7 @@ struct EmbeddingDatum {
 ///
 /// An item that exceeds `max_bytes` on its own still gets its own batch —
 /// progress beats obedience, and the caller has already clipped every input to
-/// [`MAX_EMBED_TEXT_BYTES`], which is far below any sane byte budget.
+/// [`EmbedSettings::max_embed_bytes`], which is far below any sane byte budget.
 pub fn batches<'a, 'b>(
     texts: &'a [&'b str],
     max_items: usize,
@@ -567,11 +573,13 @@ mod tests {
             endpoint: Some("http://127.0.0.1:8080/v1".into()),
             batch_max_items: 0,
             concurrency: 0,
+            max_embed_bytes: 0,
             ..EmbeddingsConfig::default()
         };
         let settings = EmbedSettings::from_config(&config).unwrap();
         assert_eq!(settings.batch_max_items, 1);
         assert_eq!(settings.concurrency, 1);
+        assert_eq!(settings.max_embed_bytes, 256);
 
         let defaults = EmbeddingsConfig {
             endpoint: Some("http://127.0.0.1:8080/v1".into()),
@@ -581,6 +589,10 @@ mod tests {
         assert_eq!(
             settings.concurrency,
             crate::config::DEFAULT_EMBED_CONCURRENCY
+        );
+        assert_eq!(
+            settings.max_embed_bytes,
+            crate::config::DEFAULT_MAX_EMBED_BYTES
         );
     }
 }

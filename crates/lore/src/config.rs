@@ -26,6 +26,12 @@ pub const DEFAULT_BATCH_MAX_ITEMS: usize = 64;
 /// whole round-trip of every batch.
 pub const DEFAULT_EMBED_CONCURRENCY: usize = 4;
 
+/// Embed-text byte budget when the file says nothing — the historical 8 KiB
+/// ceiling from [`crate::embed::text::MAX_EMBED_TEXT_BYTES`]. Keeping the
+/// default equal to the old constant means upgrading lore does not change any
+/// vector, so no existing vault re-embeds.
+pub const DEFAULT_MAX_EMBED_BYTES: usize = crate::embed::text::MAX_EMBED_TEXT_BYTES;
+
 /// Model id sent (and fingerprinted) when the file names no model.
 ///
 /// `llama-server` ignores the field entirely, so requiring it would block the
@@ -57,6 +63,13 @@ pub struct EmbeddingsConfig {
     /// pipeline. Deliberately *not* part of the embedding fingerprint: it
     /// changes when vectors arrive, never what they are.
     pub concurrency: usize,
+    /// Byte budget for one embed input (prefix + header + chunk text; the
+    /// tail of the text is clipped to fit). Servers that reject rather than
+    /// truncate oversized inputs (llama-server's 400) need this to sit under
+    /// the model's per-slot token window at a *conservative* bytes-per-token
+    /// ratio — dense JSON tokenizes near 2 bytes/token, not prose's 4. Part
+    /// of the fingerprint: clipping changes what a vector is.
+    pub max_embed_bytes: usize,
     /// Sent as `Authorization: Bearer …`. Local servers usually ignore it,
     /// but some (llama-server started with `--api-key`) demand *something*.
     /// Absent ⇒ no header at all.
@@ -73,6 +86,7 @@ impl Default for EmbeddingsConfig {
             document_prefix: String::new(),
             batch_max_items: DEFAULT_BATCH_MAX_ITEMS,
             concurrency: DEFAULT_EMBED_CONCURRENCY,
+            max_embed_bytes: DEFAULT_MAX_EMBED_BYTES,
             api_key: None,
         }
     }

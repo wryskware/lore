@@ -548,5 +548,6 @@ pub fn fingerprint(settings: &super::client::EmbedSettings) -> EmbeddingFingerpr
         query_prefix: settings.query_prefix.clone(),
         document_prefix: settings.document_prefix.clone(),
         normalization: NORMALIZATION.to_string(),
+        max_embed_bytes: settings.max_embed_bytes as u32,
     }
 }

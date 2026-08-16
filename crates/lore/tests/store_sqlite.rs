@@ -900,6 +900,7 @@ fn embedding_fingerprint_set_get_clear() {
         query_prefix: "query: ".into(),
         document_prefix: "passage: ".into(),
         normalization: "l2".into(),
+        max_embed_bytes: 8 * 1024,
     };
     store.set_embedding_fingerprint(&fp).unwrap();
     assert_eq!(store.embedding_fingerprint().unwrap().as_ref(), Some(&fp));

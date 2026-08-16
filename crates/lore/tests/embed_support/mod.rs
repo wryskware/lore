@@ -347,6 +347,7 @@ pub fn settings(base: &str) -> lore::embed::EmbedSettings {
         // backlog batch by batch, sees exactly the order it asks for. The
         // tests that are *about* overlap raise it themselves.
         concurrency: 1,
+        max_embed_bytes: lore::embed::text::MAX_EMBED_TEXT_BYTES,
         retry: lore::embed::RetryPolicy {
             max_attempts: 4,
             base_delay: std::time::Duration::from_millis(5),

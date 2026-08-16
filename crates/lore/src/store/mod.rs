@@ -264,6 +264,16 @@ pub struct EmbeddingFingerprint {
     pub document_prefix: String,
     /// Free-form normalization tag, e.g. "l2".
     pub normalization: String,
+    /// Per-input byte budget the clip was applied at. Defaults to the
+    /// historical 8 KiB when absent, so a fingerprint stored before this
+    /// field existed compares equal under an unchanged config instead of
+    /// forcing a pointless full re-embed.
+    #[serde(default = "default_max_embed_bytes")]
+    pub max_embed_bytes: u32,
+}
+
+fn default_max_embed_bytes() -> u32 {
+    8 * 1024
 }
 
 /// Per-project index counts plus the store-wide generation.
@@ -1265,6 +1275,16 @@ mod tests {
             text: text.into(),
             vault: None,
         }
+    }
+
+    /// A fingerprint stored before `max_embed_bytes` existed must read as the
+    /// historical 8 KiB, or every upgraded vault re-embeds for nothing.
+    #[test]
+    fn fingerprint_without_a_byte_budget_reads_as_the_historical_default() {
+        let old = r#"{"model_id":"m","dimensions":768,"query_prefix":"q: ",
+                      "document_prefix":"d: ","normalization":"l2"}"#;
+        let fp: EmbeddingFingerprint = serde_json::from_str(old).unwrap();
+        assert_eq!(fp.max_embed_bytes, 8 * 1024);
     }
 
     #[test]
