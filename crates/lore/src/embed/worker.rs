@@ -20,7 +20,23 @@
 //! blocking pool and takes the store lock for exactly one call — one batch
 //! fetch, one batch upsert. A full backlog is therefore thousands of short
 //! lock acquisitions interleaved with `/v1/search`, not one long one. Network
-//! time, which dominates, holds no lock at all.
+//! time, which dominates, holds no lock at all. Concurrent batches do not
+//! change that: they are more of the same short independent calls, which the
+//! store's mutex serializes as it does every other caller.
+//!
+//! # Concurrency
+//!
+//! `concurrency` batches are in flight at once (`1` = the serial pipeline).
+//! A local server serves several requests at a time, and one batch at a time
+//! leaves it idle for every round-trip and every upsert.
+//!
+//! Claiming stays single-threaded. Chunks only leave
+//! `chunks_missing_embeddings` when their batch is upserted, so a second
+//! claimer would hand the same chunk to two batches; instead the drain loop is
+//! the only caller of [`EmbedWorker::next_batch`] and records the claim before
+//! it awaits anything. Claims are filtered exactly like poison, and live only
+//! for the pass — a pass never returns while a batch it issued is still out,
+//! so an abandoned claim cannot outlive it.
 //!
 //! # Poison chunks
 //!
@@ -39,6 +55,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Notify;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::daemon::store_handle::StoreHandle;
@@ -46,7 +63,7 @@ use crate::store::{EmbedCandidate, EmbeddingFingerprint, NewEmbedding, ProjectId
 use crate::types::ChunkId;
 
 use super::client::EmbedClient;
-use super::health::Health;
+use super::health::{Health, Ticket};
 use super::text;
 
 /// Fallback wake-up when no indexer pulse arrives. The pulse is the real
@@ -226,71 +243,106 @@ impl EmbedWorker {
 
     /// Embed until nothing is missing, cancellation arrives, or the endpoint
     /// stops cooperating.
+    ///
+    /// Issues up to `concurrency` batches before waiting on any of them. Once
+    /// something goes wrong no further batch is issued, but the ones already
+    /// out are awaited rather than abandoned — their vectors are as good as
+    /// any other batch's, and a claim must not outlive the pass that made it.
     pub async fn drain(&mut self) -> Drained {
+        let limit = self.client.settings().concurrency.max(1);
+        let mut in_flight: JoinSet<Batch> = JoinSet::new();
+        let mut claimed = Claimed::new();
+        // Why this pass stopped issuing, once it has.
+        let mut stop: Option<Drained> = None;
+
         loop {
-            if self.cancel.is_cancelled() {
-                return Drained::Interrupted;
-            }
-
-            let batch = match self.next_batch().await {
-                Some(batch) if !batch.is_empty() => batch,
-                Some(_) => return Drained::Idle,
-                None => return Drained::Interrupted,
-            };
-
-            let prefix = self.client.settings().document_prefix.clone();
-            let texts: Vec<String> = batch
-                .iter()
-                .map(|candidate| text::document_text(&candidate.chunk, &prefix))
-                .collect();
-
-            // Claimed before the request, so a batch that took seconds to fail
-            // cannot demote health a later probe has already restored.
-            let ticket = self.health.ticket();
-            let embedded = tokio::select! {
-                () = self.cancel.cancelled() => return Drained::Interrupted,
-                result = self.client.embed(&texts) => result,
-            };
-
-            match embedded {
-                Ok(vectors) => {
-                    if !self.store_vectors(&batch, vectors).await {
-                        return Drained::Interrupted;
+            while stop.is_none() && in_flight.len() < limit {
+                if self.cancel.is_cancelled() {
+                    stop = Some(Drained::Interrupted);
+                    break;
+                }
+                match self.next_batch(&claimed).await {
+                    Some(batch) if !batch.is_empty() => {
+                        self.issue(&mut in_flight, &mut claimed, batch)
                     }
-                }
-                Err(err) if err.is_permanent() => {
-                    tracing::error!(
-                        error = %err,
-                        chunks = batch.len(),
-                        first_path = %batch[0].chunk.path,
-                        "endpoint rejected a batch outright; those chunks stay unembedded"
-                    );
-                    self.poison(&batch);
-                    ticket.set_unreachable(self.client.endpoint(), err.to_string());
-                    return Drained::Interrupted;
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, chunks = batch.len(), "embedding batch failed; will retry later");
-                    ticket.set_unreachable(self.client.endpoint(), err.to_string());
-                    return Drained::Interrupted;
+                    // Nothing left *that is not already claimed*: the batches
+                    // still out may well be the last of the backlog.
+                    Some(_) => break,
+                    None => stop = Some(Drained::Interrupted),
                 }
             }
 
-            // Be a good citizen on the runtime between batches.
-            tokio::task::yield_now().await;
+            // Reached only with the walk exhausted or `stop` set, so `Idle`
+            // here really does mean "backlog empty and nothing in flight".
+            let Some(joined) = in_flight.join_next().await else {
+                return stop.unwrap_or(Drained::Idle);
+            };
+            let outcome = match joined {
+                Ok(batch) => self.settle(batch, &mut claimed),
+                Err(err) => {
+                    tracing::error!(error = %err, "an embed batch task did not finish");
+                    Some(Drained::Interrupted)
+                }
+            };
+            if let Some(outcome) = outcome {
+                stop.get_or_insert(outcome);
+            }
+        }
+    }
+
+    /// Claim `batch` and put it on the wire.
+    fn issue(
+        &self,
+        in_flight: &mut JoinSet<Batch>,
+        claimed: &mut Claimed,
+        batch: Vec<EmbedCandidate>,
+    ) {
+        claimed.extend(batch.iter().map(key));
+        // Claimed before the request, so a batch that took seconds to fail
+        // cannot demote health a later probe has already restored. One ticket
+        // per batch: concurrent batches are independent observations.
+        let ticket = self.health.ticket();
+        in_flight.spawn(embed_batch(
+            self.store.clone(),
+            self.client.clone(),
+            ticket,
+            self.cancel.clone(),
+            batch,
+        ));
+    }
+
+    /// Release a finished batch's claims and record what it did. `Some` when
+    /// this pass must stop issuing.
+    fn settle(&mut self, batch: Batch, claimed: &mut Claimed) -> Option<Drained> {
+        for candidate in &batch.candidates {
+            claimed.remove(&key(candidate));
+        }
+        match batch.outcome {
+            Outcome::Stored { degenerate } => {
+                self.poison(&degenerate);
+                None
+            }
+            Outcome::Rejected => {
+                self.poison(&batch.candidates);
+                Some(Drained::Interrupted)
+            }
+            Outcome::Failed | Outcome::StoreFailed | Outcome::Cancelled => {
+                Some(Drained::Interrupted)
+            }
         }
     }
 
     /// `None` on a store failure; an empty vec **only** when the query walked
     /// off the end of the missing set.
     ///
-    /// Poisoned chunks are filtered after the query, so a page that filters
-    /// away entirely is not an empty backlog — it is a page to step over. The
-    /// rowid cursor makes that distinction; without it the oldest poisoned
-    /// rows fill every request forever and everything behind them starves.
-    /// The walk terminates because each page either yields work or consumes
-    /// poisoned rows from a set capped at [`MAX_POISONED`].
-    async fn next_batch(&self) -> Option<Vec<EmbedCandidate>> {
+    /// Poisoned and in-flight chunks are filtered after the query, so a page
+    /// that filters away entirely is not an empty backlog — it is a page to
+    /// step over. The rowid cursor makes that distinction; without it the
+    /// oldest poisoned rows fill every request forever and everything behind
+    /// them starves. The walk terminates because each page either yields work
+    /// or consumes rows from two bounded sets: poison, capped at
+    /// [`MAX_POISONED`], and the claims of at most `concurrency` batches.
+    async fn next_batch(&self, claimed: &Claimed) -> Option<Vec<EmbedCandidate>> {
         let want = self.client.settings().batch_max_items.max(1);
         // Independent of `want`: the walk fills a batch larger than one page
         // from several pages, so hydrated rows stay bounded whatever the
@@ -319,10 +371,8 @@ impl EmbedWorker {
 
             for candidate in fetched {
                 cursor = cursor.max(candidate.rowid);
-                if !self
-                    .poisoned
-                    .contains(&(candidate.project, candidate.chunk.id.clone()))
-                {
+                let key = key(&candidate);
+                if !self.poisoned.contains(&key) && !claimed.contains(&key) {
                     batch.push(candidate);
                     if batch.len() == want {
                         return Some(batch);
@@ -336,49 +386,6 @@ impl EmbedWorker {
         }
     }
 
-    /// Returns false on a store failure (the caller stops this pass).
-    async fn store_vectors(&mut self, batch: &[EmbedCandidate], vectors: Vec<Vec<f32>>) -> bool {
-        let mut items = Vec::with_capacity(batch.len());
-        let mut degenerate = Vec::new();
-        for (candidate, vector) in batch.iter().zip(vectors) {
-            // The store rejects an unusable vector for the whole transaction;
-            // catching it here keeps one bad vector from blocking the batch
-            // (and then the batch from blocking the backlog, forever). The
-            // predicate is the store's own, so the two cannot drift apart.
-            if crate::store::vector::is_usable(&vector) {
-                items.push(NewEmbedding {
-                    project: candidate.project,
-                    chunk_id: candidate.chunk.id.clone(),
-                    vector,
-                });
-            } else {
-                degenerate.push(candidate.clone());
-            }
-        }
-        if !degenerate.is_empty() {
-            tracing::warn!(
-                chunks = degenerate.len(),
-                "model returned unusable vectors (empty, zero-length or non-finite); skipping those chunks"
-            );
-            self.poison(&degenerate);
-        }
-
-        match self.store.with(move |s| s.upsert_embeddings(&items)).await {
-            Ok(Ok(stored)) => {
-                tracing::debug!(stored, "stored embeddings");
-                true
-            }
-            Ok(Err(err)) => {
-                tracing::warn!(error = %err, "storing embeddings failed");
-                false
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "store task failed while writing embeddings");
-                false
-            }
-        }
-    }
-
     fn poison(&mut self, batch: &[EmbedCandidate]) {
         for candidate in batch {
             if self.poisoned.len() >= MAX_POISONED {
@@ -388,10 +395,7 @@ impl EmbedWorker {
                 );
                 break;
             }
-            if self
-                .poisoned
-                .insert((candidate.project, candidate.chunk.id.clone()))
-            {
+            if self.poisoned.insert(key(candidate)) {
                 self.skipped += 1;
             }
         }
@@ -402,6 +406,133 @@ impl EmbedWorker {
         tokio::select! {
             () = self.cancel.cancelled() => false,
             _ = tokio::time::sleep(duration) => true,
+        }
+    }
+}
+
+/// Chunks a batch in flight has taken responsibility for. Same shape as the
+/// poison set, and filtered at the same point, so `next_batch` cannot hand a
+/// chunk to a second batch while the first is still out.
+type Claimed = HashSet<(ProjectId, ChunkId)>;
+
+fn key(candidate: &EmbedCandidate) -> (ProjectId, ChunkId) {
+    (candidate.project, candidate.chunk.id.clone())
+}
+
+/// A finished batch, handed back to the drain loop.
+struct Batch {
+    candidates: Vec<EmbedCandidate>,
+    outcome: Outcome,
+}
+
+enum Outcome {
+    /// Written, apart from vectors the store would have refused.
+    Stored { degenerate: Vec<EmbedCandidate> },
+    /// The store itself refused the write.
+    StoreFailed,
+    /// A 4xx: this exact request will never succeed, so these chunks are
+    /// poison.
+    Rejected,
+    /// Unreachable or still failing after every retry; retry the chunks later.
+    Failed,
+    /// Cancelled before the endpoint answered — nothing observed, so nothing
+    /// published to health either.
+    Cancelled,
+}
+
+/// One batch, start to finish, as its own task so several overlap on the
+/// endpoint.
+///
+/// Health is published from here rather than from the drain loop because the
+/// [`Ticket`] is the point: it was claimed before this request started, and a
+/// verdict from a batch that took seconds to fail must not land on top of a
+/// probe that has since said the endpoint is back.
+async fn embed_batch(
+    store: StoreHandle,
+    client: Arc<EmbedClient>,
+    ticket: Ticket,
+    cancel: CancellationToken,
+    candidates: Vec<EmbedCandidate>,
+) -> Batch {
+    let prefix = &client.settings().document_prefix;
+    let texts: Vec<String> = candidates
+        .iter()
+        .map(|candidate| text::document_text(&candidate.chunk, prefix))
+        .collect();
+
+    let embedded = tokio::select! {
+        () = cancel.cancelled() => {
+            return Batch { candidates, outcome: Outcome::Cancelled };
+        }
+        result = client.embed(&texts) => result,
+    };
+
+    let outcome = match embedded {
+        Ok(vectors) => store_vectors(&store, &candidates, vectors).await,
+        Err(err) if err.is_permanent() => {
+            tracing::error!(
+                error = %err,
+                chunks = candidates.len(),
+                first_path = %candidates[0].chunk.path,
+                "endpoint rejected a batch outright; those chunks stay unembedded"
+            );
+            ticket.set_unreachable(client.endpoint(), err.to_string());
+            Outcome::Rejected
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, chunks = candidates.len(), "embedding batch failed; will retry later");
+            ticket.set_unreachable(client.endpoint(), err.to_string());
+            Outcome::Failed
+        }
+    };
+    Batch {
+        candidates,
+        outcome,
+    }
+}
+
+/// One short [`StoreHandle::with`] call, whatever else is in flight.
+async fn store_vectors(
+    store: &StoreHandle,
+    batch: &[EmbedCandidate],
+    vectors: Vec<Vec<f32>>,
+) -> Outcome {
+    let mut items = Vec::with_capacity(batch.len());
+    let mut degenerate = Vec::new();
+    for (candidate, vector) in batch.iter().zip(vectors) {
+        // The store rejects an unusable vector for the whole transaction;
+        // catching it here keeps one bad vector from blocking the batch
+        // (and then the batch from blocking the backlog, forever). The
+        // predicate is the store's own, so the two cannot drift apart.
+        if crate::store::vector::is_usable(&vector) {
+            items.push(NewEmbedding {
+                project: candidate.project,
+                chunk_id: candidate.chunk.id.clone(),
+                vector,
+            });
+        } else {
+            degenerate.push(candidate.clone());
+        }
+    }
+    if !degenerate.is_empty() {
+        tracing::warn!(
+            chunks = degenerate.len(),
+            "model returned unusable vectors (empty, zero-length or non-finite); skipping those chunks"
+        );
+    }
+
+    match store.with(move |s| s.upsert_embeddings(&items)).await {
+        Ok(Ok(stored)) => {
+            tracing::debug!(stored, "stored embeddings");
+            Outcome::Stored { degenerate }
+        }
+        Ok(Err(err)) => {
+            tracing::warn!(error = %err, "storing embeddings failed");
+            Outcome::StoreFailed
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "store task failed while writing embeddings");
+            Outcome::StoreFailed
         }
     }
 }

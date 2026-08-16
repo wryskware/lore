@@ -1,7 +1,7 @@
 //! `config.toml` parsing. Config is the one thing a user edits by hand, so
 //! its failure modes matter more than its happy path.
 
-use lore::config::{Config, DEFAULT_BATCH_MAX_ITEMS};
+use lore::config::{Config, DEFAULT_BATCH_MAX_ITEMS, DEFAULT_EMBED_CONCURRENCY};
 use lore_core::EmbeddingStatus;
 
 /// Exactly the example from design/3_Retrieval/3.1 §"Embedding provider
@@ -33,6 +33,19 @@ fn documented_example_parses_field_for_field() {
     assert_eq!(embeddings.query_prefix, "");
     assert_eq!(embeddings.document_prefix, "");
     assert_eq!(embeddings.batch_max_items, 64);
+    // Not in the documented example, and adding a key must stay additive for
+    // files written before it existed.
+    assert_eq!(embeddings.concurrency, DEFAULT_EMBED_CONCURRENCY);
+}
+
+#[test]
+fn concurrency_is_optional_and_defaults_to_several_batches_in_flight() {
+    assert_eq!(DEFAULT_EMBED_CONCURRENCY, 4);
+    let config = Config::parse("[embeddings]\nconcurrency = 1\n").expect("an explicit 1 parses");
+    assert_eq!(config.embeddings.concurrency, 1);
+    let config = Config::parse("[embeddings]\nconcurrency = 0\n").expect("a zero parses");
+    // Clamped where it is used, not at parse time, so the file round-trips.
+    assert_eq!(config.embeddings.concurrency, 0);
 }
 
 #[test]
@@ -46,6 +59,7 @@ fn empty_file_and_missing_file_are_the_same_thing() {
     assert_eq!(missing, empty);
 
     assert_eq!(missing.embeddings.batch_max_items, DEFAULT_BATCH_MAX_ITEMS);
+    assert_eq!(missing.embeddings.concurrency, DEFAULT_EMBED_CONCURRENCY);
     assert!(missing.embeddings.endpoint.is_none());
 }
 

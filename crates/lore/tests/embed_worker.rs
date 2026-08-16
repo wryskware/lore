@@ -4,6 +4,7 @@ mod daemon_support;
 mod embed_support;
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use daemon_support::{Fixture, populate_standard_tree};
 use embed_support::{POISON, Reply, Stub, settings, until};
@@ -304,6 +305,205 @@ async fn one_unusable_vector_does_not_block_its_batch() {
     assert_eq!(worker.drain().await, Drained::Idle);
     assert_eq!(rig.counts(), (3, 2), "the valid peers were stored");
     assert_eq!(worker.skipped(), 1);
+    rig.stub.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency
+// ---------------------------------------------------------------------------
+
+/// Seed `count` distinct documents, one chunk each, in rowid order.
+fn seed(rig: &Rig, count: usize) {
+    for i in 0..count {
+        rig.fixture.write(
+            &format!("docs/d{i:02}.md"),
+            format!("# D{i:02}\n\nDocument number {i}.\n"),
+        );
+    }
+    full_scan(&rig.fixture.context(), &rig.fixture.project);
+    assert_eq!(rig.counts().0 as usize, count, "one chunk per seeded file");
+}
+
+/// A local server answers several requests at once; one batch at a time leaves
+/// those slots idle for every round-trip. Overlap is measured *server-side*,
+/// because that is the only place the question has an honest answer.
+#[tokio::test]
+async fn batches_overlap_on_the_endpoint() {
+    const CHUNKS: usize = 16;
+    const LIMIT: usize = 4;
+
+    let rig = Rig::with("demo", |settings| {
+        settings.batch_max_items = 1;
+        settings.concurrency = LIMIT;
+    })
+    .await;
+    seed(&rig, CHUNKS);
+    // Long enough that batches issued back to back are provably on the wire
+    // together rather than merely quick.
+    rig.stub.state.set_delay(Duration::from_millis(50));
+
+    let mut worker = rig.worker();
+    worker.reconcile_fingerprint().await.unwrap();
+    assert!(worker.probe().await);
+    assert_eq!(worker.drain().await, Drained::Idle);
+    assert_eq!(rig.counts().1 as usize, CHUNKS, "every chunk still lands");
+
+    let peak = rig.stub.state.max_in_flight();
+    assert!(peak > 1, "batches never overlapped (peak {peak})");
+    assert!(peak <= LIMIT, "{peak} in flight with concurrency = {LIMIT}");
+    rig.stub.shutdown().await;
+}
+
+/// The claim rule, stated as an observable: a chunk stays in
+/// `chunks_missing_embeddings` until its batch is upserted, so a second
+/// claimer would send it again — paying twice for a vector and racing two
+/// writes onto one row. Several batches *and* several fetch pages, because the
+/// paging walk restarts from rowid 0 and would otherwise re-offer whatever is
+/// still in flight.
+#[tokio::test]
+async fn no_chunk_is_sent_to_the_endpoint_twice() {
+    const CHUNKS: usize = 20;
+
+    let rig = Rig::with("demo", |settings| {
+        settings.batch_max_items = 2;
+        settings.concurrency = 4;
+    })
+    .await;
+    seed(&rig, CHUNKS);
+    rig.stub.state.set_delay(Duration::from_millis(20));
+
+    let mut worker = rig.worker();
+    worker.set_page_rows(4);
+    worker.reconcile_fingerprint().await.unwrap();
+    assert!(worker.probe().await);
+    assert_eq!(worker.drain().await, Drained::Idle);
+    assert_eq!(rig.counts().1 as usize, CHUNKS);
+
+    let sent = rig.stub.state.inputs();
+    let unique: std::collections::HashSet<&String> = sent.iter().collect();
+    assert_eq!(unique.len(), sent.len(), "an input was embedded twice");
+    // 20 chunks, 2 per batch, plus the probe.
+    assert_eq!(sent.len(), CHUNKS + 1);
+    assert_eq!(rig.stub.state.batches().len(), CHUNKS / 2 + 1);
+    rig.stub.shutdown().await;
+}
+
+/// A 4xx while other batches are on the wire. The rejected batch is poison and
+/// the pass stops, but the peers already in flight are finished rather than
+/// thrown away — their vectors cost the same GPU time either way, and D-0007
+/// wants the failure visible, not the progress lost.
+#[tokio::test]
+async fn a_rejected_batch_stops_the_pass_without_discarding_its_peers() {
+    const CHUNKS: usize = 12;
+    const LIMIT: usize = 4;
+
+    let rig = Rig::with("demo", |settings| {
+        settings.batch_max_items = 1;
+        settings.concurrency = LIMIT;
+    })
+    .await;
+    seed(&rig, CHUNKS);
+    rig.stub.state.set_delay(Duration::from_millis(30));
+
+    let mut worker = rig.worker();
+    worker.reconcile_fingerprint().await.unwrap();
+    assert!(worker.probe().await);
+    // Refuse the first batch to reach the endpoint — which of them it is does
+    // not matter, only that three peers are on the wire behind it.
+    rig.stub.state.script([Reply::Status(400)]);
+
+    assert_eq!(worker.drain().await, Drained::Interrupted);
+    assert!(rig.stub.state.max_in_flight() > 1, "nothing was concurrent");
+    assert_eq!(worker.skipped(), 1, "only the refused batch is poison");
+    assert!(
+        rig.counts().1 >= (LIMIT - 1) as u64,
+        "the peers of the rejected batch were discarded: {:?}",
+        rig.counts()
+    );
+    assert!(
+        rig.stub.state.batches().len() < CHUNKS,
+        "the rejection did not stop the pass issuing"
+    );
+    assert!(!rig.embedder.health().is_ready(), "degraded, visibly");
+
+    // The rest still drains once the endpoint answers again, and the refused
+    // batch is never offered a second time.
+    let mut passes = 0;
+    while worker.probe().await && worker.drain().await != Drained::Idle && passes < 10 {
+        passes += 1;
+    }
+    assert_eq!(rig.counts(), (CHUNKS as u64, CHUNKS as u64 - 1));
+    let sent = rig.stub.state.inputs();
+    let chunks_sent: Vec<&String> = sent
+        .iter()
+        .filter(|input| input.contains("Document number"))
+        .collect();
+    let unique: std::collections::HashSet<&&String> = chunks_sent.iter().collect();
+    assert_eq!(
+        unique.len(),
+        chunks_sent.len(),
+        "a chunk was embedded twice"
+    );
+    assert_eq!(chunks_sent.len(), CHUNKS, "the refused batch was re-sent");
+    rig.stub.shutdown().await;
+}
+
+/// Shutdown must not wait out the requests already on the wire.
+#[tokio::test]
+async fn cancellation_settles_a_concurrent_drain_promptly() {
+    const CHUNKS: usize = 24;
+    const DELAY: Duration = Duration::from_millis(500);
+
+    let rig = Rig::with("demo", |settings| {
+        settings.batch_max_items = 1;
+        settings.concurrency = 4;
+    })
+    .await;
+    seed(&rig, CHUNKS);
+    rig.stub.state.set_delay(DELAY);
+
+    let task = tokio::spawn(rig.worker().run());
+    until("several batches to be on the wire", || {
+        rig.stub.state.in_flight() > 1
+    })
+    .await;
+
+    let cancelled = Instant::now();
+    rig.cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("the worker stopped without waiting for the endpoint")
+        .expect("the worker task did not panic");
+    assert!(
+        cancelled.elapsed() < DELAY / 2,
+        "shutdown waited {:?} on in-flight requests",
+        cancelled.elapsed()
+    );
+    rig.stub.shutdown().await;
+}
+
+/// `concurrency = 1` is the pipeline as it was: one request on the wire at a
+/// time, one batch per chunk, nothing overlapping.
+#[tokio::test]
+async fn concurrency_of_one_is_the_serial_pipeline() {
+    const CHUNKS: usize = 8;
+
+    let rig = Rig::with("demo", |settings| {
+        settings.batch_max_items = 1;
+        settings.concurrency = 1;
+    })
+    .await;
+    seed(&rig, CHUNKS);
+    rig.stub.state.set_delay(Duration::from_millis(10));
+
+    let mut worker = rig.worker();
+    worker.reconcile_fingerprint().await.unwrap();
+    assert!(worker.probe().await);
+    assert_eq!(worker.drain().await, Drained::Idle);
+
+    assert_eq!(rig.counts().1 as usize, CHUNKS);
+    assert_eq!(rig.stub.state.max_in_flight(), 1, "requests overlapped");
+    assert_eq!(rig.stub.state.batches().len(), CHUNKS + 1, "probe + 8");
     rig.stub.shutdown().await;
 }
 

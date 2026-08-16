@@ -116,6 +116,10 @@ pub struct EmbedSettings {
     pub query_prefix: String,
     pub document_prefix: String,
     pub batch_max_items: usize,
+    /// Batches the worker may have in flight at once. Read by
+    /// [`crate::embed::worker`], not by the client — one `embed` call is still
+    /// one sequence of POSTs.
+    pub concurrency: usize,
     pub retry: RetryPolicy,
     pub request_timeout: Duration,
 }
@@ -130,6 +134,7 @@ impl std::fmt::Debug for EmbedSettings {
             .field("query_prefix", &self.query_prefix)
             .field("document_prefix", &self.document_prefix)
             .field("batch_max_items", &self.batch_max_items)
+            .field("concurrency", &self.concurrency)
             .field("retry", &self.retry)
             .field("request_timeout", &self.request_timeout)
             .finish()
@@ -151,6 +156,7 @@ impl EmbedSettings {
             query_prefix: config.query_prefix.clone(),
             document_prefix: config.document_prefix.clone(),
             batch_max_items: config.batch_max_items.max(1),
+            concurrency: config.concurrency.max(1),
             retry: RetryPolicy::default(),
             request_timeout: REQUEST_TIMEOUT,
         })
@@ -551,5 +557,30 @@ mod tests {
         assert_eq!(settings.model, crate::config::DEFAULT_MODEL_ID);
         let client = EmbedClient::new(settings).unwrap();
         assert_eq!(client.url, "http://127.0.0.1:8080/v1/embeddings");
+    }
+
+    /// A zero here would otherwise mean "never issue a batch", i.e. a backlog
+    /// that silently never drains.
+    #[test]
+    fn sizes_are_clamped_to_something_that_makes_progress() {
+        let config = EmbeddingsConfig {
+            endpoint: Some("http://127.0.0.1:8080/v1".into()),
+            batch_max_items: 0,
+            concurrency: 0,
+            ..EmbeddingsConfig::default()
+        };
+        let settings = EmbedSettings::from_config(&config).unwrap();
+        assert_eq!(settings.batch_max_items, 1);
+        assert_eq!(settings.concurrency, 1);
+
+        let defaults = EmbeddingsConfig {
+            endpoint: Some("http://127.0.0.1:8080/v1".into()),
+            ..EmbeddingsConfig::default()
+        };
+        let settings = EmbedSettings::from_config(&defaults).unwrap();
+        assert_eq!(
+            settings.concurrency,
+            crate::config::DEFAULT_EMBED_CONCURRENCY
+        );
     }
 }

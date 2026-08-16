@@ -91,11 +91,33 @@ pub struct StubState {
     /// Milliseconds to stall before answering, so a test can act while the
     /// worker is provably mid-drain rather than racing it.
     pub delay_ms: AtomicUsize,
+    /// Requests being served right now, and the most ever at once. Measured
+    /// server-side because that is the only place the question "did the client
+    /// actually overlap its batches?" has an honest answer.
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
 }
 
 impl StubState {
     pub fn attempts(&self) -> usize {
         self.attempts.load(Ordering::SeqCst)
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+
+    /// High-water mark of concurrent requests, over the stub's whole life.
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Count this request in for as long as the guard lives — including the
+    /// early-return paths, which is why it is a guard and not a pair of calls.
+    fn enter(self: &Arc<Self>) -> Busy {
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        Busy(self.clone())
     }
 
     pub fn set_delay(&self, delay: std::time::Duration) {
@@ -114,6 +136,14 @@ impl StubState {
 
     pub fn script(&self, replies: impl IntoIterator<Item = Reply>) {
         *self.script.lock().unwrap() = replies.into_iter().collect();
+    }
+}
+
+struct Busy(Arc<StubState>);
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -184,6 +214,7 @@ impl Drop for Stub {
 }
 
 async fn embeddings(State(state): State<Arc<StubState>>, body: String) -> Response {
+    let _busy = state.enter();
     state.attempts.fetch_add(1, Ordering::SeqCst);
 
     let request: Value = match serde_json::from_str(&body) {
@@ -312,6 +343,10 @@ pub fn settings(base: &str) -> lore::embed::EmbedSettings {
         query_prefix: String::new(),
         document_prefix: String::new(),
         batch_max_items: 8,
+        // Serial by default so a test that counts requests, or that walks the
+        // backlog batch by batch, sees exactly the order it asks for. The
+        // tests that are *about* overlap raise it themselves.
+        concurrency: 1,
         retry: lore::embed::RetryPolicy {
             max_attempts: 4,
             base_delay: std::time::Duration::from_millis(5),

@@ -20,6 +20,12 @@ pub const CONFIG_FILE: &str = "config.toml";
 /// Batch size used by the embedding pipeline when the file says nothing.
 pub const DEFAULT_BATCH_MAX_ITEMS: usize = 64;
 
+/// Batches the embed worker keeps in flight at once when the file says
+/// nothing. Local servers serve several requests at a time (llama-server's
+/// default is four slots), and a serial worker leaves those slots idle for the
+/// whole round-trip of every batch.
+pub const DEFAULT_EMBED_CONCURRENCY: usize = 4;
+
 /// Model id sent (and fingerprinted) when the file names no model.
 ///
 /// `llama-server` ignores the field entirely, so requiring it would block the
@@ -47,6 +53,10 @@ pub struct EmbeddingsConfig {
     pub query_prefix: String,
     pub document_prefix: String,
     pub batch_max_items: usize,
+    /// Batches the worker may have in flight at once; `1` is the serial
+    /// pipeline. Deliberately *not* part of the embedding fingerprint: it
+    /// changes when vectors arrive, never what they are.
+    pub concurrency: usize,
     /// Sent as `Authorization: Bearer …`. Local servers usually ignore it,
     /// but some (llama-server started with `--api-key`) demand *something*.
     /// Absent ⇒ no header at all.
@@ -62,6 +72,7 @@ impl Default for EmbeddingsConfig {
             query_prefix: String::new(),
             document_prefix: String::new(),
             batch_max_items: DEFAULT_BATCH_MAX_ITEMS,
+            concurrency: DEFAULT_EMBED_CONCURRENCY,
             api_key: None,
         }
     }
