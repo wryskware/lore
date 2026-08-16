@@ -16,3 +16,4 @@ Before using or editing design material, read `design/0_Canon/README.md` and the
 - Work directly on `main`; push feature commits there. Commit early, commit often — small, logical units with clear messages.
 - Feature branches + `git worktree` only for truly parallel tasks; merge back promptly.
 - Standard hygiene otherwise: don't mix unrelated changes in one commit; design-vault edits and code changes are separate commits when practical; never rewrite pushed history.
+- Run `cargo fmt --all` before every commit that touches Rust code. CI enforces this with `cargo fmt --all --check` and fails the build on unformatted code.
