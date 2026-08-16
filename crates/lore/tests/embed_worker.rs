@@ -626,7 +626,9 @@ async fn concurrency_of_one_is_the_serial_pipeline() {
 
 /// A query embedding can stall for seconds while a probe answers in
 /// milliseconds. The slow one's verdict must not land on top of the fast one's
-/// — D-0007 wants the *current* state reported, not the last one written.
+/// — D-0007 wants the *current* state reported, not the last one written. Its
+/// timeout no longer publishes at all (#5), but everything else it can observe
+/// still does, and still from a ticket claimed before the request.
 #[tokio::test]
 async fn a_stale_failure_cannot_demote_a_newer_probe() {
     let rig = Rig::new("demo").await;
@@ -638,10 +640,10 @@ async fn a_stale_failure_cannot_demote_a_newer_probe() {
     assert!(worker.probe().await);
     assert!(health.is_ready());
 
-    in_flight.set_unreachable(&rig.stub.base, "query embedding timed out after 3000ms");
+    in_flight.set_unreachable(&rig.stub.base, "query embedding failed: connection reset");
     assert!(
         health.is_ready(),
-        "a stale timeout demoted a newer successful probe"
+        "a stale failure demoted a newer successful probe"
     );
     assert!(matches!(
         rig.embedder.status(),

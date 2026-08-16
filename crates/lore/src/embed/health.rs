@@ -241,7 +241,7 @@ mod tests {
 
     /// The S2#8 race, in the order it happens: a long query starts, a batch
     /// failure and then a successful probe both complete, and only then does
-    /// the query's timeout arrive. It must not resurrect the failure.
+    /// the query's own failure arrive. It must not resurrect the batch's.
     #[test]
     fn an_older_observation_cannot_overwrite_a_newer_one() {
         let health = Health::new(EmbeddingStatus::Unconfigured);
@@ -252,8 +252,8 @@ mod tests {
         let probe = health.ticket();
         probe.set_ready("http://e/v1", "jina");
 
-        query.set_unreachable("http://e/v1", "query embedding timed out");
-        assert!(health.is_ready(), "a stale timeout demoted a newer probe");
+        query.set_unreachable("http://e/v1", "query embedding failed");
+        assert!(health.is_ready(), "a stale failure demoted a newer probe");
 
         // The newest ticket still wins, so a real outage is still reported.
         health.ticket().set_unreachable("http://e/v1", "gone");
