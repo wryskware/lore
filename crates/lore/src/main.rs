@@ -19,6 +19,13 @@ enum Command {
     Daemon,
     /// Register a project directory with the daemon.
     Add { path: String },
+    /// Write a project's `.loreignore` from the ecosystems it looks like.
+    ///
+    /// Never overwrites an existing one, and needs no running daemon.
+    Init {
+        /// Project directory. Defaults to the current directory.
+        path: Option<String>,
+    },
     /// Trigger (re)indexing of a registered project.
     Index { project: Option<String> },
     /// Show daemon and index status.
@@ -42,6 +49,7 @@ fn main() -> anyhow::Result<()> {
     match args.command {
         Command::Daemon => daemon(),
         Command::Add { path } => cli::run(cli::add(path)),
+        Command::Init { path } => cli::init(path),
         Command::Index { project } => cli::run(cli::index(project)),
         Command::Status { json, project } => cli::run(cli::status(json, project)),
         Command::Search(search) => cli::run(cli::search(search)),

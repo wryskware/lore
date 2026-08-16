@@ -108,6 +108,11 @@ pub fn full_scan(ctx: &IndexContext, project: &Project) -> PassSummary {
     let started = Instant::now();
     let mut summary = PassSummary::default();
 
+    // Before the walk, not after: the file this may create is what the walk
+    // immediately obeys. Never fatal — a root that cannot be written to falls
+    // back to the walker's built-in exclusions instead of aborting the scan.
+    super::ignorefile::ensure(&project.root);
+
     let files = walk::walk_files(
         &project.root,
         &project.root,

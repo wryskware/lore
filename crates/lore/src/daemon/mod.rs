@@ -26,6 +26,7 @@
 pub mod expand;
 pub mod handshake;
 pub mod http;
+pub mod ignorefile;
 pub mod index;
 pub mod latency;
 pub mod ownership;

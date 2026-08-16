@@ -584,8 +584,10 @@ fn route(events: Vec<DebouncedEvent>, watches: &Watches, queue: &IndexQueue, dat
                 if walk::is_excluded_rel(&rel) {
                     // Exception: the ignore rules themselves changed, so what
                     // is indexable changed with them — only a rescan can tell
-                    // how.
-                    if rel.file_name() == Some(".gitignore") {
+                    // how. Both files, because `.loreignore` is the one a user
+                    // is actually invited to edit.
+                    let name = rel.file_name();
+                    if name == Some(".gitignore") || name == Some(walk::LORE_IGNORE_FILE) {
                         tracing::info!(project = %project.name, "ignore rules changed; scheduling rescan");
                         queue.request_full(project.id);
                     }

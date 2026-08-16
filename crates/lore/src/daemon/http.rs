@@ -41,7 +41,7 @@ use crate::store::Project;
 use super::queue::IndexQueue;
 use super::store_handle::StoreHandle;
 use super::watch::{WatchCommand, WatchSender, WatchStatus};
-use super::{expand, paths, search};
+use super::{expand, ignorefile, paths, search};
 
 /// Request bodies are small JSON documents; a megabyte is generous for the
 /// largest realistic one (a pasted query) and cheap insurance otherwise.
@@ -318,6 +318,16 @@ async fn register_project(
         id = project.id,
         "project registered"
     );
+
+    // The exclusion policy is written the moment the project is enrolled, so
+    // it exists before the first scan and before the user goes looking for
+    // it. `spawn_blocking` because detection reads directories, and the first
+    // scan would only redo this work anyway.
+    {
+        let root = project.root.clone();
+        let _ = tokio::task::spawn_blocking(move || ignorefile::ensure(&root)).await;
+    }
+
     let _ = state.watch.send(WatchCommand::Watch(project.clone()));
     state.queue.request_full(project.id);
 

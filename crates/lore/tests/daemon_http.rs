@@ -154,6 +154,13 @@ async fn registering_a_project_lists_it_watches_it_and_queues_a_scan() {
     let (queued, work) = h.queue.take().expect("an initial scan was queued");
     assert_eq!(queued, id);
     assert!(work.full);
+
+    // …and its exclusion policy is on disk before the scan runs, so the user
+    // can see and edit it without waiting for anything.
+    assert!(
+        other.path().join(".loreignore").is_file(),
+        "registration should have generated a .loreignore"
+    );
 }
 
 #[tokio::test]

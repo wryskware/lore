@@ -122,7 +122,13 @@ impl Fixture {
 /// A small but realistic project: code, vault-style Markdown, a `.gitignore`
 /// with both a directory and a glob rule, plus every category of thing that
 /// must never be indexed.
+///
+/// The `.loreignore` is written explicitly, exactly as `lore init` (or the
+/// first scan) would have produced it for this tree. Without it the walker's
+/// in-memory fallback would be doing the work instead, and this fixture would
+/// silently stop covering the file that is meant to be the real mechanism.
 pub fn populate_standard_tree(fixture: &Fixture) {
+    fixture.write(".loreignore", "target/\nnode_modules/\nLibrary/\n");
     fixture.write(
         "src/lib.rs",
         "pub fn alpha() -> u32 {\n    41\n}\n\npub fn beta() -> u32 {\n    alpha() + 1\n}\n",

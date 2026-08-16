@@ -8,6 +8,9 @@
 //! Registration and reindex live here and *only* here (design 4.1): agents get
 //! `search`/`expand`/`status` over MCP and nothing that enrolls a directory.
 //!
+//! The exception is `init`, which writes a file into the project and talks to
+//! nothing at all.
+//!
 //! ## Why the renderer is duplicated
 //!
 //! `crates/lore-mcp/src/render.rs` renders the same three responses into nearly
@@ -24,6 +27,7 @@ use std::future::Future;
 
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
+use lore::daemon::ignorefile;
 use lore_core::discovery;
 use lore_core::{
     DaemonStatus, EmbeddingStatus, ExpandResponse, IndexRequest, IndexResponse, ProjectInfo,
@@ -111,6 +115,38 @@ pub async fn add(path: String) -> Result<()> {
     println!("registered {} (key {})", project.name, project.key);
     println!("  {}", project.root);
     Ok(())
+}
+
+/// `lore init [path]` — write the project's `.loreignore`.
+///
+/// The one subcommand that needs no daemon: the file belongs to the project,
+/// not to the index, and it is useful to look at (and edit) before anything
+/// has been registered. Synchronous for the same reason — there is nothing to
+/// await.
+pub fn init(path: Option<String>) -> Result<()> {
+    let root = absolute_utf8(path.as_deref().unwrap_or("."))?;
+    if !root.is_dir() {
+        bail!("not a directory: {root}");
+    }
+
+    match ignorefile::write_new(&root) {
+        Ok(ecosystems) => {
+            println!("wrote {}", ignorefile::path(&root));
+            if ecosystems.is_empty() {
+                println!("  no ecosystem detected; the file is a header and nothing else");
+            } else {
+                println!("  detected: {}", ignorefile::labels(&ecosystems));
+            }
+            println!("  edit it to change what lore indexes; lore will not rewrite it");
+            Ok(())
+        }
+        // Not an accident to recover from: refusing is the promise the header
+        // of a generated file makes, so the fix is the user's to make.
+        Err(ignorefile::WriteError::Exists(path)) => bail!(
+            "{path} already exists, and lore never rewrites it.\nDelete it and run `lore init` again to regenerate."
+        ),
+        Err(err) => Err(anyhow::Error::new(err)),
+    }
 }
 
 /// `lore index [project]` — queue a full rescan.

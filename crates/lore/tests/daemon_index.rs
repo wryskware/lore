@@ -55,15 +55,13 @@ fn every_exclusion_category_is_enforced() {
     let excluded = [
         ("ignored/secret.txt", "gitignored directory"),
         ("noisy.log", "gitignored glob"),
-        ("target/debug/build.rs", "hard-excluded build output"),
-        ("node_modules/pkg/index.js", "hard-excluded dependency tree"),
-        (
-            "Library/ScriptAssemblies/Asm.cs",
-            "hard-excluded Unity tree",
-        ),
-        (".vs/state.txt", "hard-excluded editor state"),
+        ("target/debug/build.rs", ".loreignore build output"),
+        ("node_modules/pkg/index.js", ".loreignore dependency tree"),
+        ("Library/ScriptAssemblies/Asm.cs", ".loreignore Unity tree"),
+        (".vs/state.txt", "hidden editor state"),
         (".hidden/notes.txt", "hidden directory"),
         (".gitignore", "hidden file"),
+        (".loreignore", "hidden file"),
     ];
     for (path, why) in excluded {
         assert!(
@@ -71,6 +69,53 @@ fn every_exclusion_category_is_enforced() {
             "{path} must not be indexed ({why}); indexed = {indexed:?}"
         );
     }
+}
+
+/// The exclusion policy is a file in the project, so a scan of a project that
+/// has none writes one — and the same pass then obeys what it wrote.
+#[test]
+fn a_full_scan_generates_the_loreignore_and_then_honours_it() {
+    let fixture = Fixture::new("demo");
+    fixture.write("Cargo.toml", "[package]\nname = \"demo\"\n");
+    fixture.write("src/lib.rs", "pub fn a() {}\n");
+    fixture.write("target/debug/build.rs", "fn generated() {}\n");
+    let generated = fixture.root.join(".loreignore");
+    assert!(!generated.exists());
+
+    full_scan(&fixture.context(), &fixture.project);
+
+    let body = std::fs::read_to_string(&generated).expect("the scan should have written it");
+    assert!(body.contains("\n# Rust (Cargo.toml)\ntarget/\n"), "{body}");
+    assert!(
+        !fixture
+            .indexed_paths()
+            .contains(&"target/debug/build.rs".to_string()),
+        "{:?}",
+        fixture.indexed_paths()
+    );
+}
+
+/// Generated once and then left alone — including when the edit is "index
+/// everything after all".
+#[test]
+fn a_later_scan_never_rewrites_the_users_loreignore() {
+    let fixture = Fixture::new("demo");
+    fixture.write("Cargo.toml", "[package]\nname = \"demo\"\n");
+    fixture.write("target/debug/build.rs", "fn generated() {}\n");
+    full_scan(&fixture.context(), &fixture.project);
+
+    let generated = fixture.root.join(".loreignore");
+    std::fs::write(&generated, "# mine now\n").unwrap();
+    full_scan(&fixture.context(), &fixture.project);
+
+    assert_eq!(std::fs::read_to_string(&generated).unwrap(), "# mine now\n");
+    assert!(
+        fixture
+            .indexed_paths()
+            .contains(&"target/debug/build.rs".to_string()),
+        "an emptied file is an escape hatch, not a no-op: {:?}",
+        fixture.indexed_paths()
+    );
 }
 
 /// The gitignore rules apply without `git init` — a project is usually
@@ -368,24 +413,35 @@ fn a_file_that_became_ignored_is_dropped_from_the_index() {
     assert_eq!(fixture.indexed_paths(), ["README.md"]);
 }
 
+/// Two layers, and where the line between them sits matters. Only `.git` and
+/// hidden paths are rejected on the name alone; a build tree is rejected by
+/// the project's `.loreignore`, which costs a directory listing but is a rule
+/// the user can read and change.
 #[test]
-fn incremental_pass_ignores_excluded_paths_without_touching_disk() {
+fn an_incremental_pass_indexes_neither_hidden_nor_ignored_paths() {
     let fixture = Fixture::new("demo");
     populate_standard_tree(&fixture);
     full_scan(&fixture.context(), &fixture.project);
 
-    let summary = index_paths(
+    let stat_free = index_paths(
         &fixture.context(),
         &fixture.project,
-        &paths(&[
-            "target/debug/build.rs",
-            "node_modules/pkg/index.js",
-            ".vs/state.txt",
-        ]),
+        &paths(&[".vs/state.txt", ".git/config"]),
+    );
+    assert_eq!(
+        stat_free.seen, 0,
+        "the disk is never consulted: {stat_free:?}"
     );
 
-    assert_eq!(summary.seen, 0);
-    assert_eq!(summary.indexed, 0);
-    assert_eq!(summary.removed, 0);
+    let ignored = index_paths(
+        &fixture.context(),
+        &fixture.project,
+        &paths(&["target/debug/build.rs", "node_modules/pkg/index.js"]),
+    );
+    assert_eq!(ignored.indexed, 0, "{ignored:?}");
+    assert_eq!(
+        ignored.removed, 0,
+        "they were never indexed, so there is nothing to remove: {ignored:?}"
+    );
     assert_eq!(fixture.indexed_paths(), STANDARD_TREE_INDEXED);
 }
