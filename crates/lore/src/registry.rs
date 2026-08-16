@@ -308,6 +308,9 @@ fn apply(store: &mut Store, data_dir: &Utf8Path, manifest: Manifest) -> Result<R
     let known: HashMap<String, ProjectId> =
         before.iter().map(|p| (root_key(&p.root), p.id)).collect();
     let mut taken: HashSet<String> = HashSet::new();
+    // Display names already claimed, and by which root — the root is what
+    // makes the warning actionable.
+    let mut named: HashMap<String, Utf8PathBuf> = HashMap::new();
 
     let mut listed: HashSet<String> = HashSet::new();
     let mut normalized: Vec<ManifestEntry> = Vec::with_capacity(manifest.projects.len());
@@ -326,6 +329,29 @@ fn apply(store: &mut Store, data_dir: &Utf8Path, manifest: Manifest) -> Result<R
                 .unwrap_or(entry.root.as_str())
                 .to_string();
         }
+        // `POST /v1/projects` refuses a name another root already holds, but a
+        // hand-edited manifest can walk straight past that door and recreate
+        // the ambiguity — two projects one display name, so `expand(project,
+        // …)` and `lore search --project` resolve to whichever sorted first
+        // (S1#3). Refusing to start over it would be worse: the manifest is
+        // the durable registry, and a typo in a text file must not cost the
+        // user their daemon. So the later duplicate is renamed
+        // deterministically, loudly, and in a way that round-trips — the
+        // manifest is rewritten below, so the next start sees distinct names
+        // and changes nothing.
+        if let Some(first) = named.get(&entry.name) {
+            let clashed = entry.name.clone();
+            entry.name = distinct_name(&clashed, &named);
+            tracing::warn!(
+                name = %clashed,
+                first_claimed_by = %first,
+                renamed_to = %entry.name,
+                root = %entry.root,
+                "two projects in the registry claim one display name; renaming the later one. \
+                 Edit projects.toml (or that repo's .lore.toml) to give it a name you chose"
+            );
+        }
+        named.insert(entry.name.clone(), entry.root.clone());
         if entry.key.is_empty() || !taken.insert(entry.key.clone()) {
             if !entry.key.is_empty() {
                 tracing::warn!(key = %entry.key, root = %entry.root, "duplicate project key in the registry; reassigning");
@@ -380,6 +406,21 @@ fn apply(store: &mut Store, data_dir: &Utf8Path, manifest: Manifest) -> Result<R
         updated,
         removed,
     })
+}
+
+/// A display name not already claimed, derived from `name`.
+///
+/// `lore (2)` rather than a hash suffix: this string is what a human reads in
+/// `lore status` and types after `--project`, and the point of the rename is
+/// that they notice it and choose something better. The counter skips over a
+/// name that is itself already taken, so the result is unique however odd the
+/// manifest is — and it is a function of the manifest's order alone, so
+/// reconciling the same file twice produces the same names.
+fn distinct_name(name: &str, taken: &HashMap<String, Utf8PathBuf>) -> String {
+    (2..)
+        .map(|n| format!("{name} ({n})"))
+        .find(|candidate| !taken.contains_key(candidate))
+        .expect("an unbounded sequence contains a free name")
 }
 
 /// Rewrite the manifest from the current contents of the `projects` table.

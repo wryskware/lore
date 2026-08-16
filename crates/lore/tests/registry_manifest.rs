@@ -311,6 +311,88 @@ fn a_manifest_with_duplicate_keys_reassigns_instead_of_losing_a_project() {
     );
 }
 
+/// `POST /v1/projects` 409s on a display name another root already holds, but
+/// a hand-edited manifest walks straight past that door — and two projects
+/// sharing a name is the ambiguity that makes `expand(project, …)` resolve the
+/// wrong source (S1#3).
+///
+/// Reconciliation enforces it instead, without refusing to start: a typo in a
+/// text file must not cost the user their daemon, so the later duplicate is
+/// renamed loudly and both projects survive.
+#[test]
+fn a_manifest_with_duplicate_display_names_renames_rather_than_refusing() {
+    let mut fixture = Fixture::new();
+    registry::write(
+        &fixture.data_dir,
+        &Manifest {
+            projects: vec![
+                entry("lore", "lore", "C:/repos/lore"),
+                entry("worktree", "lore", "C:/repos/lore-worktree"),
+                entry("bench", "lore", "C:/repos/lore-bench"),
+            ],
+        },
+    )
+    .unwrap();
+
+    fixture.reconcile();
+    let names: Vec<String> = fixture.rows().into_iter().map(|(name, ..)| name).collect();
+    assert_eq!(names, ["lore", "lore (2)", "lore (3)"], "{names:?}");
+    // Keys are untouched: they are the stable handle, and the clash was never
+    // theirs.
+    assert_eq!(
+        fixture
+            .rows()
+            .into_iter()
+            .map(|(_, key, _)| key)
+            .collect::<Vec<_>>(),
+        ["lore", "worktree", "bench"]
+    );
+
+    // The manifest is authoritative and gets republished, so the repair has to
+    // round-trip: the next start must see distinct names and change nothing.
+    assert_eq!(
+        fixture
+            .manifest()
+            .projects
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>(),
+        names
+    );
+    fixture.reconcile();
+    assert_eq!(
+        fixture
+            .rows()
+            .into_iter()
+            .map(|(name, ..)| name)
+            .collect::<Vec<_>>(),
+        names,
+        "reconciling twice must not rename anything a second time"
+    );
+}
+
+/// The counter steps over a name that is genuinely taken rather than
+/// colliding with it, so the result is unique whatever the manifest says.
+#[test]
+fn a_rename_never_collides_with_a_name_the_manifest_already_uses() {
+    let mut fixture = Fixture::new();
+    registry::write(
+        &fixture.data_dir,
+        &Manifest {
+            projects: vec![
+                entry("a", "lore", "C:/repos/one"),
+                entry("b", "lore (2)", "C:/repos/two"),
+                entry("c", "lore", "C:/repos/three"),
+            ],
+        },
+    )
+    .unwrap();
+
+    fixture.reconcile();
+    let names: Vec<String> = fixture.rows().into_iter().map(|(name, ..)| name).collect();
+    assert_eq!(names, ["lore", "lore (2)", "lore (3)"], "{names:?}");
+}
+
 /// The same root listed twice (a merge conflict resolved badly) must not
 /// produce two rows for one directory, which would double every search hit.
 #[test]
