@@ -22,14 +22,14 @@ Scratch/process doc — not design canon.
 ## Progress
 
 - **Session 1 complete:**
-  `design/99_Scratch/2026-08-14_adversarial-review-session-1.md`
+  `design/5_Implementation/reviews/2026-08-14_adversarial-review-session-1.md`
 - **Session 2 complete:**
-  `design/99_Scratch/2026-08-14_adversarial-review-session-2.md`
+  `design/5_Implementation/reviews/2026-08-14_adversarial-review-session-2.md`
 - **Session 3 complete:**
-  `design/99_Scratch/2026-08-14_adversarial-review-session-3.md`
+  `design/5_Implementation/reviews/2026-08-14_adversarial-review-session-3.md`
 - **Next:** Session 4 — test-suite quality audit.
 - Before starting a later session, read all existing
-  `design/99_Scratch/2026-08-14_adversarial-review-session-*.md` reports. Do not
+  `design/5_Implementation/reviews/2026-08-14_adversarial-review-session-*.md` reports. Do not
   repeat an identical finding; extend it with a distinct failure mode, stronger
   evidence, a correction, or a session-specific consequence.
 
@@ -170,7 +170,7 @@ frontmatter states its modality. The load-bearing decisions:
    that deferred choice materially harder, or a grounded feature/hardening idea
    in the separate observations section.
 7. Deliverable: write one self-contained Markdown report at
-   `design/99_Scratch/2026-08-14_adversarial-review-session-N.md`. Give it
+   `design/5_Implementation/reviews/2026-08-14_adversarial-review-session-N.md`. Give it
    `design_status: exploration` frontmatter so its D-number citations cannot be
    mistaken for canon. Rank formal findings most-severe first, then include
    smells/debts/improvements, then the session-specific deliverable. A concise
