@@ -263,7 +263,7 @@ async fn a_query_timeout_degrades_one_response_not_the_daemon() {
 
     // Every chunk has a vector; only the *query* embedding is now slow.
     stub.state.set_delay(std::time::Duration::from_millis(300));
-    let (status, body) = post(&h.router, "/v1/search", json!({ "query": QUERY })).await;
+    let (status, body) = search(&h.router, json!({ "query": QUERY })).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["lexical_only"], true, "{body:#}");
     assert_eq!(paths(&body), ["docs/one.md"], "results, not an error");
@@ -277,7 +277,7 @@ async fn a_query_timeout_degrades_one_response_not_the_daemon() {
     // And once the model is warm the very next query is hybrid again — no
     // probe, no cool-down, nothing to recover from.
     stub.state.set_delay(std::time::Duration::ZERO);
-    let (_, body) = post(&h.router, "/v1/search", json!({ "query": QUERY })).await;
+    let (_, body) = search(&h.router, json!({ "query": QUERY })).await;
     assert_eq!(body["lexical_only"], false, "{body:#}");
 
     stub.shutdown().await;
