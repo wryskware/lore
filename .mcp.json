@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "lore": {
+      "command": "lore-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
