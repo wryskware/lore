@@ -242,6 +242,43 @@ async fn an_endpoint_that_dies_degrades_the_next_request_to_lexical_only() {
     );
 }
 
+/// The same promise for the *slow* endpoint rather than the dead one (#5): a
+/// query that outruns its own deadline degrades that one response and nothing
+/// else. `/v1/status` must still say `ready`, because a model reloading after
+/// an idle timeout is not an unhealthy daemon — and reporting it as one had
+/// the daemon flapping between the two states, one search at a time.
+#[tokio::test]
+async fn a_query_timeout_degrades_one_response_not_the_daemon() {
+    let stub = Stub::start().await;
+    let mut embedder = Embedder::from_settings(settings(&stub.base));
+    embedder.set_query_timeout(std::time::Duration::from_millis(50));
+
+    let h = harness(embedder);
+    populate(&h.fixture);
+    embed_everything(&h).await;
+
+    // Every chunk has a vector; only the *query* embedding is now slow.
+    stub.state.set_delay(std::time::Duration::from_millis(300));
+    let (status, body) = post(&h.router, "/v1/search", json!({ "query": QUERY })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["lexical_only"], true, "{body:#}");
+    assert_eq!(paths(&body), ["docs/one.md"], "results, not an error");
+
+    let (_, status_body) = get(&h.router, "/v1/status").await;
+    assert_eq!(
+        status_body["embeddings"]["state"], "ready",
+        "one slow query demoted the whole daemon: {status_body:#}"
+    );
+
+    // And once the model is warm the very next query is hybrid again — no
+    // probe, no cool-down, nothing to recover from.
+    stub.state.set_delay(std::time::Duration::ZERO);
+    let (_, body) = post(&h.router, "/v1/search", json!({ "query": QUERY })).await;
+    assert_eq!(body["lexical_only"], false, "{body:#}");
+
+    stub.shutdown().await;
+}
+
 /// The vault-authority modifier applies to the fused ranking, so a *validated*
 /// `decided` document outranks an equally-relevant exploration one — and an
 /// unvalidated one does not. Same corpus, same query, same relevance: only the

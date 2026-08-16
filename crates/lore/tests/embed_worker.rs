@@ -698,6 +698,59 @@ async fn an_idle_pass_reprobes_a_stale_unreachable_instead_of_sleeping() {
     rig.stub.shutdown().await;
 }
 
+/// #5: the first search after the endpoint idles out its model pays a reload
+/// the query has no patience for. Running out of *this request's* patience is
+/// an observation about the deadline, not about the endpoint — a reloading
+/// model and a dead server look identical from here — so health survives it,
+/// and the worker is asked to go and settle the question now rather than at
+/// the next idle tick a minute away.
+#[tokio::test]
+async fn a_query_timeout_leaves_health_alone_and_asks_for_a_probe() {
+    // Nothing is indexed, so the only requests this worker makes are probes.
+    let mut rig = Rig::new("demo").await;
+    rig.embedder.set_query_timeout(Duration::from_millis(50));
+    // Slower than the query will wait, faster than a probe will.
+    rig.stub.state.set_delay(Duration::from_millis(250));
+
+    let probes = || {
+        rig.stub
+            .state
+            .inputs()
+            .iter()
+            .filter(|input| input.contains(lore::embed::client::PROBE_INPUT))
+            .count()
+    };
+
+    let task = tokio::spawn(rig.worker().run());
+    until("the worker's first probe to land", || {
+        rig.embedder.health().is_ready()
+    })
+    .await;
+    let before = probes();
+
+    assert!(
+        rig.embedder.embed_query("results ordering").await.is_none(),
+        "the query outlasted its own deadline, so it has no vector"
+    );
+    assert!(
+        rig.embedder.health().is_ready(),
+        "a query timeout demoted the endpoint: {:?}",
+        rig.embedder.status()
+    );
+
+    // Nothing pulses the worker and IDLE_TICK is 60s, so a probe arriving
+    // inside the helper's deadline can only be the one the timeout asked for.
+    until("the requested probe", || probes() > before).await;
+    assert!(
+        rig.embedder.health().is_ready(),
+        "the probe answered, so the endpoint was never unhealthy"
+    );
+
+    rig.cancel.cancel();
+    task.await.expect("the worker stops on cancellation");
+    rig.stub.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_transient_failure_leaves_the_backlog_for_later() {
     let rig = Rig::new("demo").await;

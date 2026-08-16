@@ -11,8 +11,16 @@
 //!                                   │             → embed → upsert_embeddings
 //!                                   │        │ nothing left
 //!                                   │        ▼
-//!                                   └──── wait: indexer pulse | 60s tick | cancel
+//!                                   └──── wait: indexer pulse | probe request
+//!                                               | 60s tick | cancel
 //! ```
+//!
+//! The probe request is [`Health::request_probe`], raised by a query embedding
+//! that timed out (#5). Such a query publishes no verdict of its own — a model
+//! reloading after an idle timeout is indistinguishable from a dead server at
+//! that distance — so the worker goes and asks, now rather than at the next
+//! idle tick. It is the one wake-up that probes even while health says
+//! `Ready`, because doubting a `Ready` is exactly what it is for.
 //!
 //! # Why it cannot starve search
 //!
@@ -215,12 +223,16 @@ impl EmbedWorker {
         }
 
         let mut backoff = PROBE_BACKOFF_START;
+        // Someone doubts the stored verdict — a query that timed out — so the
+        // next turn of the loop probes even if health currently reads `Ready`.
+        let mut recheck = false;
         loop {
             if self.cancel.is_cancelled() {
                 break;
             }
 
-            if !self.health.is_ready() {
+            if recheck || !self.health.is_ready() {
+                recheck = false;
                 if self.probe().await {
                     backoff = PROBE_BACKOFF_START;
                 } else {
@@ -245,6 +257,7 @@ impl EmbedWorker {
             tokio::select! {
                 () = self.cancel.cancelled() => break,
                 () = self.notify.notified() => {}
+                () = self.health.probe_requested() => recheck = true,
                 _ = tokio::time::sleep(IDLE_TICK) => {}
             }
         }

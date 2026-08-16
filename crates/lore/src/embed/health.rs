@@ -22,9 +22,21 @@
 //! written one. A writer about to make a slow observation takes a [`Ticket`]
 //! *before* the request; publishing through a ticket that a newer observation
 //! has already overtaken is dropped.
+//!
+//! # Why a request to re-probe lives here
+//!
+//! Some observations are too weak to publish but too strong to ignore: a query
+//! embedding that ran out of *its* patience says nothing about the endpoint —
+//! a model reloading after an idle timeout looks exactly like one that has
+//! died — but it is ample reason to go and ask. [`Health::request_probe`] is
+//! that ask, and it belongs next to the state it doubts: both sides of the
+//! question already hold this handle, so nothing new has to be threaded from
+//! the search path to the worker.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+
+use tokio::sync::Notify;
 
 use lore_core::EmbeddingStatus;
 
@@ -40,6 +52,8 @@ struct Inner {
     observed: RwLock<Observed>,
     /// Ticket dispenser. Monotonic for the life of the process.
     next: AtomicU64,
+    /// Raised when someone wants the stored verdict re-checked now.
+    probe_request: Notify,
 }
 
 #[derive(Clone, Debug)]
@@ -75,6 +89,7 @@ impl Health {
                     epoch: 0,
                 }),
                 next: AtomicU64::new(0),
+                probe_request: Notify::new(),
             }),
         }
     }
@@ -105,6 +120,20 @@ impl Health {
 
     pub fn set_unreachable(&self, endpoint: &str, error: impl Into<String>) {
         self.set(self.claim(), unreachable(endpoint, error));
+    }
+
+    /// Ask whoever probes this endpoint to do so now, without publishing an
+    /// opinion of your own. Cheap and idempotent: requests made while the
+    /// prober is busy collapse into the one it will honour next.
+    pub fn request_probe(&self) {
+        self.inner.probe_request.notify_one();
+    }
+
+    /// Resolves once [`Health::request_probe`] has been called. A request
+    /// raised while nobody is waiting is remembered, so one made during a
+    /// drain is honoured at the end of it rather than lost.
+    pub async fn probe_requested(&self) {
+        self.inner.probe_request.notified().await;
     }
 
     fn claim(&self) -> u64 {
@@ -229,6 +258,29 @@ mod tests {
         // The newest ticket still wins, so a real outage is still reported.
         health.ticket().set_unreachable("http://e/v1", "gone");
         assert!(!health.is_ready());
+    }
+
+    /// A re-probe request is remembered when nobody is waiting for it — the
+    /// worker is usually mid-drain when a query gives up — and several
+    /// requests cost one probe, not one each.
+    #[tokio::test]
+    async fn a_probe_request_survives_having_no_listener() {
+        let health = Health::new(EmbeddingStatus::Unconfigured);
+        health.request_probe();
+        health.request_probe();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), health.probe_requested())
+            .await
+            .expect("the request made before anyone waited was remembered");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                health.probe_requested()
+            )
+            .await
+            .is_err(),
+            "two requests must not cost two probes"
+        );
     }
 
     /// A ticket may publish repeatedly (a retrying writer), and an unversioned
