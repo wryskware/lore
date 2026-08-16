@@ -209,6 +209,16 @@ foreach ($modelId in $Models) {
             $run.corpora += $c.name
             Write-Host "  $($c.name): $($out.Count) queries"
         }
+        # Daemon-side latency percentiles (additive `latency` field on /status):
+        # global endpoints separate the embed-query wait (model cost) from the
+        # whole search handler; ?project= adds that corpus's store-scan window.
+        $lat = @{ global = (Invoke-RestMethod "$api/status" -TimeoutSec 15).latency }
+        foreach ($c in $allCorpora) {
+            $entry = (Invoke-RestMethod "$api/status?project=$([uri]::EscapeDataString($c.name))" -TimeoutSec 15).latency |
+                Where-Object endpoint -eq "search_store:$($c.name)"
+            if ($entry) { $lat[$c.name] = $entry }
+        }
+        $run.daemon_latency = $lat
         $sorted = $latencies | Sort-Object
         if ($sorted.Count) {
             $run.query_latency_ms = [ordered]@{

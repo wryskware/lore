@@ -32,7 +32,12 @@ def main() -> None:
             state = ev["part"].get("state") or {}
             t = state.get("time") or {}
             if "start" in t and "end" in t:
-                by_tool.setdefault(ev["part"].get("tool", "?"), []).append(t["end"] - t["start"])
+                tool = ev["part"].get("tool", "?")
+                key = tool
+                if tool.startswith("lore_"):
+                    project = (state.get("input") or {}).get("project") or "all"
+                    key = f"{tool}[{project}]"
+                by_tool.setdefault(key, []).append(t["end"] - t["start"])
 
     print(f"{'tool':16} {'n':>5} {'mean':>8} {'p50':>7} {'p90':>7} {'p95':>7} {'p99':>7} {'max':>8}")
     for tool, vals in sorted(by_tool.items(), key=lambda kv: -len(kv[1])):
