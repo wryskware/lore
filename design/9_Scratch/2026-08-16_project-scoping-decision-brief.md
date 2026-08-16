@@ -241,3 +241,38 @@ stops working once the daemon is remote.
 The honest counter is that A's objections to B are not answered by preferring B;
 they are deferred. Collision handling and the D-0012 optionality question are
 load-bearing and unresolved, and B is not safe to build until they are.
+
+## Resolution (Wrysk, 2026-08-16): hold — decide the core, defer the mechanism
+
+Reviewed with a synthesis that reframed A and B as answers to different
+questions (B: what is a project's portable name; A: how does a local client
+discover where it is standing; neither: who arbitrates the binding), and a
+recommended amended-B (registry binds declared keys and rejects duplicates at
+`lore add`; path resolution demoted to a local-only fallback). Wrysk's call was
+narrower than the recommendation:
+
+**Neither identity mechanism is adopted.** A, B, and the amended-B hybrid all
+stay open until issue #18's ingestion fork is settled — the fork this brief
+already flagged as capable of overturning a premature answer.
+
+**What proceeds now** — the pieces compatible with both positions and all three
+ingestion options:
+
+1. **Wire contract.** Every request carries a project identifier; unscoped
+   requests are rejected with a hard error naming the remedy. `status` scopes
+   to the identified project like `search`; the machine-wide view becomes an
+   explicitly admin-tier affordance rather than the default answer.
+2. **`lore remove`.** A CLI subcommand over the existing store-side
+   `remove_project` — the actual fix for bench-worktree result mixing.
+
+**Interim identifier.** Until the mechanism is chosen, the identifier is the
+daemon registry's existing project name. Locally the client may fill it by cwd
+containment against the registry as an implementation convenience — without
+prejudice to the eventual mechanism, and acceptable only because the daemon is
+loopback-only today.
+
+**Explicitly not decided:** how a client obtains the identifier once the daemon
+is remote, any `.lore.toml` identity table, collision rules, and whether
+`lore add` writes anything into a repo. No canon changed; no ledger entry. The
+#18 comment recording an earlier leaning toward `.lore.toml` identity is
+corrected there — that leaning is now formally open, not the plan of record.
