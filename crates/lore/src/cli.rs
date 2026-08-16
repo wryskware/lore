@@ -524,6 +524,53 @@ fn short_id(chunk_id: &str) -> &str {
     }
 }
 
+/// A symbol path with the chunker's discriminators removed — the same rule
+/// `lore-mcp/src/render.rs` applies, and for the same reason.
+///
+/// `#w<n>` marks one window of an oversized span and `#s<n>` names a run of
+/// statements under no declared symbol. Both are identity (they keep derived
+/// chunk ids distinct), so the wire keeps them and only the display drops
+/// them; a path that is nothing but a filler ordinal is the file's top level.
+///
+/// Matching `#s`/`#w` followed by digits, rather than cutting at the first
+/// `#`, keeps `Counter.#count` — a JavaScript private field — intact.
+fn display_symbol(symbol_path: &str) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut filler = false;
+    for segment in symbol_path.split('.') {
+        match trim_discriminator(segment) {
+            "" => filler = true,
+            trimmed => kept.push(trimmed),
+        }
+    }
+    match (kept.is_empty(), filler) {
+        (true, _) => "top-level statements".to_string(),
+        (false, true) => format!("{} (statements)", kept.join(".")),
+        (false, false) => kept.join("."),
+    }
+}
+
+/// Heading titles minus any element that is only a window discriminator.
+fn display_headings(headings: &[String]) -> Vec<&str> {
+    headings
+        .iter()
+        .map(String::as_str)
+        .filter(|title| !trim_discriminator(title).is_empty())
+        .collect()
+}
+
+/// One path segment without its trailing `#s<n>`/`#w<n>` discriminator; empty
+/// when the segment was nothing but one.
+fn trim_discriminator(segment: &str) -> &str {
+    let Some((head, tail)) = segment.rsplit_once('#') else {
+        return segment;
+    };
+    let discriminator = matches!(tail.as_bytes().first(), Some(b's' | b'w'))
+        && tail.len() > 1
+        && tail[1..].bytes().all(|byte| byte.is_ascii_digit());
+    if discriminator { head } else { segment }
+}
+
 fn render_search(query: &str, response: &SearchResponse) -> String {
     let mut out = String::new();
     let mode = if response.lexical_only {
@@ -571,12 +618,13 @@ fn push_result(out: &mut String, rank: usize, result: &SearchResult) {
     );
 
     if let Some(symbol) = &result.symbol_path {
-        let _ = writeln!(out, "    symbol: {symbol}");
+        let _ = writeln!(out, "    symbol: {}", display_symbol(symbol));
     }
-    if let Some(headings) = &result.heading_path
-        && !headings.is_empty()
-    {
-        let _ = writeln!(out, "    heading: {}", headings.join(" > "));
+    if let Some(headings) = &result.heading_path {
+        let titles = display_headings(headings);
+        if !titles.is_empty() {
+            let _ = writeln!(out, "    heading: {}", titles.join(" > "));
+        }
     }
     match (&result.design_status, result.decision_refs.is_empty()) {
         (Some(status), true) => {
@@ -1186,6 +1234,36 @@ mod tests {
         assert!(rendered.contains("    heading: MCP Tool Surface > v0.1 tools\n"));
         assert!(rendered.contains("    status: decided  refs: D-0007\n"));
         assert!(rendered.contains("    chunk_id: 9f3a1c2b7e4d\n"));
+    }
+
+    /// The CLI half of issue #9's `symbol: #s0`. Kept in step with
+    /// `lore-mcp/src/render.rs`, which asserts the same table.
+    #[test]
+    fn chunker_discriminators_are_display_only() {
+        assert_eq!(display_symbol("#s0"), "top-level statements");
+        assert_eq!(display_symbol("Board.#s2"), "Board (statements)");
+        assert_eq!(display_symbol("Parser.Parse#w1"), "Parser.Parse");
+        assert_eq!(display_symbol("Board.Update"), "Board.Update");
+        assert_eq!(display_symbol("Counter.#count"), "Counter.#count");
+        assert_eq!(
+            display_headings(&["Ranking".to_string(), "#w0".to_string()]),
+            ["Ranking"]
+        );
+
+        let mut filler = code_hit();
+        filler.symbol_path = Some("#s0".into());
+        let rendered = render_search(
+            "statements",
+            &SearchResponse {
+                results: vec![filler],
+                lexical_only: false,
+            },
+        );
+        assert!(
+            rendered.contains("    symbol: top-level statements\n"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("#s0"), "{rendered}");
     }
 
     /// Same rule as `lore-mcp`'s renderer: twelve characters, never sixty-four,
