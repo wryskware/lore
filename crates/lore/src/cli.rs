@@ -474,11 +474,12 @@ pub async fn status(json: bool, project: Option<String>) -> Result<()> {
 /// human can reproduce and debug exactly what an agent saw.
 ///
 /// Every query is scoped to one project. `--project` says which; without it
-/// the daemon is asked which registered project contains the current directory
-/// — the interim, local-only convenience the scoping resolution sanctions (see
-/// `GET /v1/resolve`). The flag still wins, because the local CLI is the
-/// admin surface: a human may deliberately query a project they are not
-/// standing in, where an agent may not.
+/// the daemon is asked which registered project contains the current
+/// directory — the local discovery convenience D-0016 sanctions (see
+/// `GET /v1/resolve`), which fills the identifier in and never replaces one.
+/// The flag therefore still wins, and not only as a courtesy: the local CLI is
+/// the admin surface, and a human may deliberately query a project they are
+/// not standing in, where an agent may not.
 pub async fn search(args: SearchArgs) -> Result<()> {
     let client = Client::connect()?;
     let mut request = SearchRequest::from(&args);

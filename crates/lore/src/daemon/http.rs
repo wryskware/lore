@@ -501,19 +501,19 @@ async fn remove_project(
 /// `GET /v1/resolve?path=<absolute path>` — which registered project contains
 /// this path?
 ///
-/// **INTERIM, and local-only.** The scoping resolution
-/// (`design/4_Interfaces/2026-08-16_project-scoping-decision-brief.md`) settled
-/// the wire contract — every query names one project — while explicitly
-/// *deferring* the identity mechanism to issue #18's ingestion fork. Until
-/// that is decided the identifier is the registry's own project name/key, and
-/// this endpoint is the sanctioned convenience by which a co-located client
-/// fills it in from where it happens to be standing.
+/// **A discovery convenience, and local-only — never identity.** D-0016
+/// settled what the scoping brief deferred: a project's identity is its
+/// registry-bound declared name, and cwd-containment is demoted to a local
+/// convenience by which a co-located client *fills in* an identifier it was
+/// not given. It never overrides one. Callers hold that line — the CLI's
+/// `--project` and the MCP server's `LORE_PROJECT` are both consulted first,
+/// and a pin that names no project is an error rather than a quiet fall back
+/// to wherever the process happens to be standing.
 ///
-/// It is acceptable only because the daemon is loopback-only today: registered
-/// roots are paths on the daemon's filesystem, which means nothing to a remote
-/// client. Expect it to be revisited — most sharply if ingestion inverts, which
-/// makes path-based anything moot. The rest of the wire stays name/key-based;
-/// this is the one route that takes a path.
+/// Containment stays local-only because it is meaningless anywhere else:
+/// registered roots are paths on the daemon's filesystem, and D-0015's push
+/// ingestion means a client's paths need not exist there at all. The rest of
+/// the wire is name/key-based; this is the one route that takes a path.
 #[derive(Debug, serde::Deserialize)]
 struct ResolveQuery {
     path: String,
@@ -541,9 +541,13 @@ async fn resolve(
         .filter(|project| paths::is_within(&project.root, path))
         .max_by_key(|project| project.root.as_str().len())
         .ok_or_else(|| {
-            ApiErr::not_found(
-                "path is not inside any registered project; register it with `lore add <path>`",
-            )
+            // Failing to discover a project is not failing to have one: a
+            // project is identified by the name it is registered under, and
+            // this route only guesses that name from a path. So both ways
+            // forward are named — supply the identity, or create it.
+            ApiErr::not_found(format!(
+                "path is not inside any registered project; {NAME_A_PROJECT}"
+            ))
         })?;
     Ok(Json(info(project)))
 }

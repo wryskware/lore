@@ -39,8 +39,14 @@
 //! made unique. Two projects both named `shared` made `expand(project,
 //! chunk_id)` resolve the wrong one or 404 (S1#3). Every source now carries a
 //! stable opaque `key`, assigned once at registration and never recomputed —
-//! renaming a project does not change it. Display names are additionally kept
-//! unique at registration so the human-facing resolver stays deterministic.
+//! renaming a project does not change it.
+//!
+//! Display names are additionally kept unique, because under D-0016 the
+//! declared name *is* the project's identity rather than a label on it.
+//! Registration refuses a name another root holds ([`name_holder`], enforced
+//! in [`crate::store::Store::register_project`]); reconciliation, which has to
+//! accept whatever a hand-edited manifest says, renames the later duplicate
+//! instead.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher, RandomState};
@@ -329,7 +335,7 @@ fn apply(store: &mut Store, data_dir: &Utf8Path, manifest: Manifest) -> Result<R
                 .unwrap_or(entry.root.as_str())
                 .to_string();
         }
-        // `POST /v1/projects` refuses a name another root already holds, but a
+        // Registration refuses a name another root already holds, but a
         // hand-edited manifest can walk straight past that door and recreate
         // the ambiguity — two projects one display name, so `expand(project,
         // …)` and `lore search --project` resolve to whichever sorted first
