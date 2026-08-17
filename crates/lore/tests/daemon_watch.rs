@@ -246,9 +246,22 @@ async fn the_daemons_own_writes_never_become_index_work() {
     wait_until("a real project edit to be queued", || !env.queue.is_empty()).await;
     let (project, work) = env.queue.take().unwrap();
     assert_eq!(project, env.project.id);
+    // A *directory* is legitimate queued work, not a miss. The pump is
+    // deliberately dumb: it hands the indexer whatever path the platform
+    // named and leaves "is this a directory?" to `observe_paths`, which
+    // walks it. Linux inotify commonly reports the parent for a create where
+    // Windows names the file, and both reach `src/real.rs`.
+    //
+    // Asserting the exact file was therefore asserting more than the watcher
+    // promises, and it is what made this test flaky under parallel load
+    // (issue #23): a batch carrying only `src` is a correct batch.
     assert!(
-        work.full || work.paths.iter().any(|p| p.as_str() == "src/real.rs"),
-        "queued work should name the edited file: {work:?}"
+        work.full
+            || work.paths.iter().any(|queued| {
+                let queued = queued.as_str();
+                queued == "src/real.rs" || "src/real.rs".starts_with(&format!("{queued}/"))
+            }),
+        "queued work should reach the edited file: {work:?}"
     );
 
     env.cancel.cancel();
