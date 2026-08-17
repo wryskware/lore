@@ -249,8 +249,29 @@ function New-BriefA([string]$repo, [string]$task, [object[]]$group) {
                 [void]$sb.AppendLine((Get-Content -Raw $suitePath).Trim())
             }
             else {
-                [void]$sb.AppendLine('NOT RUN. The harness does not run suites; this one has not been run by hand yet.')
+                [void]$sb.AppendLine('NOT RUN. This cell predates the harness running suites itself.')
                 [void]$sb.AppendLine('Any criterion that depends on it must come back `confidence: low`, not a guess.')
+            }
+
+            # The agent's own suite runs, lifted out of the packet. Weaker
+            # evidence than a harness run — the agent picks the command, and a
+            # green `--lib chunk::tests` says nothing about the workspace — but
+            # it is evidence, and grading four cells as "suite unknown" while
+            # the transcript shows a full green run is worse than weighing it.
+            $packetPath = Join-Path $c.dir 'packet.md'
+            if (Test-Path $packetPath) {
+                $packet = Get-Content -Raw $packetPath
+                $marker = '### suite runs the agent made itself (self-reported)'
+                $at = $packet.IndexOf($marker)
+                if ($at -ge 0) {
+                    $section = $packet.Substring($at)
+                    $nextHeading = [regex]::Match($section.Substring($marker.Length), '(?m)^### ')
+                    if ($nextHeading.Success) {
+                        $section = $section.Substring(0, $marker.Length + $nextHeading.Index)
+                    }
+                    [void]$sb.AppendLine()
+                    [void]$sb.AppendLine("#### Answer $label — " + $section.Trim())
+                }
             }
         }
     }

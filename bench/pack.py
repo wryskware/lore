@@ -112,6 +112,47 @@ def later_tool_text(parts: list[dict], after: int) -> str:
     return "\n".join(blob).replace("\\\\", "/").replace("\\", "/")
 
 
+SUITE_MARKERS = ("cargo test", "pytest", "cargo nextest")
+SUITE_VERDICT_RE = re.compile(
+    r"(test result: (?:ok|FAILED)[^\n]*|\d+ passed[^\n]*|\d+ failed[^\n]*|error\[E\d+\][^\n]*|"
+    r"error: (?:test failed|could not compile)[^\n]*)"
+)
+
+
+def agent_suite_runs(parts: list[dict]) -> list[dict]:
+    """Suite commands the AGENT chose to run, with how they came out.
+
+    Self-reported and not a substitute for the harness's own run: the agent
+    picks the command, so a green `cargo test -p lore --lib chunk::tests` says
+    nothing about the workspace. Extracted because it is real evidence that was
+    otherwise being discarded — and because round 2's four T5 cells had to be
+    graded without a harness suite result at all, while three of the four had
+    in fact run a full suite themselves.
+    """
+    runs = []
+    for idx, part in enumerate(parts):
+        if part.get("tool") != "bash":
+            continue
+        state = part.get("state") or {}
+        cmd = ((state.get("input") or {}).get("command") or "").strip()
+        if not any(marker in cmd for marker in SUITE_MARKERS):
+            continue
+        output = state.get("output") or ""
+        verdicts = SUITE_VERDICT_RE.findall(output)
+        failed = any(
+            ("FAILED" in v) or ("error" in v) or re.match(r"\d+ failed", v) and not v.startswith("0 failed")
+            for v in verdicts
+        )
+        runs.append({
+            "position": idx + 1,
+            "command": cmd.replace("\n", " ")[:200],
+            "result_lines": verdicts[-6:],
+            "looks_green": bool(verdicts) and not failed,
+            "scope": "workspace" if ("--workspace" in cmd or re.search(r"pytest\s+-q\s*$", cmd)) else "partial",
+        })
+    return runs
+
+
 def retrieval_report(parts: list[dict], answer: str) -> tuple[list[str], dict]:
     """The `### lore calls` section plus its machine-readable twin.
 
@@ -241,10 +282,32 @@ def pack_cell(cell_dir: Path) -> str | None:
         shown = diff[:DIFF_LINE_LIMIT]
         lines += ["", f"### diff ({len(diff)} lines{', truncated' if len(diff) > DIFF_LINE_LIMIT else ''})", "", "```diff", *shown, "```"]
         suite = cell_dir / "suite-result.txt"
+        lines += ["", "### suite result (harness-run, authoritative)", ""]
         if suite.exists():
-            lines += ["", f"### suite result", "", suite.read_text(encoding='utf-8').strip()]
+            lines.append(suite.read_text(encoding="utf-8").strip())
         else:
-            lines += ["", "### suite result", "", "(not yet run — mechanical step pending)"]
+            lines.append(
+                "NOT RUN. This cell predates the harness running suites itself, so there is "
+                "no authoritative result. Grade any criterion that depends on it as "
+                "`confidence: low` rather than assuming green."
+            )
+
+        runs = agent_suite_runs(parts)
+        lines += ["", "### suite runs the agent made itself (self-reported)", ""]
+        if not runs:
+            lines.append("(none — the agent never ran a suite)")
+        else:
+            lines.append(
+                "The agent chose these commands, so scope matters: a green partial run says "
+                "nothing about the whole suite. Weigh accordingly; this is not a substitute "
+                "for the harness-run result above."
+            )
+            lines.append("")
+            for run in runs:
+                flag = "looks green" if run["looks_green"] else "NOT green"
+                lines.append(f"- call {run['position']} ({run['scope']}, {flag}): `{run['command']}`")
+                for rl in run["result_lines"]:
+                    lines.append(f"    {rl}")
 
     packet = "\n".join(lines) + "\n"
     (cell_dir / "packet.md").write_text(packet, encoding="utf-8")

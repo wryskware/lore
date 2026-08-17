@@ -128,6 +128,19 @@ $scrubbed = @{
 $promptsPath = Join-Path $benchRoot 'prompts.json'
 $prompts = Get-Content $promptsPath -Raw | ConvertFrom-Json
 
+# Suite per repo, run by the harness on a T5 cell while the diff is still
+# applied. Commands are the ones the task set names as the grading suites.
+# Lexomancy is absent on purpose: its suite is an EditMode run against an
+# editor the grader keeps open, which the harness cannot drive, and inventing
+# a headless approximation would be a different measurement.
+$suiteCommand = @{
+    lore      = @{ exe = 'cargo'; args = @('test', '--workspace'); workdir = '.'; display = 'cargo test --workspace' }
+    terrarium = @{
+        exe = 'uv'; args = @('run', '--extra', 'dev', '--extra', 'server', 'pytest', '-q')
+        workdir = 'analysis'; display = 'uv run --extra dev --extra server pytest -q  (in analysis/)'
+    }
+}
+
 function Get-CmChanged([string]$cmDir) {
     Push-Location $cmDir
     try { (cm status --short 2>$null) | Where-Object { $_ -match '\S' } }
@@ -223,8 +236,46 @@ function Invoke-Cell([string]$model, [string]$repo, [string]$arm, [string]$task)
     }
     Set-Content (Join-Path $outDir 'answer.md') $answer.ToString()
 
-    # T5: capture the diff, then restore the working tree.
+    # T5: capture the diff, run the suite while the change is still applied,
+    # then restore the working tree.
+    #
+    # The suite runs HERE and nowhere else. Grading needs "suite green at the
+    # pin", the reset is seconds away, and once it lands the tree no longer
+    # contains the change — so a grader asked for a suite result afterwards has
+    # to re-apply the diff to a tree that has since served other cells. Round 2
+    # graded four T5 cells at a provisional 0.5 for exactly this reason. It is
+    # captured, never scored by the harness: `suite-result.txt` records the
+    # command, the exit code and the tail of the output, and a human or a
+    # grader reads it.
     if ($task -eq 'T5') {
+        $suiteCmd = $suiteCommand[$repo]
+        if ($suiteCmd) {
+            Write-Host "[$cell] suite: $($suiteCmd.display)" -ForegroundColor DarkCyan
+            $suiteOut = Join-Path $outDir 'suite-result.txt'
+            $sw2 = [System.Diagnostics.Stopwatch]::StartNew()
+            Push-Location (Join-Path $s.dir $suiteCmd.workdir)
+            try {
+                $output = & $suiteCmd.exe @($suiteCmd.args) 2>&1 | Out-String
+                $suiteExit = $LASTEXITCODE
+            }
+            catch {
+                $output = "harness failed to run the suite: $_"
+                $suiteExit = -1
+            }
+            finally { Pop-Location }
+            $sw2.Stop()
+            @(
+                "command: $($suiteCmd.display)",
+                "cwd: $(Join-Path $s.dir $suiteCmd.workdir)",
+                "exit: $suiteExit  ($([math]::Round($sw2.Elapsed.TotalSeconds))s)",
+                "verdict: $(if ($suiteExit -eq 0) { 'GREEN' } else { 'RED' })",
+                '',
+                '--- output ---',
+                $output.TrimEnd()
+            ) | Set-Content -LiteralPath $suiteOut -Encoding utf8
+            Write-Host "[$cell] suite $(if ($suiteExit -eq 0) { 'GREEN' } else { "RED (exit $suiteExit)" })" -ForegroundColor $(if ($suiteExit -eq 0) { 'Green' } else { 'Red' })
+        }
+
         if ($r.vcs -eq 'git') {
             # Daemon-generated files are not agent work. Excluded from the
             # staging/diff via pathspecs and from the clean via -e, so the
