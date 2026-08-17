@@ -182,6 +182,42 @@ fn a_watcher_batch_applies_the_same_rules_as_a_full_scan() {
     assert!(batch.covers(Utf8Path::new("run.log")));
 }
 
+/// The nested-repository boundary reaches the micro-manifest too. A watcher
+/// event names a path directly, so if only the full scan stopped at the
+/// boundary a single edit inside a worktree would index the whole file — and
+/// the next full scan would delete it, forever.
+///
+/// The `gitdir:` pointer is written by hand, keeping this file's no-git-binary
+/// property (the same way `git_metadata_never_reaches_a_manifest` writes
+/// `.git/config`). That the pointer file is genuinely what `git worktree add`
+/// puts on disk is established with a real checkout in `daemon::walk`'s unit
+/// tests; what is under test here is only that the observer routes both of its
+/// forms through that one evaluator.
+#[test]
+fn a_watcher_event_inside_a_nested_repository_reaches_no_manifest() {
+    let project = Project::new(&[
+        ("src/main.rs", "fn main() {}"),
+        ("wt/agent/src/main.rs", "fn main() {}"),
+        ("wt/agent/.git", "gitdir: ../../.git/worktrees/agent\n"),
+        ("vendor/dep/.git/HEAD", "ref: refs/heads/main\n"),
+        ("vendor/dep/lib.rs", "pub fn dep() {}"),
+    ]);
+    project.user_rules(".*\n");
+    assert_eq!(listed(&project.observe()), ["src/main.rs"]);
+
+    // The file event, and the directory event a dropped-in tree produces.
+    let batch = project.observe_batch(&["wt/agent/src/main.rs", "vendor/dep"]);
+    assert!(listed(&batch).is_empty(), "{:?}", listed(&batch));
+
+    // And the escape hatch holds on this path as well, or the two would
+    // disagree about a deliberately vendored repository.
+    project.write(".loreignore", "!vendor/dep/\n");
+    assert_eq!(
+        listed(&project.observe_batch(&["vendor/dep/lib.rs"])),
+        ["vendor/dep/lib.rs"]
+    );
+}
+
 /// A project's own exclusion is not overridden by anything below it, which is
 /// the other half of sovereignty: silence inherits, but a rule decides.
 #[test]
