@@ -209,3 +209,15 @@ Append-only. Newest entries at the bottom. Schema per [[README]].
 - **Consequences:** The pusher-side basis implementation targets this; D-0015's secrecy layering is otherwise unchanged.
 - **Supersedes:** D-0015's git-tracked-files-only clause only ("git repos default to git-tracked-files-only manifests"); every other D-0015 clause stands.
 - **Canonical sources:** [[../1_Architecture/1.2_Ingestion]]
+
+## D-0018 — Pre-release simplicity: no migrations, no compat machinery (expires at first release)
+
+- **Date:** 2026-08-17
+- **Status:** Accepted
+- **Scope:** Engineering posture **until the first tagged release only** — this entry is explicitly temporal and does not bind beyond that point
+- **Decided by:** Wrysk (2026-08-17)
+- **Decision:** Until the first tagged release: (1) **no schema migrations are authored** — the store schema is one flattened definition, and on a schema-version mismatch the daemon rebuilds the store outright with a loud log, because the index is derived data (repos are the source of truth; vault and session Markdown live beside the store, not in it); (2) **no API version negotiation or compatibility machinery** — everything pins at v1. The handshake's version-equality check stays (it catches same-machine stale-binary skew with a named error), and additive wire hygiene stays as cheap discipline, but neither is a compatibility promise. **Expiry: this posture ends at the first tagged release.** Migration and versioning policy must then be decided anew; nothing here carries forward as precedent, and any document citing this entry inherits its expiry.
+- **Rationale:** Pre-release, every consumer lives on this machine and a full rebuild costs minutes; authoring migrations buys nothing and carries real failure modes (the v5 rebuild had to guard against an FK-cascade that would have deleted every chunk in the store).
+- **Consequences:** Store migrations V1–V5 collapse into a single schema definition with the v5 AUTOINCREMENT guarantee baked in; their tests of migration *paths* are deleted, their tests of resulting *properties* (id non-reuse, reference integrity) are kept.
+- **Supersedes:** None
+- **Canonical sources:** `crates/lore/src/store/schema.rs`
