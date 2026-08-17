@@ -172,10 +172,12 @@ toolchain is `npm i tree-sitter-cli`.
 
 Caveats and consequences for Phase 1:
 
-- **MSVC toolset prerequisite.** VS 2022 17.2's toolset (14.32) lacks C11
-  `<stdalign.h>` and cannot compile the feature; the spike used a shim
-  header that must not reach `main`. Upgrading VS Build Tools (dev machine
-  *and* CI) is a hard prerequisite. Expect ~40 benign LNK4217 warnings.
+- **MSVC toolset prerequisite — CLEARED 2026-08-17.** Toolsets below 14.33
+  lack C11 `<stdalign.h>` and cannot compile the feature (the spike
+  initially shimmed around 14.32). Wrysk updated the dev box to 14.44 the
+  same day; the spike then built and ran unmodified with the shim deleted,
+  and GitHub-hosted CI runners already carry a current toolset. Expect ~40
+  benign LNK4217 warnings.
 - **Cost is real: +42 s clean build, +10.2 MiB binary, +101 crates**
   (Cranelift). This settles the former open question: **wasm plugin support
   goes behind a Cargo feature of core** so grammar-bundled-only builds
@@ -250,8 +252,8 @@ Drafted for Wrysk to promote or edit; not an accepted entry.
   code stays on its unmerged worktree branch as Phase 1 reference (it
   carries the MSVC shim and a default-on wasm feature that must not merge
   as-is).
-- **Phase 1 — core seam (lore repo).** Prerequisite: VS Build Tools
-  upgrade (dev + CI) for `<stdalign.h>`. Plugin registry + manifest
+- **Phase 1 — core seam (lore repo).** (Toolset prerequisite cleared, see
+  spike results.) Plugin registry + manifest
   parsing; routing in `chunk_file` after built-ins, before fallback;
   `Spec` grows a wasm-language source + thread-local `WasmStore`/parser
   pooling; ABI gate at load; fingerprint in the indexer file hash;
