@@ -55,10 +55,10 @@ numbered sub-questions, no "be sure to check X".
 | D1 | **The answer key is inside the corpus.** `lore-bench` at pin `977364a` contains `design/9_Scratch/2026-08-15_e2e-round-1-plan.md`, which spells out the task list *and the graded answers* for all three repos, including lore's T1 hop chain, T2 framing, T4 rationale ("the key-exchange convergence argument — commit 60b3599"), and T5 bug description. | **Scrub the file from both bench trees at setup**, and make the reset unable to resurrect it. See § Corpus scrub. |
 | D2 | lore T3's prompt asked half of what the key graded, *and* both arms scored 1 in every round-1 cell — a task that measures nothing. | T3 replaced with the enumeration the key half wanted, on a deliberately grep-hostile vocabulary. Prompt rewritten to ask for exactly that. |
 | D3 | lore T5 and `CHUNK_FORMAT_VERSION`: key silent, on arm bumped, off arm did not, Revision A declared it out of scope. | Bumping is correct behaviour and the constant's own doc comment says so. **Required**, and the prompt now asks for it in behavioural terms. |
-| D4 | The T4 archetype demanded a prose source of record that the prompts never mentioned; both round-1 T4 cells took symmetric 0.5s. Worse, for lore the recorded rationale **is in the code** (a doc comment), so the criterion punished the best available answer. | Archetype redesigned around **rejected alternatives** — negative space that code cannot document. Prompt asks for the reason *and where it is written down*. See § T4 redesigned. |
+| D4 | The T4 archetype demanded a prose source of record that the prompts never mentioned; both round-1 T4 cells took symmetric 0.5s. Worse, for lore the recorded rationale **is in the code** (a doc comment), so the criterion punished the best available answer. | Archetype redesigned around **rejected alternatives** — negative space that code cannot document. Prompt asks for the reason *and where it is written down*. See § T4, redesigned. |
 | D5 | lore T1/T3 keys were structural, and Revision A's completeness lists were transcribed from round-1 *answers*, not derived from code. | Re-derived from source at the pin, every item carrying `file:line`. See § lore. |
 | D6 | lexomancy T5 shield normalisation was under-specified; Revision A freed the denominator. | Kept free, tightened: the prompt now states the deterministic and degenerate-case requirements that were previously key-only. |
-| D7 | Bench projects indexed with `authority: none`, so the lore repo's own authority/modality task ran against a neutrally-indexed project. | Round 2 runs `lore-bench` under the `lore-v1` profile. See § Round-2 setup deltas. |
+| D7 | Bench projects indexed with `authority: none`, so the lore repo's own authority/modality task ran against a neutrally-indexed project. | Round 2 runs `lore-bench` under the `lore-v1` profile. See § Run protocol, and `bench/README.md` § Round-2 setup step 3b. |
 | D8 | `metrics.json` recorded no prompt identity, so a results directory could not be attributed to a prompt version. | `run.ps1` now records `task_set` and `prompt_sha256`. |
 | D9 | **The Lexomancy vault pin is not enforced.** The bench workspace's `design` junction resolves to the live vault working tree, currently 3 commits ahead of `d5e0d53310`. Round 1 ran against an unpinned vault while claiming a pin. | Recorded, **not fixed** — fixing it needs a decision from Wrysk. See § Lexomancy, corpus caveat, and § Open questions item 3. |
 | D10 | Round-1 keys carried wrong paths and wrong facts that would have marked correct answers wrong: `2_Encounters/` (really `2_BattleMechanics/`), `5_Prototypes/` (really `5_Implementation/`), "1.6_ForgingSystem and 6.1_Lexinomicon claim axiom capacity" (they claim residue cost, nothing about capacity), "D-0016 reserves per-unit taunt state" (it mentions taunt; it reserves the seam), lexomancy T1's terminus at `PayloadExecutor` (which never touches `BattleUnit`), terrarium T1's physarum-only terminus. | All corrected below, each with the correction called out where a grader might otherwise carry the old belief forward. |
@@ -78,8 +78,8 @@ Every key below is written against this state. Moving a pin invalidates every
 
 ## Corpus scrub
 
-`bench/setup-worktrees.ps1 -Apply` deletes these paths from each bench working
-tree after creating it, and `bench/run.ps1` refuses to run a cell while any of
+`bench/setup-worktrees.ps1 -Apply -Scrub` deletes these paths from **both slots**
+of each bench repo, and `bench/run.ps1` refuses to run a cell while any of
 them exists:
 
 | Repo | Path | Why |
