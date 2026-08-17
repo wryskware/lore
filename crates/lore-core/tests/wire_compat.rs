@@ -22,7 +22,7 @@
 //! branch base), field for field.
 
 use lore_core::{
-    ExpandRequest, ProjectInfo, ProjectStatus, SearchRequest, SearchResult, WatchState,
+    ExpandRequest, ProjectInfo, ProjectStatus, SearchRequest, SearchResult, SourceInfo, WatchState,
     snapshot::{
         Manifest, MassDeleteTrip, PushCommitResponse, PushFileResponse, PushLeaseResponse,
         PushManifestRequest, PushManifestResponse,
@@ -95,6 +95,20 @@ fn populated_project_status() -> ProjectStatus {
         }),
         push_lease_epoch: Some(7),
         push_staged: true,
+        // Both populated for the same reason the config error above is: this
+        // fixture pins the *maximal* serialized shape, and a field left empty
+        // is a field `skip_serializing_if` would hide from the golden list.
+        sources: vec![
+            SourceInfo {
+                mount: String::new(),
+                root: r"C:\repos\lore".into(),
+            },
+            SourceInfo {
+                mount: "engine".into(),
+                root: r"C:\repos\shared-engine".into(),
+            },
+        ],
+        sources_error: Some("source path `../gone` cannot be resolved".into()),
     }
 }
 
@@ -169,6 +183,11 @@ fn every_pre_existing_wire_field_survives_and_the_additions_are_the_specified_on
                 // a lease.
                 "push_lease_epoch",
                 "push_staged",
+                // D-0022: which directories the project is made of, and a
+                // table Lore refused. Absent for a project that is simply its
+                // own root, which is nearly all of them.
+                "sources",
+                "sources_error",
             ],
         },
         Shape {

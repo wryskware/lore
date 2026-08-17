@@ -57,7 +57,7 @@ use lore_core::{
 
 use crate::config::Config;
 use crate::embed::Embedder;
-use crate::store::{Project, RegisterError};
+use crate::store::{Project, ProjectId, RegisterError};
 
 use super::index::{ApplyOptions, IndexContext};
 use super::push::{PushClaim, PushError, PushLeases};
@@ -257,6 +257,25 @@ async fn status(
         .map_err(|err| ApiErr::internal("status", err))?
         .map_err(|err| ApiErr::internal("status", err))?;
 
+    // Resolved here rather than read from the store, because extent is not
+    // stored: every pass loads `.lore.toml` fresh, and status showing anything
+    // else would be showing the extent of some earlier pass. Off the async
+    // thread — it reads a file and canonicalizes a path per source.
+    let roots: Vec<(ProjectId, camino::Utf8PathBuf)> = status
+        .projects
+        .iter()
+        .map(|p| (p.project, p.root.clone()))
+        .collect();
+    let extents: BTreeMap<ProjectId, crate::sources::Sources> =
+        tokio::task::spawn_blocking(move || {
+            roots
+                .into_iter()
+                .map(|(id, root)| (id, crate::sources::Sources::load(&root)))
+                .collect()
+        })
+        .await
+        .map_err(|err| ApiErr::internal("status", err))?;
+
     let mut projects: Vec<lore_core::ProjectStatus> = status
         .projects
         .into_iter()
@@ -287,6 +306,22 @@ async fn status(
                 .profile
                 .map(|_| p.authority.behavior.as_str().to_string()),
             authority_config_error: p.authority.error,
+            // Reported only when the project is more than its own root: one
+            // anonymous source on every project would be noise, and its
+            // absence is exactly what "this project is its root" means.
+            sources: match extents.get(&p.project) {
+                Some(extent) if !extent.is_only_root() => extent
+                    .iter()
+                    .map(|source| lore_core::SourceInfo {
+                        mount: source.mount.clone(),
+                        root: source.root.to_string(),
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            },
+            sources_error: extents
+                .get(&p.project)
+                .and_then(|extent| extent.error().map(ToString::to_string)),
             decisions_active: p.decisions_active,
             decisions_total: p.decisions_total,
             decision_violations: p

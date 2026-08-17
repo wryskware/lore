@@ -920,6 +920,7 @@ fn render_status(status: &DaemonStatus) -> String {
             root = project.root,
             watch = watch_note(project.watch),
         );
+        push_sources(&mut out, project);
         push_authority(&mut out, project);
         push_authority_violations(&mut out, project);
         push_mass_delete_guard(&mut out, project);
@@ -989,6 +990,58 @@ fn push_abandoned(out: &mut String, abandoned: u64) {
 /// a reader who cannot see the choice cannot tell an opted-out repo from a
 /// broken one. A config error is shouted about on its own line, because the
 /// repo is indexing under a *different model* than its file asked for.
+/// Where this project's files actually come from (D-0022).
+///
+/// Silent for a project that is simply its own root, which is nearly all of
+/// them — a line saying "this project is its directory" would be noise. Loud
+/// as soon as it is not, because the line above prints one root and a project
+/// with mounts has files that live nowhere near it: `engine/render/pass.rs` in
+/// a search result is otherwise a path the reader will go looking for under
+/// the wrong directory.
+///
+/// A refused table is shouted about on its own line for the same reason a
+/// broken `.lore.toml` profile is: the project indexed as its root alone,
+/// which is a different project from the one the file described.
+fn push_sources(out: &mut String, project: &ProjectStatus) {
+    if let Some(error) = &project.sources_error {
+        let _ = writeln!(
+            out,
+            "    SOURCES: {error}; this project indexed as its root alone"
+        );
+    }
+    if project.sources.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "    sources: {}", project.sources.len());
+    let width = project
+        .sources
+        .iter()
+        .map(|source| mount_label(source).chars().count())
+        .max()
+        .unwrap_or(0);
+    for source in &project.sources {
+        let label = mount_label(source);
+        let pad = width - label.chars().count();
+        let _ = writeln!(
+            out,
+            "      {label}{blank}  {root}",
+            blank = " ".repeat(pad),
+            root = source.root,
+        );
+    }
+}
+
+/// How a source's prefix reads in the listing. The root source has no prefix
+/// at all, and printing an empty column for it would look like a defect rather
+/// than the meaning.
+fn mount_label(source: &lore_core::SourceInfo) -> String {
+    if source.mount.is_empty() {
+        "(project root)".to_string()
+    } else {
+        format!("{}/", source.mount)
+    }
+}
+
 fn push_authority(out: &mut String, project: &ProjectStatus) {
     if let Some(error) = &project.authority_config_error {
         let _ = writeln!(

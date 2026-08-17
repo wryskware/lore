@@ -803,6 +803,100 @@ async fn status_shouts_about_a_lore_toml_it_cannot_use() {
     );
 }
 
+/// A project made of more than one directory says so, and says where from.
+///
+/// Reported because the line above prints one root: with a mount declared, a
+/// search result like `engine/render/pass.rs` names a file that lives nowhere
+/// near it, and a reader who cannot see the extent goes looking under the
+/// wrong directory.
+#[tokio::test]
+async fn status_reports_a_projects_declared_extent() {
+    let outside = tempfile::tempdir().unwrap();
+    let outside = camino::Utf8Path::from_path(outside.path()).unwrap();
+    std::fs::write(outside.join("lib.rs"), "pub fn engine() {}").unwrap();
+
+    let fixture = Fixture::neutral("mounted");
+    let declared = format!("../{}", outside.file_name().expect("a temp dir has a name"));
+    fixture.write(
+        lore::repo_config::REPO_CONFIG_FILE,
+        format!(
+            "[[sources]]
+path = \".\"
+
+[[sources]]
+path = \"{declared}\"
+mount = \"engine\"
+"
+        ),
+    );
+    let h = harness_from(fixture);
+
+    let (status, body) = get(&h.router, "/v1/status").await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    let sources = body["projects"][0]["sources"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the extent must be on the wire: {body:#}"));
+    assert_eq!(sources.len(), 2, "{body:#}");
+    assert_eq!(sources[0]["mount"], "", "the root source carries no prefix");
+    assert_eq!(sources[1]["mount"], "engine");
+    assert_eq!(
+        body["projects"][0]["sources_error"],
+        Value::Null,
+        "a table that resolved has nothing to report: {body:#}"
+    );
+}
+
+/// The ordinary project — its own root and nothing else — reports no extent
+/// at all. One anonymous source on every project would be noise that means
+/// nothing, and its absence is exactly what "this project is its root" says.
+#[tokio::test]
+async fn status_reports_no_extent_for_a_project_that_is_just_its_root() {
+    let h = harness();
+    let (status, body) = get(&h.router, "/v1/status").await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    assert_eq!(
+        body["projects"][0]["sources"],
+        Value::Null,
+        "an empty extent is omitted, not sent as a one-element list: {body:#}"
+    );
+}
+
+/// A `[[sources]]` table Lore refused is shouted about, for the same reason a
+/// broken authority profile is: the project indexed as its root alone, which
+/// is a very different project from the one its file described. Silence here
+/// would read as "your mounts are fine" while the mounted content is simply
+/// missing.
+#[tokio::test]
+async fn status_shouts_about_a_sources_table_it_cannot_use() {
+    let fixture = Fixture::neutral("broken-extent");
+    fixture.write(
+        lore::repo_config::REPO_CONFIG_FILE,
+        "[[sources]]
+path = \".\"
+
+[[sources]]
+path = \"../nowhere\"
+mount = \"gone\"
+",
+    );
+    let h = harness_from(fixture);
+
+    let (status, body) = get(&h.router, "/v1/status").await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    let error = body["projects"][0]["sources_error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the error must be on the wire: {body:#}"));
+    assert!(
+        error.contains("nowhere"),
+        "it must name the problem: {error:?}"
+    );
+    assert_eq!(
+        body["projects"][0]["sources"],
+        Value::Null,
+        "and the fallback is the root alone, reported as no extent: {body:#}"
+    );
+}
+
 /// Registration is the only thing that writes the registry outside startup, so
 /// it must republish immediately — otherwise the project is indexed now and
 /// gone after the next restart.

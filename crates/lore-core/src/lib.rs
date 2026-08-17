@@ -150,6 +150,24 @@ pub struct ProjectStatus {
     /// model, which is what this field is for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority_config_error: Option<String>,
+    /// The project's declared extent (D-0022): the directories it is made of,
+    /// and the logical prefix each contributes.
+    ///
+    /// **Empty for a project that is simply its own root**, which is the
+    /// overwhelmingly common case — reporting one anonymous source for every
+    /// project would be noise that means nothing. A non-empty list is a
+    /// project whose files come from more than one place, and that is worth
+    /// saying out loud, because a path in a search result no longer implies a
+    /// directory under the registered root.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<SourceInfo>,
+    /// The `[[sources]]` table could not be used — a mount that does not
+    /// exist, an absolute path, two mounts colliding. The project **indexed as
+    /// its root alone**, which is a very different project from the one its
+    /// file described, so this is reported for the same reason
+    /// [`Self::authority_config_error`] is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources_error: Option<String>,
     /// Decisions that are accepted and not retired.
     #[serde(default)]
     pub decisions_active: u64,
@@ -188,6 +206,18 @@ pub struct ProjectStatus {
     /// inert until the commit transaction publishes them.
     #[serde(default, skip_serializing_if = "is_false")]
     pub push_staged: bool,
+}
+
+/// One directory a project is made of, as `lore status` reports it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceInfo {
+    /// The logical prefix every path from this directory carries. Empty for
+    /// the source that *is* the project root, whose files keep the paths they
+    /// have always had.
+    #[serde(default)]
+    pub mount: String,
+    /// The physical directory, canonical.
+    pub root: String,
 }
 
 /// Whether a project's edits are being indexed live.
