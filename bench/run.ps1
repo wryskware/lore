@@ -5,7 +5,8 @@
 #   .\run.ps1 -Model luna -Repo lore -Arm on -Task T4     # one cell
 #   .\run.ps1 -Matrix                                     # everything
 #   .\run.ps1 -Matrix -Models luna -Throttle 5            # luna only, 5-way parallel
-#   .\run.ps1 -Matrix -Models luna -Arms on               # round-2 shape: 15 on-arm cells
+#   .\run.ps1 -Matrix -Models luna -Arms on               # on-arm-only: 15 cells
+#   .\run.ps1 -Matrix -Models luna -Repos lore,terrarium  # two arms, no Lexomancy
 #
 # WORKING TREES — one per (repo, arm). Each arm owns its own registered lore
 # project, so a T5 cell that edits files can never be seen by the other arm.
@@ -38,6 +39,14 @@ param(
     [ValidateSet('luna', 'qwen')] [string[]]$Models = @('luna', 'qwen'),
     # Round 2 is scoped on-arm-only (15 cells): `-Matrix -Arms on`.
     [ValidateSet('on', 'off')] [string[]]$Arms = @('off', 'on'),
+    # Matrix scope filters. A two-arm round runs lore+terrarium through the
+    # matrix and Lexomancy by hand, because Lexomancy has exactly one cm
+    # workspace (`Lexomancy-alt`) and its slot 'b' has never existed: see
+    # README § Two trees per repo. `-Repos lore,terrarium` then
+    # `-Repos lexomancy -Slot a -Tasks T1,T2,T3,T4` covers everything but the
+    # two Lexomancy T5 cells, which are run one at a time.
+    [ValidateSet('lore', 'terrarium', 'lexomancy')] [string[]]$Repos = @('lore', 'terrarium', 'lexomancy'),
+    [ValidateSet('T1', 'T2', 'T3', 'T4', 'T5')] [string[]]$Tasks = @('T1', 'T2', 'T3', 'T4', 'T5'),
     # Overrides the arm -> slot mapping for this cell. `-Pilot` passes 'a' so
     # both arms read the round-1 tree and slot 'b' need not exist; the matrix
     # never sets it and keeps the fixed mapping. Not for general use.
@@ -162,6 +171,17 @@ function Invoke-Cell([string]$model, [string]$repo, [string]$arm, [string]$task)
     $preCm = if ($r.vcs -eq 'cm') { Get-CmChanged $s.cmDir } else { $null }
 
     $env:OPENCODE_CONFIG = Join-Path $benchRoot "opencode-$arm.jsonc"
+    # Pin the MCP server's scope to the project this cell claims to retrieve
+    # from, instead of letting it resolve from the cwd. The two differ for
+    # Lexomancy on purpose: the bench tree reaches the corpus through junctions,
+    # the walker does not follow them, so the bench root indexes three loose
+    # files while the corpus under test lives in the main `Lexomancy` root.
+    # Since lore-mcp dropped the agent-supplied `project` parameter and began
+    # resolving from cwd, an unpinned Lexomancy cell would search those three
+    # files. `$s.project` was already being recorded into metrics.json as the
+    # cell's project; this makes the record true. Harmless on the off arm,
+    # which has no MCP server at all.
+    $env:LORE_PROJECT = $s.project
     # Not `$args`: that is an automatic variable, and shadowing it inside a
     # function is the kind of quiet weirdness this harness has already been
     # bitten by once.
@@ -175,6 +195,7 @@ function Invoke-Cell([string]$model, [string]$repo, [string]$arm, [string]$task)
     $exit = $LASTEXITCODE
     $sw.Stop()
     Remove-Item Env:OPENCODE_CONFIG -ErrorAction SilentlyContinue
+    Remove-Item Env:LORE_PROJECT -ErrorAction SilentlyContinue
 
     # Parse the event stream: answer text, tokens, tool calls, session id.
     $tokens = @{ input = 0; output = 0; reasoning = 0; cache_read = 0; cache_write = 0 }
@@ -364,9 +385,9 @@ if ($Pilot) {
 if ($Matrix) {
     $total = [System.Diagnostics.Stopwatch]::StartNew()
     $cells = foreach ($mo in $Models) {
-        foreach ($re in 'lore', 'terrarium', 'lexomancy') {
+        foreach ($re in $Repos) {
             foreach ($ar in $Arms) {
-                foreach ($ta in 'T1', 'T2', 'T3', 'T4', 'T5') {
+                foreach ($ta in $Tasks) {
                     [pscustomobject]@{ Model = $mo; Repo = $re; Arm = $ar; Task = $ta }
                 }
             }
@@ -386,11 +407,20 @@ if ($Matrix) {
             Where-Object Count -gt 1
         if ($dupes) { throw "[matrix] duplicate cells in a parallel wave: $($dupes.Name -join ', ')" }
     }
-    $treeClash = $writes | Group-Object { "$($_.Repo)/$($_.Arm)" } | Where-Object Count -gt 1
-    if ($treeClash) { throw "[matrix] two T5 cells would share a tree: $($treeClash.Name -join ', ')" }
+    # Group by the tree a cell actually resolves to, not by (repo, arm): with
+    # `-Slot` forcing one slot for both arms, (repo, arm) is distinct while the
+    # directory is shared, which is exactly the collision this guards.
+    $treeClash = $writes | Group-Object {
+        $sl = if ($Slot) { $Slot } else { $armSlot[$_.Arm] }
+        $repoMap[$_.Repo].slots[$sl].dir
+    } | Where-Object Count -gt 1
+    if ($treeClash) { throw "[matrix] two T5 cells would share a tree: $($treeClash.Name -join ', '). Run them one at a time." }
 
-    Start-Wave $readOnly 'luna T1-T4'
-    Start-Wave $writes 'luna T5'
+    # `-Slot` must reach the child processes too, or a forced slot silently
+    # reverts to the arm mapping inside the wave.
+    $slotArgs = if ($Slot) { @('-Slot', $Slot) } else { @() }
+    Start-Wave $readOnly 'luna T1-T4' $slotArgs
+    Start-Wave $writes 'luna T5' $slotArgs
 
     foreach ($c in $serial) {
         Invoke-Cell $c.Model $c.Repo $c.Arm $c.Task
