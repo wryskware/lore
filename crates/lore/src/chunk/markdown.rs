@@ -24,7 +24,7 @@
 
 use camino::Utf8PathBuf;
 
-use super::common::{Emitter, FileVault, Tpl, decision_refs, trim_span};
+use super::common::{BOM, Emitter, FileVault, Tpl, decision_refs, trim_span};
 use crate::repo_config::Profile;
 use crate::types::{Chunk, DesignStatus};
 
@@ -32,12 +32,6 @@ use crate::types::{Chunk, DesignStatus};
 /// heading line) to earn its own chunk; below that it is folded into the
 /// first child rather than dropped.
 const MIN_SECTION_INTRO_BYTES: usize = 24;
-
-/// UTF-8 byte order mark. Windows editors write it routinely, it is *not*
-/// whitespace (U+FEFF is `Cf`, so `trim` leaves it), and it sits in front of
-/// the `---` frontmatter fence and the first `#` heading alike. Every span
-/// stays relative to the original file bytes; only the starting offset moves.
-const BOM: &str = "\u{feff}";
 
 pub(crate) fn chunk_markdown(
     path: &Utf8PathBuf,

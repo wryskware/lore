@@ -325,6 +325,45 @@ mod tests {
         );
     }
 
+    /// The same mark in a code or plain-text file is encoding, not content:
+    /// it must not ride inside the first chunk, where it would pollute both
+    /// the embedded text and the FTS row.
+    #[test]
+    fn utf8_bom_never_lands_in_a_code_or_text_chunk() {
+        for (name, body) in [
+            ("a.rs", "pub fn alpha() -> u32 {\n    41\n}\n"),
+            (
+                "A.cs",
+                "namespace N {\n  class C {\n    void M() { }\n  }\n}\n",
+            ),
+            ("a.py", "def alpha():\n    return 41\n"),
+            ("notes.txt", "first line\nsecond line\n"),
+            ("notes.rst", "first line\nsecond line\n"),
+        ] {
+            let src = format!("\u{feff}{body}");
+            let out = chunks(name, &src);
+            assert!(!out.is_empty(), "{name} produced no chunks");
+            assert!(
+                out.iter().all(|c| !c.text.contains('\u{feff}')),
+                "{name} leaked the BOM: {:?}",
+                out[0].text
+            );
+            // Spans stay relative to the *original* bytes, BOM included.
+            for chunk in &out {
+                let slice = &src[chunk.byte_start as usize..chunk.byte_end as usize];
+                assert_eq!(slice, chunk.text, "{name}: span is not the file slice");
+            }
+            // And the mark is invisible to identity, so re-saving a file with
+            // or without it is not a re-embed.
+            let plain = chunks(name, body);
+            assert_eq!(
+                out.iter().map(|c| &c.id).collect::<Vec<_>>(),
+                plain.iter().map(|c| &c.id).collect::<Vec<_>>(),
+                "{name}: the BOM moved chunk ids"
+            );
+        }
+    }
+
     /// A rule short enough to fit in one sentence is exactly the kind of
     /// prose that must stay searchable: the intro-size heuristic decides
     /// which chunk holds it, never whether it is indexed at all.

@@ -36,6 +36,11 @@ pub const TEXT_WINDOW_MAX_BYTES: usize = 8000;
 /// Lines shared between consecutive windows.
 pub const WINDOW_OVERLAP_LINES: u32 = 10;
 
+/// UTF-8 byte order mark. Windows editors write it routinely, it is *not*
+/// whitespace (U+FEFF is `Cf`, so `trim` leaves it), and it belongs to the
+/// file's encoding rather than to its content.
+pub(crate) const BOM: &str = "\u{feff}";
+
 /// Byte offsets of line starts, for exact 1-based line spans.
 pub(crate) struct LineIndex {
     starts: Vec<usize>,
@@ -319,7 +324,20 @@ fn disambiguate(kind: &ChunkKind, dup: u32) -> ChunkKind {
 
 /// Shrinks a span to its non-whitespace content so `byte_*`/`line_*` are
 /// exact and chunk text stays a verbatim file slice.
+///
+/// A leading [`BOM`] is stepped over here rather than in each chunker: it is
+/// encoding, not content, and every chunk any chunker emits passes through
+/// this one function. Without it the mark rides inside the first chunk of
+/// every code and plain-text file a Windows editor saved, polluting both the
+/// embedded text and the FTS row. Only a span that starts at byte 0 can carry
+/// it, and the offset moves rather than the file, so spans stay exact against
+/// the original bytes. (Markdown steps over it earlier as well, because its
+/// frontmatter fence and first heading have to be recognised *through* it.)
 pub(crate) fn trim_span(src: &str, start: usize, end: usize) -> Option<(usize, usize)> {
+    let start = match start == 0 && src.starts_with(BOM) {
+        true => BOM.len(),
+        false => start,
+    };
     if start >= end || end > src.len() {
         return None;
     }
