@@ -16,6 +16,13 @@
 //! way to change the schema is to edit [`SCHEMA`] in place and let existing
 //! stores rebuild.
 //!
+//! If a pre-release schema change ever *does* need data to survive — an
+//! expensive embed corpus, a store that took days to build — the escape hatch
+//! is manual, not framework: back up `lore.db` and operate on the copy
+//! surgically (`sqlite3` and a transcript of what you did), or decide at that
+//! moment that migration support has earned its way in. Do not resurrect a
+//! migration framework casually for one awkward change.
+//!
 //! Everything else in this file — the shape notes, the tokenizer choice, the
 //! AUTOINCREMENT guarantee — is permanent reasoning about *what the schema is*,
 //! and outlives the posture that removed the migration machinery.
