@@ -34,6 +34,17 @@
 //! the thing that must be impossible. Two plugins claiming one extension is a
 //! loud registration error and **neither** gets it: a precedence rule there
 //! would make which plugin wins depend on directory iteration order.
+//!
+//! That contest is settled **per registry view**, not once per machine. A
+//! plugin's [`LoadedChunker::extensions`] are what it *claims*; which claim
+//! wins is a property of the set it is resolved against ([`resolve`]), and the
+//! set that governs a project is the one that project enabled. So two installed
+//! plugins fighting over `unity` leaves the extension to neither *machine-wide*
+//! — reported at load, as before — while a project that enabled only one of
+//! them routes to it. Resolving at install scope instead would let installing
+//! an unrelated plugin strip an extension from a project already using the
+//! other claimant, which is the exact opposite of "installing a plugin
+//! re-chunks nothing until a repository enables it".
 
 pub mod grammar;
 pub mod manifest;
@@ -156,7 +167,11 @@ impl fmt::Display for Diagnostic {
 /// One chunker entry, with its grammar resolved (or its reason for not being).
 #[derive(Debug)]
 pub struct LoadedChunker {
-    /// Extensions this entry still owns after conflict resolution.
+    /// Extensions this entry **claims**. Whether a claim wins is not a property
+    /// of the entry: it depends on which other plugins it is resolved against,
+    /// which is [`resolve`]'s question and differs between the installed set and
+    /// a project's enabled one. An entry that claimed a built-in extension is
+    /// voided at load and claims nothing at all.
     pub extensions: Vec<String>,
     pub strategy: LoadedStrategy,
 }
@@ -203,8 +218,15 @@ impl Plugin {
         })
     }
 
-    /// Every extension this plugin still owns after conflict resolution, in
-    /// declaration order. What `lore status` and `lore plugin list` report.
+    /// Every extension this plugin claims, in declaration order. What
+    /// `lore status` and `lore plugin list` report.
+    ///
+    /// Claims, not holdings: an extension another installed plugin also claims
+    /// is listed here and routes for whichever projects enable only one of
+    /// them. Contested-ness belongs in the diagnostics beside this list, which
+    /// name both claimants — a display that quietly dropped the extension
+    /// instead would leave an author reading `lore plugin list` unable to tell
+    /// "I never claimed it" from "somebody else claims it too".
     pub fn extensions(&self) -> Vec<&str> {
         self.chunkers
             .iter()
@@ -222,11 +244,15 @@ impl Plugin {
 /// on purpose: routing takes `Option<&PluginRegistry>` and knows nothing about
 /// enablement, which keeps "which plugins exist" and "which this project wants"
 /// from becoming two questions the chunker has to answer.
+///
+/// The extension map is [`resolve`]d against *this registry's* plugins, so a
+/// narrowed registry is not a filtered view of the wide one's map — it is the
+/// same resolution run over fewer claimants, which is the whole point.
 #[derive(Debug, Default)]
 pub struct PluginRegistry {
     plugins: Vec<Arc<Plugin>>,
     /// Extension → (plugin index, chunker index). Built-in extensions and
-    /// contested ones are absent by construction.
+    /// extensions contested *within this registry* are absent by construction.
     by_extension: BTreeMap<String, (usize, usize)>,
 }
 
@@ -298,26 +324,29 @@ impl PluginRegistry {
     ///
     /// An enabled name nobody installed simply contributes nothing, which is
     /// what makes it a reportable gap rather than an error.
+    ///
+    /// Conflicts are re-[`resolve`]d over the narrowed set rather than
+    /// inherited from the wide one. Two installed plugins fighting over an
+    /// extension must not cost it to a project that enabled only one of them:
+    /// resolving at install scope would let `lore plugin add` re-chunk a
+    /// project that never asked for the new plugin, which is precisely the
+    /// property "installing a plugin re-chunks nothing until a repository
+    /// enables it" promises. Resolution stays deterministic because it is a
+    /// pure function of this registry's plugin order and the enabled set — not
+    /// of who asked or when.
+    ///
+    /// The narrowed resolution's diagnostics are dropped, and nothing is lost
+    /// by it: a conflict *within* an enabled set is by definition a conflict
+    /// within the installed set, so it was already reported at load, by name,
+    /// with both claimants.
     pub fn enabled_only(&self, enabled: &BTreeSet<String>) -> Self {
-        let mut plugins = Vec::new();
-        // Old plugin index → new one; extensions of a disabled plugin are
-        // dropped rather than renumbered.
-        let mut moved: BTreeMap<usize, usize> = BTreeMap::new();
-        for (at, plugin) in self.plugins.iter().enumerate() {
-            if enabled.contains(&plugin.name) {
-                moved.insert(at, plugins.len());
-                plugins.push(Arc::clone(plugin));
-            }
-        }
-        let by_extension = self
-            .by_extension
+        let plugins: Vec<Arc<Plugin>> = self
+            .plugins
             .iter()
-            .filter_map(|(extension, (plugin, chunker))| {
-                moved
-                    .get(plugin)
-                    .map(|now| (extension.clone(), (*now, *chunker)))
-            })
+            .filter(|plugin| enabled.contains(&plugin.name))
+            .map(Arc::clone)
             .collect();
+        let (by_extension, _reported_at_load) = resolve(&plugins);
         Self {
             plugins,
             by_extension,
@@ -352,8 +381,7 @@ impl PluginRegistry {
     /// [`Diagnostic`] and costs only what it has to.
     pub fn load(dir: &Utf8Path) -> (Self, Vec<Diagnostic>) {
         let mut diagnostics = Vec::new();
-        let mut loaded: Vec<Plugin> = Vec::new();
-        let mut by_extension: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        let mut loaded: Vec<Arc<Plugin>> = Vec::new();
 
         let mut roots: Vec<Utf8PathBuf> = Vec::new();
         match std::fs::read_dir(dir) {
@@ -383,12 +411,8 @@ impl PluginRegistry {
         roots.sort();
 
         let mut names: BTreeSet<String> = BTreeSet::new();
-        // Extensions two plugins fought over. Kept so a third claimant does not
-        // quietly inherit a contested extension.
-        let mut contested: BTreeMap<String, Vec<String>> = BTreeMap::new();
-
         for root in roots {
-            let Some(plugin) = load_one(&root, &mut diagnostics) else {
+            let Some(mut plugin) = load_one(&root, &mut diagnostics) else {
                 continue;
             };
             if !names.insert(plugin.name.clone()) {
@@ -398,39 +422,31 @@ impl PluginRegistry {
                 });
                 continue;
             }
-            register(
-                &mut loaded,
-                &mut by_extension,
-                plugin,
-                &mut contested,
-                &mut diagnostics,
-            );
+            admit(&mut plugin, &mut diagnostics);
+            loaded.push(Arc::new(plugin));
         }
 
-        // Wrapped only once every conflict is settled: registration edits
-        // plugins that are already registered (a contested extension is taken
-        // back off its first holder), and shared plugins would make that a
-        // question about aliasing rather than about conflicts.
+        // Conflicts are settled *over* the loaded plugins rather than *into*
+        // them: a claim is a property of the manifest, and which claim wins is
+        // a property of the set it competes in. This is the machine-wide set,
+        // so these are the machine-wide conflicts — the ones a human is told
+        // about, whichever projects go on to enable which claimant.
+        let (by_extension, conflicts) = resolve(&loaded);
+        diagnostics.extend(conflicts);
         let registry = Self {
-            plugins: loaded.into_iter().map(Arc::new).collect(),
+            plugins: loaded,
             by_extension,
         };
         (registry, diagnostics)
     }
 }
 
-/// Fold one loaded plugin into the load-in-progress, resolving its extension
-/// claims against everything registered before it.
-fn register(
-    plugins: &mut Vec<Plugin>,
-    by_extension: &mut BTreeMap<String, (usize, usize)>,
-    mut plugin: Plugin,
-    contested: &mut BTreeMap<String, Vec<String>>,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    let index = plugins.len();
+/// Everything about one plugin that is true regardless of what else is
+/// installed: the built-in extensions it may not have, and the grammars it
+/// declared but cannot run.
+fn admit(plugin: &mut Plugin, diagnostics: &mut Vec<Diagnostic>) {
     let name = plugin.name.clone();
-    for (chunker_index, chunker) in plugin.chunkers.iter_mut().enumerate() {
+    for chunker in &mut plugin.chunkers {
         // A built-in claim voids the whole entry, not just the offending
         // extension: a chunker that claims `md` alongside `uxml` has
         // misunderstood the contract, and half-honoring it would be worse
@@ -447,35 +463,6 @@ fn register(
             chunker.extensions.clear();
             continue;
         }
-        chunker.extensions.retain(|extension| {
-            if let Some(holders) = contested.get_mut(extension) {
-                holders.push(name.clone());
-                diagnostics.push(Diagnostic::ExtensionConflict {
-                    extension: extension.clone(),
-                    plugins: holders.clone(),
-                });
-                return false;
-            }
-            match by_extension.remove(extension) {
-                Some((held_by, held_chunker)) => {
-                    let first = plugins[held_by].name.clone();
-                    plugins[held_by].chunkers[held_chunker]
-                        .extensions
-                        .retain(|held| held != extension);
-                    let holders = vec![first, name.clone()];
-                    diagnostics.push(Diagnostic::ExtensionConflict {
-                        extension: extension.clone(),
-                        plugins: holders.clone(),
-                    });
-                    contested.insert(extension.clone(), holders);
-                    false
-                }
-                None => {
-                    by_extension.insert(extension.clone(), (index, chunker_index));
-                    true
-                }
-            }
-        });
 
         if let LoadedStrategy::Grammar {
             config,
@@ -490,7 +477,55 @@ fn register(
             });
         }
     }
-    plugins.push(plugin);
+}
+
+/// Settle every extension claim in `plugins` against every other, without
+/// touching a plugin.
+///
+/// A contested extension goes to **nobody**, and stays contested for every
+/// later claimant — a precedence rule would make the winner depend on the order
+/// the roots happened to be visited in. Order still decides *which pair* is
+/// reported first, which is why [`PluginRegistry::load`] sorts them.
+///
+/// Pure, so the same plugins in the same order always resolve the same way.
+/// That is what lets one project's enabled set be resolved on its own without
+/// any risk that two views of one machine disagree about anything except the
+/// claimants they were given.
+fn resolve(plugins: &[Arc<Plugin>]) -> (BTreeMap<String, (usize, usize)>, Vec<Diagnostic>) {
+    let mut by_extension: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    // Extensions two plugins fought over. Kept so a third claimant does not
+    // quietly inherit a contested extension.
+    let mut contested: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut diagnostics = Vec::new();
+
+    for (index, plugin) in plugins.iter().enumerate() {
+        for (chunker_index, chunker) in plugin.chunkers.iter().enumerate() {
+            for extension in &chunker.extensions {
+                if let Some(holders) = contested.get_mut(extension) {
+                    holders.push(plugin.name.clone());
+                    diagnostics.push(Diagnostic::ExtensionConflict {
+                        extension: extension.clone(),
+                        plugins: holders.clone(),
+                    });
+                    continue;
+                }
+                match by_extension.remove(extension) {
+                    Some((held_by, _)) => {
+                        let holders = vec![plugins[held_by].name.clone(), plugin.name.clone()];
+                        diagnostics.push(Diagnostic::ExtensionConflict {
+                            extension: extension.clone(),
+                            plugins: holders.clone(),
+                        });
+                        contested.insert(extension.clone(), holders);
+                    }
+                    None => {
+                        by_extension.insert(extension.clone(), (index, chunker_index));
+                    }
+                }
+            }
+        }
+    }
+    (by_extension, diagnostics)
 }
 
 /// Reads, parses and resolves one plugin root. `None` (with a diagnostic) when
