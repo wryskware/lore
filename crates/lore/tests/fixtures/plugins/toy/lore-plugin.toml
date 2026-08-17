@@ -1,0 +1,27 @@
+# Toy chunker plugin, used by the engine tests. Deliberately shaped like the
+# Unity plugin the contract describes: an XML grammar for a UI markup
+# extension, plus capped line windows for a serialized-asset extension.
+
+[plugin]
+name = "toy"
+
+[[chunker]]
+extensions = ["uxml"]
+strategy = "grammar"
+grammar = "xml.wasm"
+language_tag = "xml"
+containers = ["element"]
+bodies = ["content"]
+attachments = ["Comment"]
+# XML puts an element's name in `element > STag > Name`, which is neither a
+# field nor a direct child, so the field lookup misses and `name_kinds` picks
+# it up one level down.
+name_kinds = ["Name"]
+
+[[chunker]]
+extensions = ["toydata"]
+strategy = "windows"
+max_file_bytes = 8192
+window_lines = 4
+overlap_lines = 1
+language_tag = "toydata"
