@@ -889,6 +889,305 @@ async fn a_restart_discards_staged_content_no_lease_can_reach() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// The heartbeat
+// ---------------------------------------------------------------------------
+
+/// A renewal is proof of life: it resets the TTL that would otherwise have
+/// reaped an idle lease.
+///
+/// The negative control is the same lease, the same TTL and no renewal, so what
+/// is under test is the renewal rather than this machine's timing. The TTL is
+/// short and the waits clear it by a third, in both directions.
+#[tokio::test]
+async fn a_renewal_keeps_an_idle_lease_alive_past_its_ttl() {
+    const TTL: Duration = Duration::from_millis(300);
+    const QUIET: Duration = Duration::from_millis(400);
+
+    let harness = harness_with(Fixture::neutral("demo"), |fixture| {
+        PushLeases::new(&fixture.data_dir, TTL, Duration::ZERO)
+    });
+    let router = &harness.router;
+    let (session, epoch) = lease(router).await;
+    let staging = harness.staging_dir(epoch);
+    negotiate(router, &session, epoch, &manifest()).await;
+    upload(router, &session, epoch, PUSHED_PATH, PUSHED.as_bytes()).await;
+    assert!(
+        harness.push.reap().is_empty(),
+        "a lease that has just been used is not quiet"
+    );
+
+    // Idle right through the TTL, then a heartbeat — which is the one thing a
+    // pusher with nothing to send is expected to do.
+    tokio::time::sleep(QUIET).await;
+    let (status, body) = post(
+        router,
+        "/v1/push/lease/renew",
+        json!({ "project": "demo", "session": session, "epoch": epoch }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["session"],
+        json!(session),
+        "the renewal echoes the lease"
+    );
+    assert_eq!(body["epoch"], epoch);
+
+    assert!(
+        harness.push.reap().is_empty(),
+        "the renewal reset the clock: this lease is not quiet any more"
+    );
+    assert_eq!(staged_files(&staging), 1, "nor was its staging touched");
+    assert_eq!(project_status(router).await["push_lease_epoch"], epoch);
+
+    // The same silence again, with no heartbeat this time.
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(
+        harness.push.reap(),
+        vec![staging.clone()],
+        "an unheartbeaten lease is reaped after the same wait"
+    );
+}
+
+/// A renewal names its epoch like every other push request, so a session that
+/// was taken over cannot quietly resurrect itself by heartbeating — and a
+/// renewal for a project nobody holds is refused rather than creating a lease.
+#[tokio::test]
+async fn a_renewal_from_a_taken_over_session_is_refused_by_name() {
+    let harness = harness();
+    let router = &harness.router;
+    let renew = async |session: &str, epoch: u64| {
+        post(
+            router,
+            "/v1/push/lease/renew",
+            json!({ "project": "demo", "session": session, "epoch": epoch }),
+        )
+        .await
+    };
+
+    // Nobody holds this project's lease yet. A heartbeat is not an acquire.
+    let (status, body) = renew("9f3a1c2b9f3a1c2b9f3a1c2b9f3a1c2b", 1).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(message(&body).contains("no push lease is held"), "{body}");
+
+    let (first, first_epoch) = lease(router).await;
+    let (second, second_epoch) = lease(router).await;
+    assert!(second_epoch > first_epoch);
+
+    let (status, body) = renew(&first, first_epoch).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let refusal = message(&body);
+    assert!(
+        refusal.contains("took over") && refusal.contains(&second_epoch.to_string()),
+        "a displaced session learns why its heartbeat failed: {refusal}"
+    );
+    assert_eq!(
+        project_status(router).await["push_lease_epoch"],
+        second_epoch,
+        "and the refused heartbeat changed nothing about who holds the lease"
+    );
+
+    // The holder's own heartbeat works, and re-advertises the cadences.
+    let (status, body) = renew(&second, second_epoch).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ttl = body["ttl_secs"].as_u64().expect("a ttl");
+    let heartbeat = body["heartbeat_secs"].as_u64().expect("a heartbeat");
+    assert!(
+        heartbeat > 0 && heartbeat < ttl,
+        "the advertised renewal cadence sits comfortably inside the TTL: \
+         {heartbeat}s of {ttl}s"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// What a path in a request is allowed to be
+// ---------------------------------------------------------------------------
+
+/// A path is a *lookup key*, never a filesystem path.
+///
+/// Two halves of one property. A path the session's manifest never listed is
+/// refused by name — a manifest is the complete listing, so an unlisted upload
+/// is not a smaller push but an unnegotiated one. And a traversal-shaped path
+/// that *is* listed still cannot escape, because staged content is named by the
+/// hash the receiver verified rather than by the string the client chose.
+#[tokio::test]
+async fn a_path_a_manifest_never_listed_is_refused_and_a_traversal_cannot_escape() {
+    const ESCAPE_PATH: &str = "../escape.txt";
+    const ESCAPE: &str = "content that must not land where this path points\n";
+
+    let harness = harness();
+    let router = &harness.router;
+    let (session, epoch) = lease(router).await;
+    let staging = harness.staging_dir(epoch);
+    let listing = Manifest::new(vec![entry(PUSHED_PATH, PUSHED), entry(ESCAPE_PATH, ESCAPE)]);
+    let (status, body) = negotiate(router, &session, epoch, &listing).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    for unlisted in ["src/never-listed.rs", "../../../escape2.txt"] {
+        let (status, body) = upload(router, &session, epoch, unlisted, PUSHED.as_bytes()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{unlisted}: {body}");
+        let refusal = message(&body);
+        assert!(
+            refusal.contains(unlisted) && refusal.contains("not in this session's manifest"),
+            "{unlisted}: {refusal}"
+        );
+    }
+
+    // The listed traversal is accepted as an upload — and lands under its hash.
+    let (status, body) = upload(router, &session, epoch, ESCAPE_PATH, ESCAPE.as_bytes()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = upload(router, &session, epoch, PUSHED_PATH, PUSHED.as_bytes()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let staged: Vec<String> = std::fs::read_dir(&staging)
+        .expect("the staging area exists")
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(staged.len(), 2, "both uploads staged: {staged:?}");
+    for name in &staged {
+        assert!(
+            name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit()),
+            "staged files are named by their content hash, never by the \
+             client's path string: {name}"
+        );
+    }
+
+    // Nowhere `../escape.txt` could have pointed, at any level above the
+    // staging directory it was uploaded into.
+    let staging_root = harness.fixture.data_dir.join(push::STAGING_DIR);
+    for dir in [&staging, &staging_root, &harness.fixture.data_dir] {
+        assert!(
+            !dir.join("escape.txt").exists(),
+            "an upload escaped the staging area into {dir}"
+        );
+    }
+    assert!(!harness.fixture.root.join("escape.txt").exists());
+}
+
+/// An epoch *above* the live lease cannot be a takeover — epochs are minted by
+/// the daemon — so it is refused as the fabrication it is, under its own name.
+///
+/// The distinction is the point: a pusher told "you were taken over" re-acquires
+/// and pushes again, which for a fabricated epoch would be an infinite retry of
+/// the wrong remedy.
+#[tokio::test]
+async fn an_epoch_the_daemon_never_minted_is_refused_as_fabricated_not_as_a_takeover() {
+    let harness = harness();
+    let router = &harness.router;
+    let (session, epoch) = lease(router).await;
+    let ahead = epoch + 1;
+
+    for (route, (status, body)) in [
+        (
+            "manifest",
+            negotiate(router, &session, ahead, &manifest()).await,
+        ),
+        ("commit", commit(router, &session, ahead).await),
+        (
+            "upload",
+            upload(router, &session, ahead, PUSHED_PATH, PUSHED.as_bytes()).await,
+        ),
+    ] {
+        assert_eq!(status, StatusCode::CONFLICT, "{route}: {body}");
+        let refusal = message(&body);
+        assert!(
+            refusal.contains(&format!("push epoch {ahead} is ahead of"))
+                && refusal.contains("never by a pusher"),
+            "{route}: {refusal}"
+        );
+        assert!(
+            !refusal.contains("took over"),
+            "{route}: a fabricated epoch is not a takeover, and telling a \
+             pusher it is sends it to re-acquire forever: {refusal}"
+        );
+    }
+
+    // The lease is untouched by the attempt: its real epoch still pushes.
+    assert_eq!(project_status(router).await["push_lease_epoch"], epoch);
+    let (status, body) = negotiate(router, &session, epoch, &manifest()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["needed"], json!([PUSHED_PATH]));
+}
+
+// ---------------------------------------------------------------------------
+// Deregistration
+// ---------------------------------------------------------------------------
+
+/// Deregistering a project takes its push state with it: the staged content of
+/// a lease that can no longer commit anything goes immediately rather than
+/// waiting for the reaper, and — because SQLite hands a deleted rowid straight
+/// back out — a later project inheriting that id must not inherit the lease.
+#[tokio::test]
+async fn deregistering_a_project_drops_the_push_state_bound_to_it() {
+    let harness = harness();
+    let router = &harness.router;
+    let original_id = harness.fixture.project.id;
+    let (session, epoch) = lease(router).await;
+    let staging = harness.staging_dir(epoch);
+    negotiate(router, &session, epoch, &manifest()).await;
+    upload(router, &session, epoch, PUSHED_PATH, PUSHED.as_bytes()).await;
+    assert_eq!(staged_files(&staging), 1);
+
+    let (status, body) = send(
+        router,
+        Request::builder()
+            .method("DELETE")
+            .uri("/v1/projects/demo")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !staging.exists(),
+        "staged content for a project that no longer exists is discarded at once"
+    );
+
+    // Nothing to push to: identity is the registry binding (D-0016), and the
+    // registry no longer has one.
+    let (status, body) = commit(router, &session, epoch).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(message(&body).contains("unknown project `demo`"), "{body}");
+
+    // The same name and root, registered again.
+    let (status, body) = post(
+        router,
+        "/v1/projects",
+        json!({ "root": harness.fixture.root.to_string(), "name": "demo" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let new_id = body["id"].as_i64().expect("a project id");
+    assert_eq!(
+        new_id, original_id,
+        "this test is only worth anything while the deleted rowid is reused — \
+         that reuse is the confusion `forget` exists to prevent"
+    );
+
+    // The old session named this very project id at this very epoch, and the
+    // lease it named is gone rather than inherited.
+    let (status, body) = commit(router, &session, epoch).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(message(&body).contains("no push lease is held"), "{body}");
+
+    // A fresh lease starts the epoch counter over, because the counter is a
+    // column on the project row and this is a new row.
+    let (next_session, next_epoch) = lease(router).await;
+    assert_ne!(next_session, session);
+    assert_eq!(
+        next_epoch, epoch,
+        "a new project row carries a new epoch counter, not the old one"
+    );
+    let (status, body) = negotiate(router, &next_session, next_epoch, &manifest()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["needed"],
+        json!([PUSHED_PATH]),
+        "and inherits nothing the discarded session staged"
+    );
+}
+
 /// The receiver's backstop: a pusher decides what to send, but the paths this
 /// daemon hard-excludes are not the pusher's to re-include.
 ///
