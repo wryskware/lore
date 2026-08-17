@@ -48,10 +48,52 @@ pub const DEFAULT_MAX_EMBED_BYTES: usize = crate::embed::text::MAX_EMBED_TEXT_BY
 /// visible change that forces a re-embed rather than silent vector mixing.
 pub const DEFAULT_MODEL_ID: &str = "default";
 
+/// Quiet period before a burst of watcher events becomes an index pass, when
+/// the file says nothing.
+///
+/// Twenty seconds, not the sub-second value a "live" watcher suggests: bench
+/// round 1 showed agent retrieval is front-loaded at task start, so searching
+/// for code *while* editing it is pathological and sub-10s freshness buys
+/// nothing (D-0015). What it costs is real — every micro-batch is a pass, a
+/// generation bump and an embed wake. `lore index` remains the immediate path
+/// for anyone who wants the index now.
+///
+/// An operational default, tunable without a new decision.
+pub const DEFAULT_WATCH_DEBOUNCE_SECS: u64 = 20;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub embeddings: EmbeddingsConfig,
+    pub watcher: WatcherConfig,
+}
+
+/// Filesystem-watch behaviour.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WatcherConfig {
+    /// Seconds of quiet before a burst of events is delivered as one batch.
+    /// Long enough to absorb an editor's write-temp-then-rename dance, a Unity
+    /// asset import, or a whole `cargo build`.
+    pub debounce_secs: u64,
+}
+
+impl Default for WatcherConfig {
+    fn default() -> Self {
+        Self {
+            debounce_secs: DEFAULT_WATCH_DEBOUNCE_SECS,
+        }
+    }
+}
+
+impl WatcherConfig {
+    /// The debounce actually handed to the watcher. Clamped to a second at the
+    /// bottom — a zero-length quiet period is not "immediate", it is a
+    /// debouncer that fires once per event, which is the storm behaviour the
+    /// pump exists to prevent. `lore index` is the immediate path.
+    pub fn debounce(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.debounce_secs.max(1))
+    }
 }
 
 /// External OpenAI-compatible embedding endpoint (D-0003: local-only; the

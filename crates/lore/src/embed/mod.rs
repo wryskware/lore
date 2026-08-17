@@ -237,6 +237,7 @@ impl Embedder {
 fn config_status(config: &EmbeddingsConfig) -> EmbeddingStatus {
     crate::config::Config {
         embeddings: config.clone(),
+        ..Default::default()
     }
     .embedding_status()
 }

@@ -1,7 +1,8 @@
 //! Filesystem watching → coalesced index work.
 //!
-//! One debouncer (`notify` + `notify-debouncer-full`, ~800 ms) with one
-//! recursive watch per registered project root. A debouncer per project would
+//! One debouncer (`notify` + `notify-debouncer-full`, tens of seconds — see
+//! [`crate::config::DEFAULT_WATCH_DEBOUNCE_SECS`]) with one recursive watch
+//! per registered project root. A debouncer per project would
 //! mean a background thread per project for no benefit — the debouncer
 //! already tracks paths independently, and a single event stream keeps
 //! ordering sane when roots nest.
@@ -58,11 +59,6 @@ use crate::store::{Project, ProjectId};
 use super::paths;
 use super::queue::IndexQueue;
 use super::walk;
-
-/// Quiet period before a burst of events is delivered. Long enough to absorb
-/// an editor's write-temp-then-rename dance and a Unity asset import, short
-/// enough that a save feels instant.
-pub const DEBOUNCE: Duration = Duration::from_millis(800);
 
 /// Debounced batches the pump may fall behind by before detail is dropped.
 ///
@@ -223,8 +219,8 @@ pub struct NotifyBackend {
 }
 
 impl NotifyBackend {
-    pub fn new(sink: EventSink) -> anyhow::Result<Self> {
-        let debouncer = new_debouncer(DEBOUNCE, None, move |batch: DebounceEventResult| {
+    pub fn new(sink: EventSink, debounce: Duration) -> anyhow::Result<Self> {
+        let debouncer = new_debouncer(debounce, None, move |batch: DebounceEventResult| {
             sink.send(batch);
         })?;
         Ok(Self {
@@ -500,10 +496,11 @@ pub async fn run(
     queue: IndexQueue,
     data_dir: Utf8PathBuf,
     status: WatchStatus,
+    debounce: Duration,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let (sink, events) = event_channel();
-    let backend = NotifyBackend::new(sink)?;
+    let backend = NotifyBackend::new(sink, debounce)?;
     run_with(
         Watcher {
             backend,
