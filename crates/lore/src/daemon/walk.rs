@@ -283,6 +283,16 @@ pub fn walk_files(
         // project stops inheriting the monorepo root's `.gitignore`. Under
         // D-0020 that project says what it wants in its own file, which is the
         // whole posture.
+        //
+        // The tempting fix is to scan upward but stop at the repository root,
+        // which is exactly git's own rule. Considered and refused (issue #27):
+        // it makes a core boundary *git-dependent*, in a walker that set
+        // `require_git(false)` a few lines down precisely so a `.gitignore`
+        // means what it says before anyone has run `git init`. It would do
+        // nothing at all for a plain directory or a non-git workspace, and
+        // teaching lore to recognise every VCS's root marker is a worse
+        // dependency than the one it removes. One rule that holds everywhere
+        // beats a better rule that holds for git users.
         .parents(false)
         .git_ignore(true)
         // Not among the three decided sources: `.git/info/exclude` lives inside
