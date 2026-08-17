@@ -5,6 +5,18 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["wasm-grammars"]
+# Runtime `.wasm` tree-sitter grammars for chunker plugins (wasmtime, via
+# tree-sitter's own `wasm` feature). Default-on because the flagship plugin
+# shape needs it; separable because the spike measured the cost at +42 s clean
+# build, +10.2 MiB binary and +101 crates, which a grammar-bundled-only build
+# should not have to pay. Everything else about plugins — manifests, the
+# registry, fingerprints, the `windows` strategy — compiles without it, and a
+# manifest declaring a `grammar` chunker still *parses*: the chunker registers
+# as unavailable with a typed reason instead of failing the plugin.
+wasm-grammars = ["tree-sitter/wasm"]
+
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true

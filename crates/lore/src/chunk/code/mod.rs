@@ -32,36 +32,78 @@ use tree_sitter::{Language, Node, Parser};
 use super::common::{
     Emitter, MAX_CHUNK_BYTES, SMALL_CONTAINER_BYTES, TINY_CHUNK_BYTES, Tpl, trim_span,
 };
+use crate::plugin::{Grammar, GrammarChunker};
 use crate::types::Chunk;
+
+/// Where a [`Spec`]'s grammar comes from.
+///
+/// A `fn() -> Language` cannot express a wasm grammar: that one comes from a
+/// fallible call against a live `WasmStore`, and the parser it runs in owns
+/// that store. This enum is the whole of that difference — the walker below
+/// never looks at it.
+pub(crate) enum LanguageSource<'a> {
+    /// A grammar linked at compile time.
+    Native(fn() -> Language),
+    /// A plugin's `.wasm` grammar, parsed on this thread's pooled parser.
+    Plugin(&'a Grammar),
+}
+
+/// Declaration name extraction.
+pub(crate) enum NameOf<'a> {
+    /// A built-in extractor, which may know anything about its grammar.
+    Fn(fn(Node<'_>, &str) -> Option<String>),
+    /// The declarative form a manifest can express: the tree-sitter field
+    /// `field`, then — only if that misses — the first node whose kind is in
+    /// `kinds`, searched over the declaration's named children and *their*
+    /// named children.
+    ///
+    /// The two-level reach is the one extra mechanism the contract's open
+    /// question allowed, and it exists because of a real shape rather than a
+    /// hypothetical one: XML puts an element's name in `element > STag > Name`,
+    /// which is not a field on `element` and not a direct child of it either,
+    /// so a field-only rule would name every UXML element `element`. It is
+    /// deliberately not a query engine — no captures, no predicates, no
+    /// `.scm`; a grammar that needs more than this is evidence for the
+    /// tags-query convergence the contract left open, not for growing this.
+    Declared {
+        field: &'a str,
+        kinds: &'a [&'a str],
+    },
+}
 
 /// Per-language node-kind vocabulary. Kind lists are cheap supersets; an
 /// unknown kind simply falls through to filler.
-pub(crate) struct Spec {
-    /// Grammar constructor.
-    pub language: fn() -> Language,
+///
+/// The lifetime is what lets one struct serve both a built-in spec (whose kind
+/// lists are `'static` literals) and a plugin's (whose come from a manifest
+/// read at runtime). Built-ins construct `Spec<'static>` and are otherwise
+/// unchanged.
+pub(crate) struct Spec<'a> {
+    /// Grammar source.
+    pub language: LanguageSource<'a>,
     /// Value for [`Chunk::language`].
-    pub tag: &'static str,
+    pub tag: &'a str,
     /// Containers that only contribute a path segment (namespaces, modules).
-    pub path_only: &'static [&'static str],
+    pub path_only: &'a [&'a str],
     /// Containers whose members become chunks of their own.
-    pub containers: &'static [&'static str],
+    pub containers: &'a [&'a str],
     /// Leaf declarations worth a chunk.
-    pub symbols: &'static [&'static str],
+    pub symbols: &'a [&'a str],
     /// Nodes wrapping a declaration (`export`, decorators, C# global stmts).
-    pub wrappers: &'static [&'static str],
+    pub wrappers: &'a [&'a str],
     /// Body nodes searched for members of a container.
-    pub bodies: &'static [&'static str],
+    pub bodies: &'a [&'a str],
     /// Preceding siblings that belong to the declaration that follows them.
-    pub attachments: &'static [&'static str],
+    pub attachments: &'a [&'a str],
     /// Declarations that scope every *following* sibling rather than their
     /// own children (C# file-scoped namespaces).
-    pub trailing_scope: &'static [&'static str],
+    pub trailing_scope: &'a [&'a str],
     /// Declaration name extraction.
-    pub name_of: fn(Node<'_>, &str) -> Option<String>,
+    pub name_of: NameOf<'a>,
 }
 
 /// Returns the spec for a lowercase language tag, if it is one we parse.
-pub(crate) fn spec_for(tag: &str) -> Option<Spec> {
+pub(crate) fn spec_for(tag: &str) -> Option<Spec<'static>> {
     match tag {
         "csharp" => Some(csharp::spec()),
         "rust" => Some(rust::spec()),
@@ -75,15 +117,61 @@ pub(crate) fn spec_for(tag: &str) -> Option<Spec> {
 
 /// Chunks source text with the given language spec. Returns `None` when the
 /// grammar refuses the source, so the caller can fall back to text windows.
-pub(crate) fn chunk_code(spec: &Spec, path: &Utf8PathBuf, src: &str) -> Option<Vec<Chunk>> {
-    let mut parser = Parser::new();
-    parser.set_language(&(spec.language)()).ok()?;
-    let tree = parser.parse(src, None)?;
+pub(crate) fn chunk_code(spec: &Spec<'_>, path: &Utf8PathBuf, src: &str) -> Option<Vec<Chunk>> {
+    let tree = match &spec.language {
+        LanguageSource::Native(language) => {
+            let mut parser = Parser::new();
+            parser.set_language(&language()).ok()?;
+            parser.parse(src, None)?
+        }
+        LanguageSource::Plugin(grammar) => grammar.parse(src)?,
+    };
     let mut emitter = Emitter::new(path, Some(spec.tag), src);
     let root = tree.root_node();
     let items = collect_items(spec, src, root, "");
     emit_items(spec, src, &items, &mut emitter);
     Some(emitter.finish())
+}
+
+/// Chunks with a plugin's declared grammar mapping, through the same walker.
+///
+/// The borrowed `&str` views live only for this call: a manifest holds
+/// `String`s, the walker wants `&[&str]`, and the conversion is eight tiny
+/// allocations against a whole tree-sitter parse — invisible, and it leaves
+/// built-in specs at exactly zero cost and zero change.
+pub(crate) fn chunk_plugin_grammar(
+    config: &GrammarChunker,
+    grammar: &Grammar,
+    path: &Utf8PathBuf,
+    src: &str,
+) -> Option<Vec<Chunk>> {
+    fn borrow(kinds: &[String]) -> Vec<&str> {
+        kinds.iter().map(String::as_str).collect()
+    }
+    let path_only = borrow(&config.path_only);
+    let containers = borrow(&config.containers);
+    let symbols = borrow(&config.symbols);
+    let wrappers = borrow(&config.wrappers);
+    let bodies = borrow(&config.bodies);
+    let attachments = borrow(&config.attachments);
+    let trailing_scope = borrow(&config.trailing_scope);
+    let name_kinds = borrow(&config.name_kinds);
+    let spec = Spec {
+        language: LanguageSource::Plugin(grammar),
+        tag: &config.language_tag,
+        path_only: &path_only,
+        containers: &containers,
+        symbols: &symbols,
+        wrappers: &wrappers,
+        bodies: &bodies,
+        attachments: &attachments,
+        trailing_scope: &trailing_scope,
+        name_of: NameOf::Declared {
+            field: &config.name_field,
+            kinds: &name_kinds,
+        },
+    };
+    chunk_code(&spec, path, src)
 }
 
 /// One candidate chunk within a scope.
@@ -109,7 +197,7 @@ impl Item<'_> {
     }
 }
 
-fn collect_items<'t>(spec: &Spec, src: &str, scope: Node<'t>, prefix: &str) -> Vec<Item<'t>> {
+fn collect_items<'t>(spec: &Spec<'_>, src: &str, scope: Node<'t>, prefix: &str) -> Vec<Item<'t>> {
     let mut cursor = scope.walk();
     let children: Vec<Node<'t>> = scope.named_children(&mut cursor).collect();
     let (starts, absorbed) = attach_leading(spec, src, &children);
@@ -163,7 +251,7 @@ fn collect_items<'t>(spec: &Spec, src: &str, scope: Node<'t>, prefix: &str) -> V
     items
 }
 
-fn emit_items(spec: &Spec, src: &str, items: &[Item<'_>], emitter: &mut Emitter<'_>) {
+fn emit_items(spec: &Spec<'_>, src: &str, items: &[Item<'_>], emitter: &mut Emitter<'_>) {
     let mut i = 0;
     while i < items.len() {
         let item = &items[i];
@@ -206,7 +294,7 @@ fn emit_items(spec: &Spec, src: &str, items: &[Item<'_>], emitter: &mut Emitter<
     }
 }
 
-fn emit_container(spec: &Spec, src: &str, item: &Item<'_>, emitter: &mut Emitter<'_>) {
+fn emit_container(spec: &Spec<'_>, src: &str, item: &Item<'_>, emitter: &mut Emitter<'_>) {
     let node = item.node.expect("containers carry their node");
     let members = collect_items(spec, src, body_scope(spec, node), &item.symbol_path);
     let whole = Tpl::Code {
@@ -242,7 +330,7 @@ fn emit_container(spec: &Spec, src: &str, item: &Item<'_>, emitter: &mut Emitter
 /// siblings were consumed that way. A comment that attaches to nothing — a
 /// file header followed by a blank line, a trailing note — stays behind as
 /// its own content so no bytes are silently dropped.
-fn attach_leading(spec: &Spec, src: &str, children: &[Node<'_>]) -> (Vec<usize>, Vec<bool>) {
+fn attach_leading(spec: &Spec<'_>, src: &str, children: &[Node<'_>]) -> (Vec<usize>, Vec<bool>) {
     let mut starts: Vec<usize> = children.iter().map(Node::start_byte).collect();
     let mut absorbed = vec![false; children.len()];
     for i in 0..children.len() {
@@ -267,7 +355,7 @@ fn attach_leading(spec: &Spec, src: &str, children: &[Node<'_>]) -> (Vec<usize>,
     (starts, absorbed)
 }
 
-fn unwrap<'t>(spec: &Spec, node: Node<'t>) -> Node<'t> {
+fn unwrap<'t>(spec: &Spec<'_>, node: Node<'t>) -> Node<'t> {
     if !spec.wrappers.contains(&node.kind()) {
         return node;
     }
@@ -286,15 +374,47 @@ fn unwrap<'t>(spec: &Spec, node: Node<'t>) -> Node<'t> {
     }
 }
 
-fn body_scope<'t>(spec: &Spec, node: Node<'t>) -> Node<'t> {
+fn body_scope<'t>(spec: &Spec<'_>, node: Node<'t>) -> Node<'t> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|c| spec.bodies.contains(&c.kind()))
         .unwrap_or(node)
 }
 
-fn name_of(spec: &Spec, node: Node<'_>, src: &str) -> String {
-    (spec.name_of)(node, src).unwrap_or_else(|| node.kind().to_string())
+fn name_of(spec: &Spec<'_>, node: Node<'_>, src: &str) -> String {
+    let found = match &spec.name_of {
+        NameOf::Fn(extract) => extract(node, src),
+        NameOf::Declared { field, kinds } => declared_name(node, src, field, kinds),
+    };
+    found.unwrap_or_else(|| node.kind().to_string())
+}
+
+/// The declarative extractor behind [`NameOf::Declared`].
+fn declared_name(node: Node<'_>, src: &str, field: &str, kinds: &[&str]) -> Option<String> {
+    if let Some(named) = node
+        .child_by_field_name(field)
+        .map(|n| node_text(n, src))
+        .filter(|n| !n.is_empty())
+    {
+        return Some(named);
+    }
+    if kinds.is_empty() {
+        return None;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if kinds.contains(&child.kind()) {
+            return Some(node_text(child, src)).filter(|n| !n.is_empty());
+        }
+        let mut inner = child.walk();
+        if let Some(found) = child
+            .named_children(&mut inner)
+            .find(|n| kinds.contains(&n.kind()))
+        {
+            return Some(node_text(found, src)).filter(|n| !n.is_empty());
+        }
+    }
+    None
 }
 
 fn dotted(prefix: &str, name: &str) -> String {

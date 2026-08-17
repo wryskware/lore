@@ -36,6 +36,29 @@ pub const TEXT_WINDOW_MAX_BYTES: usize = 8000;
 /// Lines shared between consecutive windows.
 pub const WINDOW_OVERLAP_LINES: u32 = 10;
 
+/// The line windower's geometry. [`Default`] is core's, and is what every
+/// built-in path uses; a chunker plugin may substitute *tighter* values (see
+/// [`crate::plugin`]), never looser ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowCaps {
+    pub window_lines: u32,
+    /// Byte ceiling per window. Not author-settable: it exists to guard
+    /// pathological single-line files, which is core's concern rather than a
+    /// per-format one.
+    pub max_bytes: usize,
+    pub overlap_lines: u32,
+}
+
+impl Default for WindowCaps {
+    fn default() -> Self {
+        Self {
+            window_lines: TEXT_WINDOW_LINES,
+            max_bytes: TEXT_WINDOW_MAX_BYTES,
+            overlap_lines: WINDOW_OVERLAP_LINES,
+        }
+    }
+}
+
 /// UTF-8 byte order mark. Windows editors write it routinely, it is *not*
 /// whitespace (U+FEFF is `Cf`, so `trim` leaves it), and it belongs to the
 /// file's encoding rather than to its content.

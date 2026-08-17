@@ -6,13 +6,13 @@
 
 use tree_sitter::Node;
 
-use super::{Spec, child_of_kind, field_name, node_text};
+use super::{LanguageSource, NameOf, Spec, child_of_kind, field_name, node_text};
 
-pub(crate) fn javascript() -> Spec {
+pub(crate) fn javascript() -> Spec<'static> {
     make(|| tree_sitter_javascript::LANGUAGE.into(), "javascript")
 }
 
-pub(crate) fn typescript() -> Spec {
+pub(crate) fn typescript() -> Spec<'static> {
     make(
         || tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         "typescript",
@@ -20,13 +20,13 @@ pub(crate) fn typescript() -> Spec {
 }
 
 /// TSX parses `.tsx`; the language tag stays `typescript`.
-pub(crate) fn tsx() -> Spec {
+pub(crate) fn tsx() -> Spec<'static> {
     make(|| tree_sitter_typescript::LANGUAGE_TSX.into(), "typescript")
 }
 
-fn make(language: fn() -> tree_sitter::Language, tag: &'static str) -> Spec {
+fn make(language: fn() -> tree_sitter::Language, tag: &'static str) -> Spec<'static> {
     Spec {
-        language,
+        language: LanguageSource::Native(language),
         tag,
         path_only: &["internal_module", "module"],
         containers: &[
@@ -52,7 +52,7 @@ fn make(language: fn() -> tree_sitter::Language, tag: &'static str) -> Spec {
         bodies: &["class_body", "interface_body", "enum_body", "object_type"],
         attachments: &["comment", "decorator"],
         trailing_scope: &[],
-        name_of,
+        name_of: NameOf::Fn(name_of),
     }
 }
 

@@ -2,22 +2,33 @@
 
 use camino::Utf8PathBuf;
 
-use super::common::{
-    Emitter, LineIndex, TEXT_WINDOW_LINES, TEXT_WINDOW_MAX_BYTES, WINDOW_OVERLAP_LINES,
-};
+use super::common::{Emitter, LineIndex, WindowCaps};
 use crate::types::{Chunk, ChunkKind};
 
 /// `language` is `Some` only when a known language failed to parse and we are
 /// degrading to windows rather than dropping the file.
 pub(crate) fn chunk_text(path: &Utf8PathBuf, src: &str, language: Option<&str>) -> Vec<Chunk> {
+    chunk_text_with(path, src, language, WindowCaps::default())
+}
+
+/// [`chunk_text`] with explicit geometry — the seam a `windows`-strategy
+/// chunker plugin parameterizes. Identical to the default path when `caps` is
+/// [`WindowCaps::default`], which is what keeps a file no plugin claims
+/// byte-identical to before plugins existed.
+pub(crate) fn chunk_text_with(
+    path: &Utf8PathBuf,
+    src: &str,
+    language: Option<&str>,
+    caps: WindowCaps,
+) -> Vec<Chunk> {
     let lines = LineIndex::new(src);
     let spans: Vec<(usize, usize)> = lines
         .windows(
             1,
             lines.line_count(),
-            TEXT_WINDOW_LINES,
-            TEXT_WINDOW_MAX_BYTES,
-            WINDOW_OVERLAP_LINES,
+            caps.window_lines,
+            caps.max_bytes,
+            caps.overlap_lines,
         )
         .into_iter()
         .map(|(first, last)| (lines.line_start(first), lines.line_end(last)))

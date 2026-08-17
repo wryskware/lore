@@ -3,11 +3,11 @@
 
 use tree_sitter::Node;
 
-use super::{Spec, field_name};
+use super::{LanguageSource, NameOf, Spec, field_name};
 
-pub(crate) fn spec() -> Spec {
+pub(crate) fn spec() -> Spec<'static> {
     Spec {
-        language: || tree_sitter_python::LANGUAGE.into(),
+        language: LanguageSource::Native(|| tree_sitter_python::LANGUAGE.into()),
         tag: "python",
         path_only: &[],
         containers: &["class_definition"],
@@ -16,6 +16,6 @@ pub(crate) fn spec() -> Spec {
         bodies: &["block"],
         attachments: &["comment"],
         trailing_scope: &[],
-        name_of: |node: Node<'_>, src: &str| field_name(node, src),
+        name_of: NameOf::Fn(|node: Node<'_>, src: &str| field_name(node, src)),
     }
 }

@@ -7,11 +7,11 @@
 
 use tree_sitter::Node;
 
-use super::{Spec, field_name, node_text};
+use super::{LanguageSource, NameOf, Spec, field_name, node_text};
 
-pub(crate) fn spec() -> Spec {
+pub(crate) fn spec() -> Spec<'static> {
     Spec {
-        language: || tree_sitter_rust::LANGUAGE.into(),
+        language: LanguageSource::Native(|| tree_sitter_rust::LANGUAGE.into()),
         tag: "rust",
         path_only: &["mod_item"],
         containers: &["impl_item", "trait_item"],
@@ -37,7 +37,7 @@ pub(crate) fn spec() -> Spec {
             "inner_attribute_item",
         ],
         trailing_scope: &[],
-        name_of,
+        name_of: NameOf::Fn(name_of),
     }
 }
 

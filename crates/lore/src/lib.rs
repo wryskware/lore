@@ -11,6 +11,8 @@
 //! - [`config`] — optional `config.toml` in the data directory.
 //! - [`repo_config`] — the repo-committed `.lore.toml` that opts a repository
 //!   into authority semantics at all (D-0012).
+//! - [`plugin`] — chunker plugins: `lore-plugin.toml`, the registry that
+//!   answers "which plugin owns this extension", and runtime `.wasm` grammars.
 //! - [`embed`] — local embedding client, health and the backfill worker.
 //! - [`daemon`] — lifecycle, HTTP API, watcher and indexing.
 //! - [`setup`] — the agent-side assets `lore setup` installs into a coding
@@ -21,6 +23,7 @@ pub mod chunk;
 pub mod config;
 pub mod daemon;
 pub mod embed;
+pub mod plugin;
 pub mod registry;
 pub mod repo_config;
 pub mod setup;

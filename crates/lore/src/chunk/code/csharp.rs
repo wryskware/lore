@@ -14,11 +14,11 @@
 
 use tree_sitter::Node;
 
-use super::{Spec, child_of_kind, field_name, node_text};
+use super::{LanguageSource, NameOf, Spec, child_of_kind, field_name, node_text};
 
-pub(crate) fn spec() -> Spec {
+pub(crate) fn spec() -> Spec<'static> {
     Spec {
-        language: || tree_sitter_c_sharp::LANGUAGE.into(),
+        language: LanguageSource::Native(|| tree_sitter_c_sharp::LANGUAGE.into()),
         tag: "csharp",
         path_only: &["namespace_declaration"],
         containers: &[
@@ -48,7 +48,7 @@ pub(crate) fn spec() -> Spec {
         bodies: &["declaration_list", "enum_member_declaration_list"],
         attachments: &["comment", "attribute_list"],
         trailing_scope: &["file_scoped_namespace_declaration"],
-        name_of,
+        name_of: NameOf::Fn(name_of),
     }
 }
 

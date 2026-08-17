@@ -20,11 +20,12 @@ use camino::{Utf8Path, Utf8PathBuf};
 
 pub use common::{
     BINARY_SNIFF_BYTES, MAX_CHUNK_BYTES, MAX_FILE_BYTES, SMALL_CONTAINER_BYTES, TEXT_WINDOW_LINES,
-    TEXT_WINDOW_MAX_BYTES, TINY_CHUNK_BYTES, WINDOW_OVERLAP_LINES,
+    TEXT_WINDOW_MAX_BYTES, TINY_CHUNK_BYTES, WINDOW_OVERLAP_LINES, WindowCaps,
 };
 
 /// `D-NNNN` extraction, shared with [`crate::authority`]'s ledger parser so
 /// the two agree on what a decision reference looks like.
+use crate::plugin::{Claim, LoadedStrategy, PluginRegistry, Unavailable};
 use crate::repo_config::Profile;
 use crate::types::Chunk;
 
@@ -58,7 +59,8 @@ pub const MAX_TEXT_LINE_BYTES: usize = 4096;
 /// Why a file produced no chunks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
-    /// Larger than [`MAX_FILE_BYTES`].
+    /// Larger than [`MAX_FILE_BYTES`] — or than the tighter `max_file_bytes`
+    /// of the chunker plugin that claimed the extension.
     TooLarge,
     /// NUL byte within the first [`BINARY_SNIFF_BYTES`].
     Binary,
@@ -114,7 +116,93 @@ pub fn is_markdown(rel_path: &Utf8Path) -> bool {
 /// *text*, spans and ids are identical either way — only the metadata differs
 /// — so flipping a profile costs a re-chunk, never a re-embed.
 pub fn chunk_file(rel_path: &Utf8Path, content: &[u8], profile: Option<Profile>) -> FileChunks {
-    if content.len() > MAX_FILE_BYTES {
+    chunk_file_with(rel_path, content, profile, None).chunks
+}
+
+/// Which chunker actually handled a file. The daemon counts these for
+/// `status`, because the contract's one quality-cliff requirement is that a
+/// file falling back for want of a plugin is **visible**, never silent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    /// A built-in chunker, or the unknown-text fallback with nobody claiming
+    /// the extension.
+    Builtin,
+    /// A chunker plugin handled it. The fingerprint is the plugin's whole
+    /// version identity, and belongs in the file's content hash.
+    Plugin { plugin: String, fingerprint: String },
+    /// A plugin claimed the extension but could not run, so the file took the
+    /// built-in fallback path instead.
+    FellBack { plugin: String, reason: Unavailable },
+}
+
+/// [`chunk_file`]'s result, plus who produced it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkOutcome {
+    pub chunks: FileChunks,
+    pub route: Route,
+}
+
+/// [`chunk_file`] with a chunker-plugin registry consulted **after** the
+/// built-ins and **before** the unknown-text fallback.
+///
+/// `plugins: None` is exactly the pre-plugin pipeline, byte for byte: same
+/// chunks, same ids, same metadata. So is a registry that claims nothing about
+/// this file's extension. That is the property the whole feature rests on —
+/// installing a plugin must never move a chunk it does not own.
+pub fn chunk_file_with(
+    rel_path: &Utf8Path,
+    content: &[u8],
+    profile: Option<Profile>,
+    plugins: Option<&PluginRegistry>,
+) -> ChunkOutcome {
+    let path = Utf8PathBuf::from(rel_path.as_str().replace('\\', "/"));
+    let extension = path
+        .extension()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+
+    // Built-ins win every extension conflict, unconditionally. The registry
+    // refuses to *register* a built-in extension in the first place; this is
+    // the second lock on the same door, so that even a registry built some
+    // other way cannot take `.md` (and with it frontmatter authority) away
+    // from core.
+    let claim = match is_builtin_extension(&extension) {
+        true => None,
+        false => plugins.and_then(|registry| registry.claim_extension(&extension)),
+    };
+    let route = match claim {
+        None => Route::Builtin,
+        Some(claim) => match claim.unavailable() {
+            None => Route::Plugin {
+                plugin: claim.plugin.to_string(),
+                fingerprint: claim.fingerprint.to_string(),
+            },
+            Some(reason) => Route::FellBack {
+                plugin: claim.plugin.to_string(),
+                reason: reason.clone(),
+            },
+        },
+    };
+
+    ChunkOutcome {
+        chunks: chunk_routed(&path, &extension, content, profile, claim),
+        route,
+    }
+}
+
+fn chunk_routed(
+    path: &Utf8PathBuf,
+    extension: &str,
+    content: &[u8],
+    profile: Option<Profile>,
+    claim: Option<Claim<'_>>,
+) -> FileChunks {
+    // A plugin may only *tighten* this (validated at manifest parse), so the
+    // core ceiling still binds every file.
+    let max_file_bytes = claim
+        .and_then(|claim| claim.max_file_bytes())
+        .unwrap_or(MAX_FILE_BYTES);
+    if content.len() > max_file_bytes {
         return FileChunks::Skipped(SkipReason::TooLarge);
     }
     let sniff = &content[..content.len().min(BINARY_SNIFF_BYTES)];
@@ -125,17 +213,11 @@ pub fn chunk_file(rel_path: &Utf8Path, content: &[u8], profile: Option<Profile>)
         return FileChunks::Skipped(SkipReason::InvalidUtf8);
     };
 
-    let path = Utf8PathBuf::from(rel_path.as_str().replace('\\', "/"));
-    let extension = path
-        .extension()
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default();
-
     if extension == "md" {
-        return FileChunks::Chunked(markdown::chunk_markdown(&path, src, profile));
+        return FileChunks::Chunked(markdown::chunk_markdown(path, src, profile));
     }
-    if let Some(spec) = language_tag(&extension).and_then(code::spec_for) {
-        if let Some(chunks) = code::chunk_code(&spec, &path, src) {
+    if let Some(spec) = language_tag(extension).and_then(code::spec_for) {
+        if let Some(chunks) = code::chunk_code(&spec, path, src) {
             return FileChunks::Chunked(chunks);
         }
         // Grammar refused the file: degrade to windows rather than lose it —
@@ -143,18 +225,71 @@ pub fn chunk_file(rel_path: &Utf8Path, content: &[u8], profile: Option<Profile>)
         if is_machine_text(src) {
             return FileChunks::Skipped(SkipReason::MachineText);
         }
-        return FileChunks::Chunked(text::chunk_text(&path, src, Some(spec.tag)));
+        return FileChunks::Chunked(text::chunk_text(path, src, Some(spec.tag)));
     }
+
+    if let Some(claim) = claim {
+        match claim.strategy {
+            LoadedStrategy::Windows(windows) => {
+                // The machine-text guard stays on for plugin-routed windows.
+                // A serialized blob with one 4 KB line is token noise whoever
+                // claimed the extension, and the guard is precisely a
+                // window-path rule — the structural strategies are the ones
+                // exempt from it, not the trusted formats.
+                if is_machine_text(src) {
+                    return FileChunks::Skipped(SkipReason::MachineText);
+                }
+                return FileChunks::Chunked(text::chunk_text_with(
+                    path,
+                    src,
+                    windows.language_tag.as_deref(),
+                    windows.caps,
+                ));
+            }
+            LoadedStrategy::Grammar {
+                config,
+                grammar: Ok(grammar),
+            } => {
+                if let Some(chunks) = code::chunk_plugin_grammar(config, grammar, path, src) {
+                    return FileChunks::Chunked(chunks);
+                }
+                if is_machine_text(src) {
+                    return FileChunks::Skipped(SkipReason::MachineText);
+                }
+                return FileChunks::Chunked(text::chunk_text(
+                    path,
+                    src,
+                    Some(&config.language_tag),
+                ));
+            }
+            // Claimed, but the grammar could not be loaded. The file takes the
+            // ordinary fallback path; `Route::FellBack` is what makes that
+            // countable rather than invisible.
+            LoadedStrategy::Grammar { .. } => {}
+        }
+    }
+
     if is_machine_text(src) {
         return FileChunks::Skipped(SkipReason::MachineText);
     }
-    FileChunks::Chunked(text::chunk_text(&path, src, None))
+    FileChunks::Chunked(text::chunk_text(path, src, None))
 }
 
 /// Only window-chunked paths get this guard: code that parses and Markdown
 /// keep their own structure even with the odd long line (tables, data URIs).
 fn is_machine_text(src: &str) -> bool {
     src.lines().any(|line| line.len() > MAX_TEXT_LINE_BYTES)
+}
+
+/// Does a built-in chunker own this (lowercase, bare) extension?
+///
+/// Derived from [`language_tag`] plus Markdown rather than restated as a
+/// second list, so adding a built-in language automatically closes that
+/// extension to plugins instead of quietly opening a race for it. Markdown is
+/// named here for the reason it is named everywhere: authority extraction is
+/// core's, permanently.
+pub fn is_builtin_extension(extension: &str) -> bool {
+    extension == "md" || language_tag(extension).is_some()
 }
 
 /// Internal parser key for an extension (`tsx` selects the TSX grammar; the
