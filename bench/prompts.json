@@ -1,24 +1,25 @@
 {
-  "_comment": "Machine copy of the frozen prompts in design/9_Scratch/2026-08-15_e2e-round-1-answer-key.md (the authority). Prompts only — keys never go here.",
+  "_comment": "Machine copy of the prompts frozen in design/6_Evaluation/2026-08-17_e2e-round-2-task-set.md (the authority). Prompts only - keys never go here. Frozen WITHIN a round: editing one means bumping _task_set and re-freezing the keys with it. run.ps1 records _task_set and the prompt's sha256 into every cell's metrics.json.",
+  "_task_set": "round-2",
   "lexomancy": {
     "T1": "how does a surge cast i submit actually end up damaging an enemy? walk me through the code path, files and classes at each step",
     "T2": "do axioms cost lexic residue? is there a slot limit or tiers?",
-    "T3": "i thought we removed residue from the design. is it still referenced in the code anywhere? list everything you find",
-    "T4": "why is battle targeting rng-free? whats the pick order",
-    "T5": "add a tiebreaker to enemy targeting: prefer lowest shield percentage, between effective damage and hp fraction. keep it deterministic and add tests"
+    "T3": "i thought we removed residue from the design. is it still referenced anywhere in the game? code and assets, list everything you find",
+    "T4": "did we look at lanes for targeting? why'd we drop it, and where's that written down",
+    "T5": "add a tiebreaker to enemy targeting: prefer lowest shield percentage, between effective damage and hp fraction. keep it deterministic, handle the edge cases, and add tests"
   },
   "terrarium": {
     "T1": "how does stem loudness end up changing how bright a species is on screen? trace it from the python side all the way through",
-    "T2": "does the web app still use embedding.json? and is docs/handoff.md still an accurate picture of what we're doing",
-    "T3": "list every place in web/src that reads timeline channel or event data after load",
-    "T4": "why did we go with the random projection driver bank thing instead of just using the raw embedding",
-    "T5": "the server's track content version only hashes the timeline files but we serve audio.wav too. include the wav in the version and update the test"
+    "T2": "does the mapping still run off the raw 1024-dim embedding? and is that still the plan",
+    "T3": "list every place in web/src that reads channel or event values at runtime. sampler calls and features-frame reads both count",
+    "T4": "which sim substrate were we leaning toward before the current one? why'd we drop it, and where's that written down",
+    "T5": "the server's track content version only hashes the timeline files but we serve audio.wav too. make the version cover the wav and update the test"
   },
   "lore": {
     "T1": "walk me through what happens when an mcp search call comes in, from the proxy to the ranked results. files and functions at each hop",
     "T2": "is the fixed 50-candidate pool per search arm still how it works? is that the decided design",
-    "T3": "what are all the ways an index pass can get triggered? list every code path",
-    "T4": "why does registry reconciliation apply the whole project set atomically instead of row by row",
-    "T5": "headings like \"# Learning C#\" lose the trailing # in heading paths. fix that per commonmark rules and add a test"
+    "T3": "where does a doc's design_status actually get used? list every place in the code that reads it or acts on it",
+    "T4": "did we ever decide not to build a code graph thing? why, and where's that written down",
+    "T5": "headings like \"# Learning C#\" lose the trailing # in heading paths. fix that per commonmark rules and add a test. make sure files that are already indexed pick up the fix"
   }
 }

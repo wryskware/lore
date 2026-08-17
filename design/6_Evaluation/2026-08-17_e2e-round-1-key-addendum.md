@@ -7,6 +7,13 @@ decision_refs:
 
 # E2E answer keys — Revision A (2026-08-17)
 
+> **Superseded for round 2 by [[2026-08-17_e2e-round-2-task-set]]** (same day,
+> later). Every ruling below was decided under a constraint Wrysk has since
+> revoked — that round 2 must stay comparable to round 1 and prompts must not
+> change. Where this file says a ruling "wins for round 2 and later", read
+> "wins for round 1's record only". Nothing else here is edited; it remains
+> the account of how round 1's logged key gaps were resolved at the time.
+
 Addendum to [[2026-08-15_e2e-round-1-plan]] (which holds the per-repo grading
 keys) and [[2026-08-15_e2e-round-1-answer-key]] (prompts, pins, protocol).
 

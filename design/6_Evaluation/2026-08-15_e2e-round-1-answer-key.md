@@ -5,6 +5,10 @@ last_reviewed: 2026-08-15
 
 # E2E round 1 — frozen prompts and answer keys
 
+> **Round-1 record. For round 2 use [[2026-08-17_e2e-round-2-task-set]]**,
+> which carries its own prompts and keys. The prompts below are round 1's and
+> stay unchanged; `bench/prompts.json` now holds the round-2 set.
+
 > **Revision A (2026-08-17):** grading criteria are amended by
 > [[2026-08-17_e2e-round-1-key-addendum]], which resolves the `key_gaps` the
 > blind graders logged. Read it alongside this doc and the plan doc; where they

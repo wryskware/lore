@@ -9,6 +9,11 @@ decision_refs:
 
 First e2e runs at the M1 boundary. Scratch/process doc, not canon.
 
+> **Round-1 record. For round 2 use [[2026-08-17_e2e-round-2-task-set]]**,
+> which is self-contained and replaces the task archetypes, per-repo
+> instantiations and grading keys below. This file is left exactly as round 1
+> was graded against it.
+
 > **Revision A (2026-08-17):** the grading keys in
 > § "Per-repo instantiations" and the T4 archetype in § "Task archetypes" are
 > amended by [[2026-08-17_e2e-round-1-key-addendum]] (gaps KG-1…KG-5: lore T3
