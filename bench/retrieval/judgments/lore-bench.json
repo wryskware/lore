@@ -1,0 +1,115 @@
+{
+  "corpus": "lore-bench",
+  "frozen_at": "977364ad1994b0293be67da931a9b7204133f0e3",
+  "scale": "2 = answers the query, 1 = useful context, 0 = noise",
+  "judgments": [
+    {
+      "query_id": "LB-01",
+      "path": "design/7_Research/raw/A_candidates.md",
+      "sha256": "843d1f496686e24fb4255d8800245473455e61e7ce5ecde5dbd2233e611100a7",
+      "label": 2,
+      "why": "It directly identifies the filesystem lock and single authoritative service ownership.",
+      "model": "openai/gpt-5.6-luna",
+      "at": "2026-08-17T06:57:12.0409753-07:00"
+    },
+    {
+      "query_id": "LB-01",
+      "path": "design/4_Interfaces/4.1_MCP_Surface.md",
+      "sha256": "6109cf84c1762b5ea4dd0d8ee4e41b7da1050a7b059483d20c7d0456f650e9c6",
+      "label": 0,
+      "why": "It contains no information about service ownership or index-write exclusion.",
+      "model": "openai/gpt-5.6-luna",
+      "at": "2026-08-17T06:57:12.0415241-07:00"
+    },
+    {
+      "query_id": "LB-01",
+      "path": "design/7_Research/01_landscape.md",
+      "sha256": "ca440d40ad87f5f79e06629b0f2953cec9e9ff20bad5911a8945846e2a83f4dd",
+      "label": 1,
+      "why": "It explains why process-local locking fails and names structural ownership as the needed remedy.",
+      "model": "openai/gpt-5.6-luna",
+      "at": "2026-08-17T06:57:12.0415642-07:00"
+    },
+    {
+      "query_id": "LB-01",
+      "path": "design/7_Research/raw/E_rust-stack.md",
+      "sha256": "4df9920a2ccc1ecc02e18069b7ff13e3dee1cb569cb2df1afc23e38b20c9e1e1",
+      "label": 1,
+      "why": "It describes Tantivy's writer lock and operational restriction against multiple daemon writers.",
+      "model": "openai/gpt-5.6-luna",
+      "at": "2026-08-17T06:57:12.0415860-07:00"
+    },
+    {
+      "query_id": "LB-01",
+      "path": "context-engine-research-handoff.md",
+      "sha256": "cd5c2e68a4c192bd0c101a4e7e96fb81c2e379e95c7483d42e6c346bf3a7d0d4",
+      "label": 0,
+      "why": "It discusses splitting services rather than preventing duplicate index writers.",
+      "model": "openai/gpt-5.6-luna",
+      "at": "2026-08-17T06:57:12.0416103-07:00"
+    },
+    {
+      "query_id": "LB-01",
+      "path": "design/7_Research/raw/D_codegraph.md",
+      "sha256": "dc050ee4a2f73b26f2c9ed0db26b39ea4e0fc9e0a802ef5f80dfa7cd392d6f01",
+      "label": 1,
+      "why": "It documents advisory daemon admission and explicitly explains why it is insufficient for enforced single ownership.",
+      "model": "openai/gpt-5.6-luna",
+      "at": "2026-08-17T06:57:12.0416441-07:00"
+    },
+    {
+      "query_id": "LB-01",
+      "path": "design/9_Scratch/2026-08-14_adversarial-review-session-1.md",
+      "sha256": "006b4b5925dfd671442b2995f0875c759c32c0ccb5bc9e46116393be40ed3584",
+      "label": 2,
+      "why": "It directly shows that nothing currently prevents concurrent ownership and specifies the required process-lifetime lock.",
+      "model": "openai/gpt-5.6-luna",
+      "at": "2026-08-17T06:57:12.0416601-07:00"
+    },
+    {
+      "query_id": "LB-01",
+      "path": "design/9_Scratch/2026-08-14_adversarial-review-session-2.md",
+      "sha256": "897d94553ab2d19e7ffaa712689822764789dd35422fdc87286457e2f4ece104",
+      "label": 1,
+      "why": "It provides a concrete shutdown race that can allow two writers, though it does not state the prevention mechanism.",
+      "model": "openai/gpt-5.6-luna",
+      "at": "2026-08-17T06:57:12.0416803-07:00"
+    },
+    {
+      "query_id": "LB-02",
+      "path": "design/7_Research/raw/D_codegraph.md",
+      "sha256": "dc050ee4a2f73b26f2c9ed0db26b39ea4e0fc9e0a802ef5f80dfa7cd392d6f01",
+      "label": 0,
+      "why": "It discusses debounce handling but not the queried service ownership or index-write conflict.",
+      "model": "openai/gpt-5.6-luna",
+      "at": "2026-08-17T06:57:12.0416974-07:00"
+    },
+    {
+      "query_id": "LB-02",
+      "path": "design/7_Research/raw/B_discovery.md",
+      "sha256": "8cc30b05ea1541540e536e3e1418ceffa684ff927b73ed2da31b8e65839456e4",
+      "label": 0,
+      "why": "It discusses daemon ownership and memory sidecars, not memory bounds during branch switches.",
+      "model": "openai/gpt-5.6-luna",
+      "at": "2026-08-17T06:57:12.0417131-07:00"
+    },
+    {
+      "query_id": "LB-02",
+      "path": "crates/lore/src/daemon/watch.rs",
+      "sha256": "4646e518ea8a287def8aee182d9cb4fb866bda6a9c5f5f9991e11ab96629b9ed",
+      "label": 2,
+      "why": "It directly states that a capped 64-batch queue bounds memory during bulk file events.",
+      "model": "openai/gpt-5.6-luna",
+      "at": "2026-08-17T06:57:12.0417290-07:00"
+    },
+    {
+      "query_id": "LB-02",
+      "path": "crates/lore/tests/embed_worker.rs",
+      "sha256": "f5106a957d534dda8048cf2ead769907a55dea3f2399a8bbef4ba5b7bd3af5a6",
+      "label": 0,
+      "why": "It tests embedding notifications and does not address memory growth during branch switches.",
+      "model": "openai/gpt-5.6-luna",
+      "at": "2026-08-17T06:57:12.0417450-07:00"
+    }
+  ]
+}

@@ -210,31 +210,13 @@ foreach ($modelId in $Models) {
         }
 
         # -- queries --------------------------------------------------------
-        $latencies = New-Object System.Collections.Generic.List[double]
-        foreach ($c in $allCorpora) {
-            $qFile = Join-Path $Root $c.queries
-            if (-not (Test-Path $qFile)) { $run.warnings += "no query file for $($c.name)"; continue }
-            $key = Get-Content $qFile -Raw | ConvertFrom-Json
-            $out = @()
-            foreach ($q in $key.queries) {
-                $qsw = [System.Diagnostics.Stopwatch]::StartNew()
-                $resp = Invoke-RestMethod -Method Post "$api/search" -ContentType 'application/json' `
-                    -Body (@{ query = $q.query; project = $c.name; limit = $TopK } | ConvertTo-Json)
-                $qsw.Stop()
-                $latencies.Add($qsw.Elapsed.TotalMilliseconds)
-                if ($resp.lexical_only -ne $isLexical) { $run.warnings += "lexical_only=$($resp.lexical_only) unexpected for $($q.id)" }
-                $out += [ordered]@{
-                    id = $q.id; kind = $q.kind; query = $q.query
-                    lexical_only = $resp.lexical_only
-                    latency_ms = [math]::Round($qsw.Elapsed.TotalMilliseconds, 1)
-                    results = @($resp.results | ForEach-Object { [ordered]@{
-                        path = $_.path; line_start = $_.line_start; line_end = $_.line_end; score = $_.score } })
-                }
-            }
-            $out | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $outDir "searches\$($c.name).json")
-            $run.corpora += $c.name
-            Write-Host "  $($c.name): $($out.Count) queries"
-        }
+        # query.ps1 owns the search loop, so scoring a live daemon does not
+        # have to come through the model matrix to get comparable artifacts.
+        $qr = & (Join-Path $Root 'query.ps1') -Api $api -OutDir $outDir `
+            -Corpora @($allCorpora.name) -TopK $TopK -ExpectLexicalOnly:$isLexical
+        $run.corpora += $qr.corpora
+        $run.warnings += $qr.warnings
+        $latencies = [double[]]$qr.latencies
         # Daemon-side latency percentiles (additive `latency` field on /status):
         # global endpoints separate the embed-query wait (model cost) from the
         # whole search handler; ?project= adds that corpus's store-scan window.

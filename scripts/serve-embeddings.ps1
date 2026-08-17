@@ -4,7 +4,7 @@
 # on a fixed port for the live lore daemon. The daemon never manages this
 # process (D-0007); run this at logon or whenever the daemon reports the
 # endpoint unreachable. Reuses the bench's downloaded binary and GGUF
-# (bench/embed/setup.ps1 fetches both).
+# (bench/retrieval/setup.ps1 fetches both).
 #
 # Flag rationale (measured 2026-08-16, see D-0014):
 #   --kv-unified      REQUIRED for causal embedders: per-slot KV streams make

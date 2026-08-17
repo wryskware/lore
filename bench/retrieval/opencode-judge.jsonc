@@ -1,0 +1,17 @@
+{
+  // Relevance-judging arm. Selected by judge.ps1 via OPENCODE_CONFIG.
+  //
+  // The judge must not retrieve. Everything it needs is in the prompt, and a
+  // judge that can search the corpus would be scoring its own second opinion
+  // instead of the ranked list under test. opencode MERGES this with the
+  // global config, so the lore server is disabled by name (same mechanism the
+  // e2e off arm uses, verified 2026-08-15).
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "lore": {
+      "type": "local",
+      "command": ["C:\\Users\\perag\\wryskware\\lore\\target\\debug\\lore-mcp.exe"],
+      "enabled": false
+    }
+  }
+}
