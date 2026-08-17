@@ -262,7 +262,28 @@ pub fn walk_files(
         // where a project can re-include a dot-file it wants indexed. This flag
         // is the same policy at a precedence nothing can argue with.
         .hidden(false)
-        .parents(true)
+        // Ignore files *above* the walk root are not consulted. The crate
+        // defaults this on for ripgrep, where it is right: a search root is ad
+        // hoc (`cd src && rg foo`), so reading the ancestors reconstructs the
+        // repository context the user never got to state. A lore root is
+        // *declared* — `lore add` names where the project starts — so there is
+        // no missing context to reconstruct, and reading past the boundary
+        // just ignores what the user said.
+        //
+        // Left on it is worse here than in ripgrep, because `.loreignore` is
+        // registered below as a *custom* ignore filename and the crate's parent
+        // scan reads custom names too, walking to the filesystem root: a
+        // `.loreignore` in a home directory would silently govern every project
+        // beneath it. That is the same objection `git_global(false)` is set for
+        // a few lines down, arriving through a different door — and it is what
+        // makes each declared root genuinely independent rather than nominally
+        // so.
+        //
+        // The cost, stated: a subdirectory of a monorepo registered as its own
+        // project stops inheriting the monorepo root's `.gitignore`. Under
+        // D-0020 that project says what it wants in its own file, which is the
+        // whole posture.
+        .parents(false)
         .git_ignore(true)
         // Not among the three decided sources: `.git/info/exclude` lives inside
         // the hard floor, and `.ignore` is configuration for search tools
@@ -670,6 +691,52 @@ mod tests {
         );
         fixture.user_rules(".*\n");
         assert_eq!(fixture.walk(), ["kept.rs"]);
+    }
+
+    /// **The stack has three rungs and they all live at or below the root.**
+    ///
+    /// The `ignore` crate defaults to reading ignore files from every ancestor
+    /// of the walk root, up to the filesystem root, and — because
+    /// `.loreignore` is registered as a *custom* ignore filename — that
+    /// includes `.loreignore`. Left on, a file in a home directory would
+    /// silently govern every project beneath it: a fourth rung D-0020 never
+    /// described, invisible in the project, and unmentioned by `lore status`.
+    ///
+    /// It is the same objection `git_global(false)` exists for — what lore
+    /// indexes must not depend on unrelated machine state — and it is what
+    /// makes a declared root actually independent. This test is the whole of
+    /// that guarantee; nothing else would notice the crate default coming back
+    /// on a version bump.
+    ///
+    /// Found in the wild rather than by inspection: a stray `/tmp/.gitignore`
+    /// on a Linux box excluded `target/` and `node_modules/` from every
+    /// tempdir fixture, failing exactly the tests that exist to deny it.
+    #[test]
+    fn rules_above_the_root_do_not_reach_into_the_project() {
+        let outer = tempfile::tempdir().unwrap();
+        let outer = Utf8PathBuf::from_path_buf(outer.path().to_path_buf()).unwrap();
+        // Two levels up, so this cannot pass by only stopping at the parent.
+        std::fs::write(outer.join(".gitignore"), "target/\n").unwrap();
+        std::fs::write(outer.join(LORE_IGNORE_FILE), "secret-notes/\n").unwrap();
+
+        let data = tempfile::tempdir().unwrap();
+        let data = Utf8PathBuf::from_path_buf(data.path().to_path_buf()).unwrap();
+        let root = outer.join("nested").join("project");
+        for (rel, body) in [
+            ("main.rs", "fn main() {}"),
+            ("target/debug/build.rs", "generated"),
+            ("secret-notes/plan.md", "mine"),
+        ] {
+            let abs = root.join(rel);
+            std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+            std::fs::write(abs, body).unwrap();
+        }
+
+        assert_eq!(
+            sorted(walk_files(&root, &root, None, &data, None).files),
+            ["main.rs", "secret-notes/plan.md", "target/debug/build.rs"],
+            "an ancestor's rules — of either kind — are not this project's"
+        );
     }
 
     // -----------------------------------------------------------------------
