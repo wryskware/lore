@@ -60,8 +60,11 @@ $plan = @(
         # Retrieval for BOTH Lexomancy slots targets the main `Lexomancy`
         # project: the walker does not follow junctions, so a bench root
         # indexes only its own two loose files. The second tree exists for
-        # file isolation during T5, not for a second index.
-        Project = $null
+        # file isolation during T5, not for a second index. It is still
+        # registered, because slot 'a' is: an unregistered cwd resolves to no
+        # project at all, and the two slots must present the agent with the
+        # same default-resolution behaviour or the arms are not comparable.
+        Project = 'Lexomancy-bench-b'
         CmWorkspace = 'C:\Users\perag\Unity\Lexomancy-alt-b'
     }
 ) | Where-Object { $Repos -contains $_.Repo }
@@ -168,7 +171,16 @@ foreach ($p in $plan) {
             }
             Did "built $($p.Dir)"
         }
-        Skip 'no `lore add` for this tree: both Lexomancy slots query project=Lexomancy (junctions are not walked)'
+        # Registered for resolution symmetry with slot 'a' only. No .lore.toml
+        # is pre-written: slot 'a' has none either, and the file itself is not
+        # indexed, so `lore add` deriving the name is the symmetric path.
+        Step "lore add `"$($p.Dir)`" --name $($p.Project)"
+        Step '  (retrieval still targets project=Lexomancy for both slots — junctions are not walked)'
+        if ($Apply) {
+            lore add $p.Dir --name $p.Project
+            if ($LASTEXITCODE -ne 0) { throw "lore add failed for $($p.Project)" }
+            Did "registered $($p.Project)"
+        }
     }
 }
 

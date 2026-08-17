@@ -46,7 +46,10 @@ Two things about Lexomancy are deliberate, not oversights:
   limitation; fixing it is a daemon-side change.
 - Slot b therefore exists purely for **file isolation** during T5, and needs a
   second cm workspace (`Lexomancy-alt-b`). Until that exists, run Lexomancy T5
-  one arm at a time.
+  one arm at a time. Slot b is still *registered* (as `Lexomancy-bench-b`,
+  indexing its two loose files) purely so that both slots resolve a default
+  project the same way — an unregistered cwd resolves to nothing, which is a
+  behaviour difference between the arms, not just a missing index.
 
 Round 2 is scoped **on-arm-only, 15 cells** (`-Matrix -Models luna -Arms on`).
 Under that shape only slot `a` is exercised; slot b buys nothing until a round
