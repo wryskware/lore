@@ -12,9 +12,12 @@
 //! is not a precondition for anything here and these tests say the same thing on
 //! a machine with no git installed.
 
+mod daemon_support;
+
 use std::collections::BTreeSet;
 
 use camino::{Utf8Path, Utf8PathBuf};
+use daemon_support::link_dir;
 use lore::daemon::snapshot::{Snapshot, observe_paths, observe_project};
 use lore::daemon::walk::USER_IGNORE_FILE;
 use tokio_util::sync::CancellationToken;
@@ -275,30 +278,20 @@ fn with_no_rules_anywhere_the_manifest_is_the_whole_project() {
 /// shapes, because a watcher batch that named the link has to reach the same
 /// verdict the full scan does.
 ///
-/// Windows-only because the shape that motivated this is a directory
-/// **junction** (`Lexomancy-bench`: three junctions over other checkouts, three
-/// loose files, and a `files: 3` index with nothing saying why). A junction
-/// needs no privilege to create, which is why assembled workspaces use one and
-/// why the fixture can build a real one here.
-#[cfg(windows)]
+/// The shape that motivated this is a directory **junction**
+/// (`Lexomancy-bench`: three junctions over other checkouts, three loose files,
+/// and a `files: 3` index with nothing saying why), so the fixture builds one
+/// on Windows and a plain symlink elsewhere — see [`daemon_support::link_dir`].
+/// D-0021 gives the two the identical semantic, and the assertions below are
+/// the semantic, so there is one test rather than a Windows one and a hole.
 #[test]
-fn a_junctioned_corpus_is_absent_from_the_manifest_and_named_in_the_snapshot() {
+fn a_linked_corpus_is_absent_from_the_manifest_and_named_in_the_snapshot() {
     let corpus = tempfile::tempdir().unwrap();
     let corpus = Utf8Path::from_path(corpus.path()).unwrap();
     std::fs::write(corpus.join("behind.md"), "# the actual content").unwrap();
 
     let project = Project::new(&[("loose.md", "# the only real file")]);
-    let out = std::process::Command::new("cmd")
-        .args([
-            "/c",
-            "mklink",
-            "/J",
-            project.root.join("corpus").as_str(),
-            corpus.as_str(),
-        ])
-        .output()
-        .expect("mklink is available");
-    assert!(out.status.success(), "mklink /J failed: {out:?}");
+    link_dir(&project.root.join("corpus"), corpus);
     // The content really is reachable through the link; not walking it is a
     // choice, and the test would be vacuous if the fixture were broken.
     assert!(project.root.join("corpus/behind.md").is_file());

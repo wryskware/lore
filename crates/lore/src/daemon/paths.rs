@@ -163,6 +163,24 @@ mod tests {
         );
     }
 
+    /// A link to a directory, in whatever form the platform makes one: a
+    /// junction on Windows (no privilege needed, so it is the shape real trees
+    /// have), an ordinary symlink on POSIX. D-0021 gives the two the identical
+    /// semantic, which is why the test below is one test rather than a pair.
+    #[cfg(windows)]
+    fn link_dir(link: &camino::Utf8Path, target: &camino::Utf8Path) {
+        let out = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J", link.as_str(), target.as_str()])
+            .output()
+            .expect("mklink is available");
+        assert!(out.status.success(), "mklink /J failed: {out:?}");
+    }
+
+    #[cfg(unix)]
+    fn link_dir(link: &camino::Utf8Path, target: &camino::Utf8Path) {
+        std::os::unix::fs::symlink(target, link).expect("a POSIX symlink needs no privilege");
+    }
+
     /// The one link the daemon *does* resolve (D-0021): a project root may
     /// itself be a link, and canonicalizing here is what makes the physical
     /// root the thing that is walked, watched and compared against.
@@ -172,7 +190,6 @@ mod tests {
     /// stored as the *logical* path would fail every containment check and the
     /// project would silently never index. That the rule stops here — no other
     /// link is resolved anywhere — is the whole of D-0021.
-    #[cfg(windows)]
     #[test]
     fn a_project_root_that_is_a_link_canonicalizes_to_the_physical_root() {
         let real = tempfile::tempdir().unwrap();
@@ -184,11 +201,7 @@ mod tests {
         let holder = tempfile::tempdir().unwrap();
         let holder = canonicalize_root(holder.path()).unwrap();
         let link = holder.join("logical-root");
-        let out = std::process::Command::new("cmd")
-            .args(["/c", "mklink", "/J", link.as_str(), real.as_str()])
-            .output()
-            .expect("mklink is available");
-        assert!(out.status.success(), "mklink /J failed: {out:?}");
+        link_dir(&link, &real);
 
         let registered = canonicalize_root(link.as_std_path()).unwrap();
         assert_eq!(registered, real, "registration resolves the root");

@@ -6,7 +6,7 @@ mod daemon_support;
 use std::collections::BTreeSet;
 
 use camino::Utf8PathBuf;
-use daemon_support::{Fixture, STANDARD_TREE_INDEXED, populate_standard_tree};
+use daemon_support::{Fixture, STANDARD_TREE_INDEXED, link_dir, populate_standard_tree};
 use lore::daemon::index::{ApplyOptions, full_scan, full_scan_with, index_paths};
 use lore::store::SearchFilter;
 
@@ -572,7 +572,6 @@ fn a_tripped_guard_is_remembered_until_a_pass_succeeds() {
 /// project that genuinely has three files in it. `links_skipped` is the
 /// difference, and it is what makes an unchanged `.loreignore` edit explicable
 /// instead of mysterious.
-#[cfg(windows)]
 #[test]
 fn a_pass_reports_the_links_it_did_not_follow() {
     let corpus = tempfile::tempdir().unwrap();
@@ -581,17 +580,7 @@ fn a_pass_reports_the_links_it_did_not_follow() {
 
     let fixture = Fixture::new("demo");
     fixture.write("loose.md", "# the only real file");
-    let out = std::process::Command::new("cmd")
-        .args([
-            "/c",
-            "mklink",
-            "/J",
-            fixture.root.join("corpus").as_str(),
-            corpus.as_str(),
-        ])
-        .output()
-        .expect("mklink is available");
-    assert!(out.status.success(), "mklink /J failed: {out:?}");
+    link_dir(&fixture.root.join("corpus"), corpus);
 
     let summary = full_scan(&fixture.context(), &fixture.project);
 
@@ -621,24 +610,11 @@ fn a_pass_over_a_tree_without_links_reports_none() {
 // forever.
 // ---------------------------------------------------------------------------
 
-/// Build a real junction, or explain the failure. Directory junctions need no
-/// privilege, which is why assembled workspaces use them and why a test can
-/// rely on one.
-#[cfg(windows)]
-fn junction(link: &camino::Utf8Path, target: &camino::Utf8Path) {
-    let out = std::process::Command::new("cmd")
-        .args(["/c", "mklink", "/J", link.as_str(), target.as_str()])
-        .output()
-        .expect("mklink is available");
-    assert!(out.status.success(), "mklink /J failed: {out:?}");
-}
-
 /// The named case: a watcher batch naming paths behind a link indexes nothing.
 ///
 /// Both shapes a debounced batch can produce — the link itself (a directory
 /// event) and a file underneath it — because the watcher cannot tell them
 /// apart and neither may get through.
-#[cfg(windows)]
 #[test]
 fn a_watcher_batch_naming_a_path_behind_a_link_indexes_nothing() {
     let corpus = tempfile::tempdir().unwrap();
@@ -647,7 +623,7 @@ fn a_watcher_batch_naming_a_path_behind_a_link_indexes_nothing() {
 
     let fixture = Fixture::new("demo");
     fixture.write("loose.md", "# the only real file");
-    junction(&fixture.root.join("corpus"), corpus);
+    link_dir(&fixture.root.join("corpus"), corpus);
     // The fixture is not vacuous: the path really does resolve to content.
     assert!(fixture.root.join("corpus/behind.md").is_file());
 
@@ -679,7 +655,6 @@ fn a_watcher_batch_naming_a_path_behind_a_link_indexes_nothing() {
 /// are absent from the micro-manifest — and being in its scope, they are
 /// deleted. An index that merely *stopped updating* those rows would keep
 /// serving content that is no longer part of the project.
-#[cfg(windows)]
 #[test]
 fn a_link_dropped_over_indexed_content_prunes_it() {
     let elsewhere = tempfile::tempdir().unwrap();
@@ -694,7 +669,7 @@ fn a_link_dropped_over_indexed_content_prunes_it() {
 
     // Swap the real directory for a junction of the same name.
     fixture.remove_dir("corpus");
-    junction(&fixture.root.join("corpus"), elsewhere);
+    link_dir(&fixture.root.join("corpus"), elsewhere);
 
     let summary = index_paths(&fixture.context(), &fixture.project, &paths(&["corpus"]));
 

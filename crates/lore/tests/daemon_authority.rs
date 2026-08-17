@@ -574,6 +574,9 @@ fn superseding_a_decision_demotes_the_documents_that_cited_it() {
 /// (D-0003): a vault checked out as `0_canon/decisions.md` — which Windows
 /// treats as the same file — must not silently stop being the ledger, because
 /// the failure mode is the entire vault quietly losing its canon.
+///
+/// Platform-scoped, and its POSIX counterpart directly below asserts the
+/// opposite outcome: the asymmetry is the policy, not a gap in it.
 #[cfg(windows)]
 #[test]
 fn a_case_varied_ledger_path_is_still_the_ledger_on_windows() {
@@ -603,6 +606,65 @@ fn a_case_varied_ledger_path_is_still_the_ledger_on_windows() {
     fixture.write(
         "design/0_canon/decisions.md",
         "# Ledger\n\n## D-0001 — Retired\n\n- **Status:** Proposed\n",
+    );
+    let batch: BTreeSet<camino::Utf8PathBuf> =
+        [camino::Utf8PathBuf::from("design/0_canon/decisions.md")]
+            .into_iter()
+            .collect();
+    index_paths(&fixture.context(), &fixture.project, &batch);
+    assert!(active(&fixture).is_empty());
+    assert_eq!(tiers(&fixture, "design/1.1.md", "Heading"), [1]);
+}
+
+/// The deliberate other half of the test above, and it asserts the **opposite**
+/// outcome on purpose.
+///
+/// `is_ledger_path` compares path segments through the same case policy as
+/// `daemon::paths` and the store's filter SQL: ASCII-insensitive on Windows,
+/// exact everywhere else. That is not a portability wart to be smoothed over —
+/// on a case-sensitive filesystem `design/0_canon/decisions.md` genuinely *is*
+/// a different file from `design/0_Canon/DECISIONS.md`, and a recognizer that
+/// pretended otherwise would let a stray lowercase copy silently become canon
+/// for a project that already had a ledger.
+///
+/// So the vault loses its canon here, and does so in the way canon prescribes
+/// rather than by accident: no active decisions, the miscased ledger ranked as
+/// the ordinary Markdown it is (tier 1, not the pinned ledger tier of 3), and
+/// the document citing D-0001 demoted for citing a decision nothing made
+/// active. `a_full_scan_stamps_the_policy_onto_every_file` is the control —
+/// the same content at the conventional casing is tier 3 on every platform.
+#[cfg(unix)]
+#[test]
+fn a_case_varied_ledger_path_is_not_the_ledger_on_a_case_sensitive_filesystem() {
+    let fixture = Fixture::new("authority");
+    fixture.write("design/0_canon/decisions.md", ledger_body());
+    fixture.write(
+        "design/1.1.md",
+        doc("decided", "decision_refs: [D-0001]\n", "Body of one"),
+    );
+    full_scan(&fixture.context(), &fixture.project);
+
+    assert!(
+        active(&fixture).is_empty(),
+        "nothing at that path feeds the active set: {:?}",
+        active(&fixture)
+    );
+    assert_eq!(
+        tiers(&fixture, "design/0_canon/decisions.md", "Status"),
+        [1],
+        "a Markdown file that merely looks like a ledger"
+    );
+    assert_eq!(
+        tiers(&fixture, "design/1.1.md", "Heading"),
+        [1],
+        "declared `decided`, citing a decision no ledger made active"
+    );
+
+    // …and editing it triggers no recompute either, because the incremental
+    // pass asks `is_decision_source` the same question and gets the same no.
+    fixture.write(
+        "design/0_canon/decisions.md",
+        "# Ledger\n\n## D-0001 — Reinstated\n\n- **Status:** Accepted\n",
     );
     let batch: BTreeSet<camino::Utf8PathBuf> =
         [camino::Utf8PathBuf::from("design/0_canon/decisions.md")]

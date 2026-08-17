@@ -205,3 +205,29 @@ pub const STANDARD_TREE_INDEXED: [&str; 3] = ["README.md", "docs/design.md", "sr
 pub fn as_utf8(path: &std::path::Path) -> &Utf8Path {
     Utf8Path::from_path(path).expect("utf-8 path")
 }
+
+/// A real link to a directory, in whatever form the local platform makes one.
+///
+/// On Windows that is `mklink /J`, a **junction**: it needs no privilege, which
+/// is why an assembled workspace uses one (`Lexomancy-bench` — the tree that
+/// motivated D-0021 — is three of them) and why a test can rely on building
+/// one. On POSIX it is an ordinary symlink, equally unprivileged.
+///
+/// This lives here, rather than in each test file, because the D-0021 link
+/// tests were originally written `#[cfg(windows)]` around the *whole test* —
+/// which meant the rule "a link is a descent boundary" was asserted on one
+/// platform and nowhere else. The platform difference is only in how a link is
+/// created, so that is the only thing this gates; every caller is one test that
+/// runs everywhere.
+pub fn link_dir(link: &Utf8Path, target: &Utf8Path) {
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J", link.as_str(), target.as_str()])
+            .output()
+            .expect("mklink is available");
+        assert!(out.status.success(), "mklink /J failed: {out:?}");
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).expect("a POSIX symlink needs no privilege");
+}

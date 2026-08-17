@@ -955,6 +955,13 @@ mod tests {
     // Real links throughout. The whole question is what the *platform* reports
     // for a reparse point, and a fixture that hand-built the shape would be a
     // restatement of this module's assumptions rather than a test of them.
+    //
+    // The link *construction* is what differs between platforms, so that is the
+    // only thing gated: `link_dir`/`link_file` below build the local article and
+    // every test that uses one runs everywhere. Gating the tests themselves —
+    // which is how they were first written — meant the D-0021 rules were
+    // asserted on Windows and nowhere else, so a Linux or macOS regression in
+    // the shared `is_symlink` branch above would have shipped unnoticed.
     // -----------------------------------------------------------------------
 
     /// A directory of content, outside any fixture root, for a link to point at.
@@ -965,16 +972,49 @@ mod tests {
         (dir, path)
     }
 
-    /// `mklink /J` — a Windows **junction**, which is what an assembled
-    /// workspace actually uses (a symlink needs privilege; a junction does
-    /// not, so this is the shape real trees have).
+    /// A link to a directory, in whatever form the platform makes one.
+    ///
+    /// On Windows that is `mklink /J`, a **junction**, which is what an
+    /// assembled workspace actually uses (a directory symlink needs privilege;
+    /// a junction does not, so this is the shape real trees have). On POSIX it
+    /// is an ordinary symlink, which needs no privilege either. D-0021 gives
+    /// the two the identical semantic, so every caller below is one test.
     #[cfg(windows)]
-    fn junction(link: &Utf8Path, target: &Utf8Path) {
+    fn link_dir(link: &Utf8Path, target: &Utf8Path) {
         let out = std::process::Command::new("cmd")
             .args(["/c", "mklink", "/J", link.as_str(), target.as_str()])
             .output()
             .expect("mklink is available");
         assert!(out.status.success(), "mklink /J failed: {out:?}");
+    }
+
+    #[cfg(unix)]
+    fn link_dir(link: &Utf8Path, target: &Utf8Path) {
+        std::os::unix::fs::symlink(target, link).expect("a POSIX symlink needs no privilege");
+    }
+
+    /// A link to a *file*, or `false` where the platform refused to make one.
+    ///
+    /// The refusal is Windows-shaped and deliberately not shared: a file
+    /// symlink needs `SeCreateSymbolicLinkPrivilege` (developer mode), unlike a
+    /// junction, and a test that failed on an ordinary account would be
+    /// reporting the account rather than the code. POSIX has no such
+    /// privilege, so a failure there is a genuine one and must be loud — a
+    /// skip on that side would quietly retire the coverage this helper exists
+    /// to extend.
+    #[cfg(windows)]
+    fn link_file(link: &Utf8Path, target: &Utf8Path) -> bool {
+        if std::os::windows::fs::symlink_file(target, link).is_err() {
+            eprintln!("skipping: creating a file symlink needs developer mode");
+            return false;
+        }
+        true
+    }
+
+    #[cfg(unix)]
+    fn link_file(link: &Utf8Path, target: &Utf8Path) -> bool {
+        std::os::unix::fs::symlink(target, link).expect("a POSIX symlink needs no privilege");
+        true
     }
 
     /// The defect, exactly: a workspace whose entire corpus is reached through
@@ -985,12 +1025,11 @@ mod tests {
     /// hint that anything had been declined. Editing its `.loreignore` could
     /// not change the outcome, because no ignore rule is ever consulted for a
     /// tree the walk does not enter.
-    #[cfg(windows)]
     #[test]
-    fn a_directory_junction_is_not_followed_but_is_reported() {
+    fn a_directory_link_is_not_followed_but_is_reported() {
         let (_keep, target) = elsewhere();
         let fixture = Fixture::new(&[("loose.md", "# notes")]);
-        junction(&fixture.root.join("corpus"), &target);
+        link_dir(&fixture.root.join("corpus"), &target);
 
         assert_eq!(fixture.walk(), ["loose.md"], "the link is not followed");
         assert_eq!(fixture.links(), ["corpus"], "and it is not silent either");
@@ -1008,10 +1047,33 @@ mod tests {
         let (_keep, target) = elsewhere();
         let fixture = Fixture::new(&[]);
         let link = fixture.root.join("corpus");
-        junction(&link, &target);
+        link_dir(&link, &target);
 
         let kind = std::fs::symlink_metadata(&link).unwrap().file_type();
         assert!(kind.is_symlink(), "a junction is a link to std");
+        assert!(!kind.is_dir(), "and specifically not a directory");
+        // Following it deliberately *does* resolve — the walker's choice not
+        // to is policy, not an inability.
+        assert!(fixture.root.join("corpus/behind.md").is_file());
+    }
+
+    /// The same claim on the other side of the `cfg`, and a separate test
+    /// rather than a shared one because the *fact* differs: above, that Windows
+    /// answers `is_symlink` for a name-surrogate reparse point; here, that a
+    /// POSIX symlink to a directory does not quietly present itself as the
+    /// directory. `symlink_metadata` not following the link is the whole reason
+    /// the classification holds, and one shared test would have left whichever
+    /// platform it was not written on unpinned.
+    #[cfg(unix)]
+    #[test]
+    fn unix_reports_a_symlink_to_a_directory_as_a_symlink() {
+        let (_keep, target) = elsewhere();
+        let fixture = Fixture::new(&[]);
+        let link = fixture.root.join("corpus");
+        link_dir(&link, &target);
+
+        let kind = std::fs::symlink_metadata(&link).unwrap().file_type();
+        assert!(kind.is_symlink(), "the link itself, unresolved");
         assert!(!kind.is_dir(), "and specifically not a directory");
         // Following it deliberately *does* resolve — the walker's choice not
         // to is policy, not an inability.
@@ -1022,12 +1084,11 @@ mod tests {
     /// already decided a link is noise does not get told about it every pass.
     /// (Which tree the link points at is not something the rules can reach —
     /// that is the part this module cannot fix with a rule.)
-    #[cfg(windows)]
     #[test]
     fn an_ignored_link_is_not_reported() {
         let (_keep, target) = elsewhere();
         let fixture = Fixture::new(&[("loose.md", "# notes"), (".loreignore", "corpus\n")]);
-        junction(&fixture.root.join("corpus"), &target);
+        link_dir(&fixture.root.join("corpus"), &target);
 
         assert_eq!(fixture.links(), Vec::<String>::new());
         assert_eq!(fixture.walk(), [".loreignore", "loose.md"]);
@@ -1055,7 +1116,6 @@ mod tests {
     /// `.loreignore` carries `!design/`, `!tools/` and `!Lexomancy/` over three
     /// junctions, written in the expectation that they would pull the corpus
     /// in. They are inert, and this test is what keeps them inert.
-    #[cfg(windows)]
     #[test]
     fn a_loreignore_reinclude_does_not_rescue_a_link() {
         let (_keep, target) = elsewhere();
@@ -1064,7 +1124,7 @@ mod tests {
             // Every spelling a hopeful user would reach for.
             (".loreignore", "!corpus\n!corpus/\n!corpus/**\n"),
         ]);
-        junction(&fixture.root.join("corpus"), &target);
+        link_dir(&fixture.root.join("corpus"), &target);
 
         assert_eq!(
             fixture.walk(),
@@ -1083,17 +1143,13 @@ mod tests {
     /// logical paths and the same bytes would compete with themselves in the
     /// rankings.
     ///
-    /// Skipped rather than failed where the privilege is absent: a *file*
-    /// symlink needs `SeCreateSymbolicLinkPrivilege` (developer mode) on
-    /// Windows, unlike a junction, and a test that fails on an ordinary
-    /// account would be reporting the account rather than the code.
-    #[cfg(windows)]
+    /// Where the privilege to make one is absent, [`link_file`] skips rather
+    /// than fails — on Windows only, and see that helper for why.
     #[test]
     fn a_link_to_a_file_is_not_indexed_through_the_link() {
         let fixture = Fixture::new(&[("real.md", "# the genuine article")]);
         let link = fixture.root.join("alias.md");
-        if std::os::windows::fs::symlink_file(fixture.root.join("real.md"), &link).is_err() {
-            eprintln!("skipping: creating a file symlink needs developer mode");
+        if !link_file(&link, &fixture.root.join("real.md")) {
             return;
         }
         assert!(
