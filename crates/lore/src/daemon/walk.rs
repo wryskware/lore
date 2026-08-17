@@ -24,6 +24,22 @@
 //!
 //! Plus one safety net: a project root with **no** `.loreignore` at all gets
 //! [`FALLBACK_EXCLUDES`] applied in memory. See that constant for why.
+//!
+//! ## What is *not* here
+//!
+//! [`CREDENTIAL_EXCLUDES`] lives in this file, beside the rules it outranks,
+//! but is applied one layer up in [`super::snapshot`] rather than inside
+//! [`walk_files`]. Two reasons. It is not an ignore rule — it is a refusal that
+//! no ignore file may argue with, and mixing it into the `ignore` crate's
+//! precedence stack is exactly how it would acquire an override. And its one
+//! escape hatch is repository configuration ([`super::snapshot`] reads
+//! `.lore.toml` once per observation), which a per-directory walk predicate has
+//! no business loading. [`refusal`] is the shared verdict, and the receiving
+//! daemon's backstop calls the same function over paths it never walked.
+//!
+//! The git-aware manifest basis (D-0017) sits at that same layer, in
+//! [`super::basis`]: it intersects with what this module returns rather than
+//! replacing it.
 
 use camino::{Utf8Path, Utf8PathBuf};
 use ignore::WalkBuilder;
@@ -40,6 +56,60 @@ pub const LORE_IGNORE_FILE: &str = ".loreignore";
 /// file says. Only `.git`: it is not an ecosystem opinion but the mechanism
 /// the ignore rules are themselves read from.
 pub const HARD_EXCLUDES: &[&str] = &[".git"];
+
+/// Credential patterns that never enter a manifest, whatever any ignore file
+/// says (D-0015, "Ignore rules and secrets").
+///
+/// **Non-overridable.** Unlike everything else in this module these are not
+/// ignore *rules* — they are a refusal. A `.loreignore` cannot re-include them
+/// with `!`, a `.gitignore` cannot, and no walk order can reach around them,
+/// because the failure they prevent is a private key becoming a search result
+/// that an agent then quotes into a transcript. The single escape hatch is the
+/// repository naming the exact path in `.lore.toml`'s `[ingest]
+/// allow_secret_paths` (see [`crate::repo_config::allow_secret_paths`]): an
+/// explicit, committed, reviewable act rather than a `!` buried in an ignore
+/// file among fifty build-output rules.
+///
+/// Pattern-based only — **no entropy scanning** (D-0015 killed it by name:
+/// false-positive-prone, and it trains the reflex of overriding the guard).
+/// The list is therefore knowingly incomplete; it is a floor, not a promise,
+/// and the substantive data-protection measure is an encrypted store.
+///
+/// Grammar, deliberately tiny so the constant is the whole specification:
+///
+/// - trailing `/` — a directory path. Every file under a matching run of
+///   components is refused (`.config/gcloud/` matches
+///   `home/.config/gcloud/creds.json`).
+/// - otherwise a file-name pattern with at most one `*`, matched against the
+///   last component only.
+///
+/// Matching is ASCII-case-insensitive throughout, because a case-insensitive
+/// Windows volume makes `ID_RSA` the same file as `id_rsa`.
+pub const CREDENTIAL_EXCLUDES: &[&str] = &[
+    // Process environment files. `.env.local`, `.env.production` and friends
+    // are the same file with a suffix, and they are where deployed secrets
+    // actually live.
+    ".env",
+    ".env.*",
+    // OpenSSH private keys, as `ssh-keygen` names them. The `.pub` half is
+    // public and would be harmless, but `id_rsa*` refusing `id_rsa.pub` too
+    // costs nothing anybody wanted indexed.
+    "id_rsa*",
+    "id_ecdsa*",
+    "id_ed25519*",
+    "id_dsa*",
+    // PEM containers and generic key files. Broad on purpose — see the module
+    // note in `credential_exclusion` about what `*.key` also catches.
+    "*.pem",
+    "*.key",
+    // Credential directories. Every one of these is hidden, so the walker
+    // already skips them locally; they earn their place at the *receiver*,
+    // which has no walker and only ever sees a list of strings a client chose.
+    ".ssh/",
+    ".aws/",
+    ".gnupg/",
+    ".config/gcloud/",
+];
 
 /// The exclusion list Lore used before `.loreignore` existed, applied in
 /// memory **only** while a project root has no `.loreignore` at all.
@@ -73,6 +143,87 @@ fn matches_any(names: &[&str], name: &str) -> bool {
 
 pub fn is_hard_excluded(name: &str) -> bool {
     matches_any(HARD_EXCLUDES, name)
+}
+
+/// The [`HARD_EXCLUDES`] entry some component of `rel` names, if any.
+///
+/// The name-level [`is_hard_excluded`] answers about one component during a
+/// walk; this answers about a whole project-relative path, which is the only
+/// form a *pushed* manifest entry ever takes — there is no walk on that side to
+/// prune anything.
+pub fn hard_excluded_component(rel: &Utf8Path) -> Option<&'static str> {
+    rel.components().find_map(|component| {
+        HARD_EXCLUDES
+            .iter()
+            .copied()
+            .find(|name| name.eq_ignore_ascii_case(component.as_str()))
+    })
+}
+
+/// The [`CREDENTIAL_EXCLUDES`] pattern `rel` matches, if any.
+///
+/// Returns the pattern rather than a bool so every refusal can *name the rule
+/// that refused it* — a pusher told "refused: `certs/dev.pem` (`*.pem`)" can
+/// tell a credential guard from a bug in ten seconds, and a bare "refused"
+/// costs an afternoon.
+///
+/// Known-broad edges, kept rather than narrowed because a missed key is
+/// unrecoverable and a missed *document* is one config line away:
+///
+/// - `*.key` also catches Apple Keynote documents and a handful of
+///   game-engine asset formats. All binary; the chunker would refuse them
+///   anyway, so the cost is a file that was never going to be a search result.
+/// - `*.pem` catches public certificate chains as well as private keys. PEM
+///   does not distinguish them in the file name and Lore must not read the
+///   file to find out.
+pub fn credential_exclusion(rel: &Utf8Path) -> Option<&'static str> {
+    let components: Vec<&str> = rel.components().map(|c| c.as_str()).collect();
+    let name = *components.last()?;
+    CREDENTIAL_EXCLUDES.iter().copied().find(|pattern| {
+        match pattern.strip_suffix('/') {
+            // A directory pattern: some consecutive run of components equals
+            // it. Testing every window rather than only a prefix is what makes
+            // a vendored `home/.ssh/` refused as firmly as a root-level one.
+            Some(dir) => {
+                let wanted: Vec<&str> = dir.split('/').collect();
+                components.windows(wanted.len()).any(|window| {
+                    window
+                        .iter()
+                        .zip(&wanted)
+                        .all(|(a, b)| a.eq_ignore_ascii_case(b))
+                })
+            }
+            None => matches_glob(pattern, name),
+        }
+    })
+}
+
+/// Why `rel` may never be indexed, whoever listed it: the [`HARD_EXCLUDES`]
+/// component or the [`CREDENTIAL_EXCLUDES`] pattern that refuses it.
+///
+/// One function so the observer (which refuses before sending) and the
+/// receiving daemon's backstop (which refuses what a client sent anyway) cannot
+/// drift into two different notions of "never".
+pub fn refusal(rel: &Utf8Path) -> Option<&'static str> {
+    hard_excluded_component(rel).or_else(|| credential_exclusion(rel))
+}
+
+/// The one-`*` glob [`CREDENTIAL_EXCLUDES`] uses, over one path component.
+///
+/// Byte-wise rather than char-wise so a non-ASCII file name can never land the
+/// slice on a UTF-8 boundary and panic; the patterns are all ASCII, so the
+/// comparison means the same thing either way.
+fn matches_glob(pattern: &str, name: &str) -> bool {
+    let (name, pattern) = (name.as_bytes(), pattern.as_bytes());
+    match pattern.iter().position(|&b| b == b'*') {
+        None => name.eq_ignore_ascii_case(pattern),
+        Some(star) => {
+            let (prefix, suffix) = (&pattern[..star], &pattern[star + 1..]);
+            name.len() >= prefix.len() + suffix.len()
+                && name[..prefix.len()].eq_ignore_ascii_case(prefix)
+                && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+        }
+    }
 }
 
 /// Cheap, stat-free rejection of a project-relative path: hard-excluded or
@@ -401,5 +552,85 @@ mod tests {
         // re-include it.
         std::fs::write(root.join(LORE_IGNORE_FILE), "!.git/\n").unwrap();
         assert_eq!(walk(&root), ["kept.rs"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Credential refusals (D-0015)
+    // -----------------------------------------------------------------------
+
+    fn refused(path: &str) -> Option<&'static str> {
+        credential_exclusion(Utf8Path::new(path))
+    }
+
+    #[test]
+    fn every_credential_pattern_refuses_something_and_names_itself() {
+        // One case per entry in the constant, so a pattern cannot be added
+        // without a demonstration that it matches, or removed without a
+        // failure here.
+        let cases = [
+            (".env", ".env"),
+            ("app/.env", ".env"),
+            (".env.production", ".env.*"),
+            ("deploy/.env.local", ".env.*"),
+            ("id_rsa", "id_rsa*"),
+            ("keys/id_rsa.pub", "id_rsa*"),
+            ("id_ecdsa", "id_ecdsa*"),
+            ("id_ed25519", "id_ed25519*"),
+            ("id_dsa", "id_dsa*"),
+            ("certs/server.pem", "*.pem"),
+            ("tls/private.key", "*.key"),
+            ("home/.ssh/known_hosts", ".ssh/"),
+            (".aws/credentials", ".aws/"),
+            (".gnupg/secring.gpg", ".gnupg/"),
+            ("home/.config/gcloud/creds.json", ".config/gcloud/"),
+        ];
+        for (path, pattern) in cases {
+            assert_eq!(refused(path), Some(pattern), "{path}");
+        }
+        let unmatched: Vec<&&str> = CREDENTIAL_EXCLUDES
+            .iter()
+            .filter(|pattern| !cases.iter().any(|(_, matched)| *matched == **pattern))
+            .collect();
+        assert!(unmatched.is_empty(), "untested patterns: {unmatched:?}");
+    }
+
+    /// A case-insensitive volume makes `ID_RSA` the same file as `id_rsa`, and
+    /// a refusal that a rename to uppercase defeats is not a refusal.
+    #[test]
+    fn credential_matching_ignores_ascii_case() {
+        assert_eq!(refused("ID_RSA"), Some("id_rsa*"));
+        assert_eq!(refused("Certs/Server.PEM"), Some("*.pem"));
+        assert_eq!(refused("Home/.SSH/config"), Some(".ssh/"));
+    }
+
+    /// The patterns are narrow enough that ordinary source survives them — the
+    /// guard is worth nothing if the reflex it trains is to switch it off.
+    #[test]
+    fn ordinary_source_is_not_a_credential() {
+        for path in [
+            "src/main.rs",
+            "src/environment.rs",
+            "docs/env.md",
+            "keyboard.rs",
+            "src/keys.rs",
+            "config/gcloud.md",
+            "scripts/ssh-setup.sh",
+            "id_generator.rs",
+            // Non-ASCII names must compare, not panic.
+            "docs/日本語.md",
+            "café.pemx",
+        ] {
+            assert_eq!(refused(path), None, "{path}");
+        }
+    }
+
+    /// The receiver's backstop reaches paths no walk ever pruned, so the two
+    /// refusal families answer through one function.
+    #[test]
+    fn refusal_covers_git_metadata_and_credentials_alike() {
+        assert_eq!(refusal(Utf8Path::new(".git/config")), Some(".git"));
+        assert_eq!(refusal(Utf8Path::new("vendor/.git/HEAD")), Some(".git"));
+        assert_eq!(refusal(Utf8Path::new("certs/key.pem")), Some("*.pem"));
+        assert_eq!(refusal(Utf8Path::new("src/main.rs")), None);
     }
 }
