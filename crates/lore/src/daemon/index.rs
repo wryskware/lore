@@ -343,10 +343,13 @@ pub fn apply_snapshot(
 /// profile flip has.
 ///
 /// The claim is answered from the path alone, before content is read, which is
-/// what lets the diff below short-circuit without fetching anything. It is
-/// answered whether or not the plugin can actually *run*: a claim that falls
-/// back still chunked the file under that plugin's decision, and the reason it
-/// fell back (a missing asset, say) is itself part of the fingerprint.
+/// what lets the diff below short-circuit without fetching anything. Whether the
+/// claim can actually *run* is part of the stamp too (`@` for a chunker that
+/// works, `!` for one that will fall back), because those two produce different
+/// chunks from the same bytes and the same fingerprint: a `grammar` chunker is
+/// unavailable in a build without the `wasm-grammars` feature, so a corpus
+/// indexed by such a build has to re-chunk when a build that carries the engine
+/// takes over — and it does, for exactly the claimed files.
 ///
 /// Public because the push manifest diff has to ask the same question the
 /// pipeline asks — "does the store already have this content?" — and a second,
@@ -364,7 +367,13 @@ pub fn content_stamp(
         _ => "",
     };
     let plugin_tag = match plugins.and_then(|plugins| plugins.claim(rel)) {
-        Some(claim) => format!("+{}@{}", claim.plugin, claim.fingerprint),
+        Some(claim) => {
+            let runs = match claim.unavailable() {
+                None => '@',
+                Some(_) => '!',
+            };
+            format!("+{}{runs}{}", claim.plugin, claim.fingerprint)
+        }
         None => String::new(),
     };
     format!(
@@ -820,6 +829,24 @@ fn index_one(
     // invalidates the short-circuit below and unchanged bytes re-chunk.
     let stamp = |hash: &str| policy.stamp(rel, hash);
 
+    // Counted here, from the claim alone, and therefore *before* the
+    // short-circuit below: a file that fell back last month and has not changed
+    // since is still a file this project's plugin cannot chunk, and a count
+    // that only saw re-chunked files would report a settled project as healthy.
+    // Being answerable from the path is what makes that possible at all.
+    if let Some(claim) = policy.plugins.claim(rel)
+        && let Some(reason) = claim.unavailable()
+    {
+        summary.plugin_fallbacks += 1;
+        tracing::debug!(
+            project = %project.name,
+            path = %rel,
+            plugin = %claim.plugin,
+            reason = %reason,
+            "plugin claims this file but cannot chunk it; the built-in fallback handles it"
+        );
+    }
+
     // The manifest hash is what the diff is done against; nothing is fetched
     // for a file whose content the store already has.
     if stored_hash == Some(stamp(&entry.hash).as_str()) {
@@ -848,19 +875,17 @@ fn index_one(
     let hash = stamp(&blake3::hash(&content).to_hex());
 
     let outcome = chunk_file_with(rel, &content, policy.profile, Some(policy.plugins));
-    // Counted per pass, whatever the file then turns out to be: a plugin that
-    // could not run is the condition being reported, not the chunks it failed
-    // to produce.
-    if let Route::FellBack { plugin, reason } = &outcome.route {
-        summary.plugin_fallbacks += 1;
-        tracing::debug!(
-            project = %project.name,
-            path = %rel,
-            plugin = %plugin,
-            reason = %reason,
-            "plugin claimed this file but could not chunk it; using the built-in fallback"
-        );
-    }
+    // The route is the chunker's own account of what happened, and it must
+    // agree with the claim the count above was taken from — they are two
+    // readings of one registry, and a disagreement would mean the stamp
+    // describes a chunker other than the one that ran.
+    debug_assert_eq!(
+        matches!(outcome.route, Route::FellBack { .. }),
+        policy
+            .plugins
+            .claim(rel)
+            .is_some_and(|claim| claim.unavailable().is_some())
+    );
 
     match outcome.chunks {
         FileChunks::Chunked(chunks) => {

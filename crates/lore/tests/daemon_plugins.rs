@@ -218,6 +218,21 @@ fn an_unclaimed_file_stamps_exactly_as_it_did_before_plugins_existed() {
         content_stamp(md, hash, Some(lore::repo_config::Profile::LoreV1), None),
         "Markdown is never claimable, so a registry cannot change its stamp"
     );
+
+    // A claim that cannot run stamps distinctly from one that can, even at the
+    // same fingerprint: the two produce different chunks from the same bytes,
+    // so a build that gains the wasm engine has to re-chunk what the build
+    // without it fell back on — and only that.
+    let (_broken_guard, broken_dir) = plugin_dir();
+    let broken = registry(&broken_dir, &[("broken", BROKEN)]);
+    let broken = broken.enabled_only(&BTreeSet::from(["broken".to_string()]));
+    let stamp = content_stamp(claimed, hash, None, Some(&broken));
+    assert!(stamp.contains("+broken!"), "{stamp}");
+    assert_ne!(
+        stamp,
+        stamp.replace("+broken!", "+broken@"),
+        "an unavailable claim must not stamp as a working one"
+    );
 }
 
 /// The same property through the pipeline: a pass with plugins installed but
@@ -390,6 +405,15 @@ fn files_that_fall_back_are_counted_for_every_pass() {
         "both claimed files fell back: {fell_back:?}"
     );
     assert_eq!(ctx.fallbacks.of(fixture.project.id), 2);
+
+    // And again on the next pass, which changes nothing: those files are still
+    // chunked by a plugin that cannot run, so a count taken only over the files
+    // a pass *re-chunked* would report a settled project as healthy.
+    let settled = full_scan(&ctx, &fixture.project);
+    assert_eq!(settled.indexed, 0, "nothing changed: {settled:?}");
+    assert_eq!(settled.plugin_fallbacks, 2, "{settled:?}");
+    assert_eq!(ctx.fallbacks.of(fixture.project.id), 2);
+
     // They are still indexed — a fallback is a worse chunking, never a lost
     // file.
     assert!(
