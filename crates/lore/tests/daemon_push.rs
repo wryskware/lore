@@ -889,6 +889,44 @@ async fn a_restart_discards_staged_content_no_lease_can_reach() {
     );
 }
 
+/// The receiver's backstop: a pusher decides what to send, but the paths this
+/// daemon hard-excludes are not the pusher's to re-include.
+///
+/// D-0015, "Ignore rules and secrets": "`.loreignore` evaluation runs
+/// **pusher-side** [...] The receiving daemon keeps hard-exclude backstop
+/// scanning; it does not re-run full ignore evaluation (trusted-client model)."
+/// `.git` is the one name [`lore::daemon::walk::HARD_EXCLUDES`] already lists,
+/// so this test does not depend on the credential patterns the same section
+/// describes and nothing has implemented yet.
+///
+/// **Ignored: this fails today.** Nothing on the push path consults
+/// `walk::is_hard_excluded` — a pushed manifest entry goes straight to
+/// `index_one`. The fix is not a test's to make: it needs a decision about
+/// *where* the backstop sits (drop the entries during negotiation, or refuse
+/// the manifest by name) and about the credential pattern list that has no
+/// implementation anywhere yet.
+#[tokio::test]
+#[ignore = "receiver-side hard-exclude backstop (D-0015) is unimplemented; see the doc comment"]
+async fn a_manifest_cannot_push_a_path_the_receiver_hard_excludes() {
+    let harness = harness();
+    let router = &harness.router;
+    let (session, epoch) = lease(router).await;
+
+    let secret = "[remote \"origin\"]\n    url = git@example.com:private.git\n";
+    let sneaky = Manifest::new(vec![entry(".git/config", secret)]);
+    let (status, body) = negotiate(router, &session, epoch, &sneaky).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    if body["needed"] != json!([]) {
+        upload(router, &session, epoch, ".git/config", secret.as_bytes()).await;
+    }
+    commit(router, &session, epoch).await;
+
+    assert!(
+        harness.fixture.indexed_paths().is_empty(),
+        "a hard-excluded path must not enter the index because a client listed it"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The mass-delete guard, on the push path
 // ---------------------------------------------------------------------------
