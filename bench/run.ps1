@@ -31,9 +31,17 @@ param(
     [ValidateSet('on', 'off')] [string]$Arm,
     [ValidateSet('T1', 'T2', 'T3', 'T4', 'T5')] [string]$Task,
     [switch]$Matrix,
+    # Difficulty calibration for the two round-2 tasks whose difficulty is
+    # argued rather than observed. Runs both arms, luna only. See the § Pilot
+    # block below for why it is four cells and not fifteen.
+    [switch]$Pilot,
     [ValidateSet('luna', 'qwen')] [string[]]$Models = @('luna', 'qwen'),
     # Round 2 is scoped on-arm-only (15 cells): `-Matrix -Arms on`.
     [ValidateSet('on', 'off')] [string[]]$Arms = @('off', 'on'),
+    # Overrides the arm -> slot mapping for this cell. `-Pilot` passes 'a' so
+    # both arms read the round-1 tree and slot 'b' need not exist; the matrix
+    # never sets it and keeps the fixed mapping. Not for general use.
+    [ValidateSet('a', 'b')] [string]$Slot,
     [ValidateRange(1, 16)] [int]$Throttle = 5
 )
 
@@ -119,7 +127,9 @@ function Get-CmChanged([string]$cmDir) {
 
 function Invoke-Cell([string]$model, [string]$repo, [string]$arm, [string]$task) {
     $m = $modelMap[$model]; $r = $repoMap[$repo]
-    $slot = $armSlot[$arm]
+    # `-Slot` overrides the fixed arm -> slot mapping. Only `-Pilot` sets it,
+    # and only for read-only tasks, where both arms sharing a tree is safe.
+    $slot = if ($Slot) { $Slot } else { $armSlot[$arm] }
     $s = $r.slots[$slot]
     $prompt = $prompts.$repo.$task
     if (-not $prompt) { throw "no prompt for $repo/$task" }
@@ -287,6 +297,70 @@ function Invoke-Cell([string]$model, [string]$repo, [string]$arm, [string]$task)
         ($sw.ElapsedMilliseconds / 1000), $tokens.input, $tokens.output, $toolCalls, $loreCalls)
 }
 
+# Launches a set of cells as child processes, throttled, and waits for all of
+# them. `$extraArgs` is splatted into every child's argument list — `-Pilot`
+# uses it to pass `-Slot a`. Each element is passed as its own argument, so a
+# value is never re-parsed by the child's command line.
+function Start-Wave([object[]]$wave, [string]$label, [string[]]$extraArgs = @()) {
+    if (-not $wave) { return }
+    Write-Host "[wave] '$label': $($wave.Count) cell(s) @ throttle $Throttle" -ForegroundColor DarkCyan
+    $procs = @()
+    foreach ($c in $wave) {
+        while (@($procs | Where-Object { -not $_.HasExited }).Count -ge $Throttle) {
+            Start-Sleep -Seconds 3
+        }
+        $log = Join-Path $resultsRoot "launch-$($c.Model)-$($c.Repo)-$($c.Arm)-$($c.Task).log"
+        Write-Host "[wave] launching $($c.Model)/$($c.Repo)/$($c.Arm)/$($c.Task)" -ForegroundColor DarkCyan
+        $procs += Start-Process pwsh -PassThru -WindowStyle Hidden -RedirectStandardOutput $log `
+            -ArgumentList (@('-NoProfile', '-File', $PSCommandPath,
+                '-Model', $c.Model, '-Repo', $c.Repo, '-Arm', $c.Arm, '-Task', $c.Task) + $extraArgs)
+    }
+    $procs | ForEach-Object { $_.WaitForExit() }
+    $failed = @($procs | Where-Object { $_.ExitCode -ne 0 }).Count
+    if ($failed) { Write-Warning "[wave] '$label': $failed cell(s) exited non-zero — check launch-*.log" }
+}
+
+# § Pilot — difficulty calibration before the round-2 keys freeze.
+#
+# Two round-2 tasks have difficulty that is argued rather than observed: lore
+# T3 (the `design_status` consumer sweep, whose difficulty rests on the concept
+# being spelled seven different ways so a literal grep gets about half of it)
+# and terrarium T4 (the dropped Lenia substrate, whose difficulty rests on a
+# lazy grep for reject|abandon|dropped returning nothing). The failure mode is a
+# task that turns out trivial for BOTH arms, which measures nothing — and which
+# you would otherwise discover only after running the whole round.
+#
+# So both arms run, even though round 2 proper is on-arm-only: the question
+# being asked here is "could the off arm have done this easily", which cannot be
+# answered without an off arm.
+#
+# Both arms use slot 'a'. Both pilot tasks are read-only, so sharing a tree is
+# safe, and it means slot 'b' need not exist to run the pilot at all.
+if ($Pilot) {
+    $pilotSet = @(
+        [pscustomobject]@{ Repo = 'lore'; Task = 'T3' }
+        [pscustomobject]@{ Repo = 'terrarium'; Task = 'T4' }
+    )
+    # The shared-tree assumption above holds only while the set stays
+    # read-only. Assert it rather than trusting whoever edits the list next.
+    $writeCells = @($pilotSet | Where-Object { $_.Task -eq 'T5' })
+    if ($writeCells) {
+        throw "[pilot] pilot cells must be read-only — both arms share slot 'a', so a T5 write would land under the other arm: $($writeCells.Repo -join ', ')"
+    }
+
+    $total = [System.Diagnostics.Stopwatch]::StartNew()
+    $cells = foreach ($p in $pilotSet) {
+        foreach ($ar in 'off', 'on') {
+            [pscustomobject]@{ Model = 'luna'; Repo = $p.Repo; Arm = $ar; Task = $p.Task }
+        }
+    }
+    Start-Wave $cells 'pilot' @('-Slot', 'a')
+    $total.Stop()
+    Write-Host ("[pilot] {0} cells in {1:n1} min. Read the answers before freezing the keys: for each task, did the OFF arm struggle the way the key assumes?" -f
+        $cells.Count, $total.Elapsed.TotalMinutes) -ForegroundColor Green
+    return
+}
+
 if ($Matrix) {
     $total = [System.Diagnostics.Stopwatch]::StartNew()
     $cells = foreach ($mo in $Models) {
@@ -314,25 +388,6 @@ if ($Matrix) {
     }
     $treeClash = $writes | Group-Object { "$($_.Repo)/$($_.Arm)" } | Where-Object Count -gt 1
     if ($treeClash) { throw "[matrix] two T5 cells would share a tree: $($treeClash.Name -join ', ')" }
-
-    function Start-Wave([object[]]$wave, [string]$label) {
-        if (-not $wave) { return }
-        Write-Host "[matrix] wave '$label': $($wave.Count) cell(s) @ throttle $Throttle" -ForegroundColor DarkCyan
-        $procs = @()
-        foreach ($c in $wave) {
-            while (@($procs | Where-Object { -not $_.HasExited }).Count -ge $Throttle) {
-                Start-Sleep -Seconds 3
-            }
-            $log = Join-Path $resultsRoot "launch-$($c.Model)-$($c.Repo)-$($c.Arm)-$($c.Task).log"
-            Write-Host "[matrix] launching $($c.Model)/$($c.Repo)/$($c.Arm)/$($c.Task)" -ForegroundColor DarkCyan
-            $procs += Start-Process pwsh -PassThru -WindowStyle Hidden -RedirectStandardOutput $log `
-                -ArgumentList '-NoProfile', '-File', $PSCommandPath,
-                '-Model', $c.Model, '-Repo', $c.Repo, '-Arm', $c.Arm, '-Task', $c.Task
-        }
-        $procs | ForEach-Object { $_.WaitForExit() }
-        $failed = @($procs | Where-Object { $_.ExitCode -ne 0 }).Count
-        if ($failed) { Write-Warning "[matrix] wave '$label': $failed cell(s) exited non-zero — check launch-*.log" }
-    }
 
     Start-Wave $readOnly 'luna T1-T4'
     Start-Wave $writes 'luna T5'

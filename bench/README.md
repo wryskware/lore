@@ -139,7 +139,39 @@ sharing a tree) and throws before launching anything if they do not hold.
    `cs:134`; the git worktrees stay detached at their pins.
 8. **Serving stack up:** ollama with `qwen3.8:latest` if the qwen arm runs;
    the embedding endpoint `lore status` reports as `ready`.
-9. Run: `.\run.ps1 -Matrix -Models luna -Arms on -Throttle 5`.
+9. **Pilot first** (see below): `.\run.ps1 -Pilot`.
+10. Run: `.\run.ps1 -Matrix -Models luna -Arms on -Throttle 5`.
+
+## Pilot — calibrate difficulty before freezing the keys
+
+```powershell
+.\run.ps1 -Pilot
+```
+
+Four cells, luna only, a few minutes: `lore/T3` and `terrarium/T4`, each on
+both arms.
+
+**Why these two.** Every other round-2 task had its difficulty established by
+reading the corpus at the pin. These two rest on an argument about *search
+behavior* instead: lore T3 assumes a literal grep finds only about half the
+`design_status` pipeline because the concept is spelled seven different ways,
+and terrarium T4 assumes the dropped Lenia substrate is unreachable by a lazy
+`reject|abandon|dropped` sweep. Both arguments are sound on paper. Neither has
+been watched happen.
+
+**What you are checking.** The failure mode is a task that turns out easy for
+*both* arms — that cell then measures nothing, and you would find out only
+after the full round. So read the two off-arm answers and ask: did the off arm
+struggle the way the key assumes? If it strolled to a complete answer, the task
+needs rework before the round, not after.
+
+**Why both arms**, when round 2 proper is on-arm-only: the question is "could
+the off arm have done this easily", which has no answer without an off arm.
+
+**Slot 'b' is not required.** Both pilot tasks are read-only, so both arms run
+against slot `a` and cannot collide. `run.ps1` throws if the pilot set is ever
+edited to include a T5, since that assumption would no longer hold. This means
+step 3 of setup can be skipped if you are only piloting.
 
 ## T5 capture and reset
 
