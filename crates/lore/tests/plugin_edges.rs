@@ -657,45 +657,131 @@ fn a_manifest_that_is_not_utf8_is_refused_by_name() {
 // Conflicts and enablement
 // ---------------------------------------------------------------------------
 
-/// Conflict resolution happens at *install* scope, not enablement scope: an
-/// extension two installed plugins claim belongs to nobody even in a project
-/// that enabled only one of them.
+/// A contest is settled against the set that governs the project, which is the
+/// set the project enabled — so an extension two *installed* plugins claim
+/// routes for a project that enabled only one of them, and belongs to nobody
+/// for a project that enabled both.
 ///
-/// The contract's sentence is "two **enabled** plugins claiming the same
-/// extension is a loud registration error"; the implementation resolves the
-/// conflict once, at load, for every project on the machine. The consequence a
-/// user feels is the one asserted here — installing an unrelated plugin can
-/// take an extension away from a project that was already using it — and it is
-/// pinned rather than assumed, because the alternative (resolving per project)
-/// would make which plugin wins depend on who asked.
+/// The property this protects is the feature's own headline: **installing a
+/// plugin re-chunks nothing until a repository enables it**. Resolving contests
+/// at install scope would break it in the worst available way — `lore plugin
+/// add unity-fork` would silently strip `uxml` from every project already
+/// chunking with `unity`, moving their stamps and re-chunking their corpora
+/// because of a plugin none of them named.
 #[test]
-fn a_contested_extension_stays_contested_even_when_one_claimant_is_enabled() {
+fn a_contest_is_settled_against_the_plugins_a_project_enabled() {
     let dir = TempDir::new().unwrap();
     let dir = utf8(&dir);
     write_plugin(&dir, "a", &windows_manifest("alpha", &["shared"]));
     write_plugin(&dir, "b", &windows_manifest("beta", &["shared"]));
     let (registry, diagnostics) = PluginRegistry::load(&dir);
-    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
 
-    let only_alpha = registry.enabled_only(&["alpha".to_string()].into_iter().collect());
-    assert_eq!(only_alpha.plugins().len(), 1);
+    // Machine-wide, the contest is real and reported: a human is told both
+    // claimants by name, whichever project goes on to enable which.
     assert!(
-        only_alpha.claim(Utf8Path::new("a.shared")).is_none(),
-        "enabling one claimant does not settle a conflict the other caused"
+        matches!(
+            diagnostics.as_slice(),
+            [Diagnostic::ExtensionConflict { extension, plugins }]
+                if extension == "shared" && plugins == &["alpha".to_string(), "beta".to_string()]
+        ),
+        "{diagnostics:?}"
     );
-    // ...and the file is chunked as if no plugin existed, not as a fallback:
-    // nobody claims it, so there is nothing to report.
+    assert!(registry.claim(Utf8Path::new("a.shared")).is_none());
+    // Both plugins still *claim* it — a claim is what the manifest says, and
+    // `lore plugin list` showing one plugin's claims silently shortened would
+    // hide the very thing the diagnostic is about.
+    for name in ["alpha", "beta"] {
+        assert_eq!(registry.get(name).unwrap().extensions(), ["shared"]);
+    }
+
+    let enabled =
+        |names: &[&str]| registry.enabled_only(&names.iter().map(|n| n.to_string()).collect());
     let src = lines(10);
-    let out = chunk_file_with(
-        Utf8Path::new("a.shared"),
-        src.as_bytes(),
-        None,
-        Some(&only_alpha),
+
+    // One claimant enabled: it wins, because within this project there is no
+    // contest at all. The other plugin is not installed as far as this project
+    // is concerned.
+    for winner in ["alpha", "beta"] {
+        let only = enabled(&[winner]);
+        let claim = only
+            .claim(Utf8Path::new("a.shared"))
+            .unwrap_or_else(|| panic!("{winner} was enabled alone and should hold `shared`"));
+        assert_eq!(claim.plugin, winner);
+
+        let out = chunk_file_with(Utf8Path::new("a.shared"), src.as_bytes(), None, Some(&only));
+        assert!(
+            matches!(&out.route, Route::Plugin { plugin, .. } if plugin == winner),
+            "{:?}",
+            out.route
+        );
+        // The end-to-end consequence: the file carries the winner's identity in
+        // its content stamp, so it re-chunks when *that* plugin moves and never
+        // when the other one is installed, edited or removed.
+        let stamp = content_stamp(Utf8Path::new("a.shared"), "abc123", None, Some(&only));
+        assert!(stamp.contains(&format!("+{winner}@")), "{stamp}");
+    }
+
+    // Both enabled: now the project really does have two claimants, and the
+    // extension goes to neither — the contract's rule, at the scope the
+    // contract states it.
+    let both = enabled(&["alpha", "beta"]);
+    assert!(
+        both.claim(Utf8Path::new("a.shared")).is_none(),
+        "two enabled claimants must leave it to nobody"
     );
+    let out = chunk_file_with(Utf8Path::new("a.shared"), src.as_bytes(), None, Some(&both));
     assert_eq!(out.route, Route::Builtin);
     assert_eq!(
         out.chunks,
         chunk_file(Utf8Path::new("a.shared"), src.as_bytes(), None)
+    );
+    // And an unclaimed extension is not a fallback: nobody claimed it, so
+    // there is nothing for `status` to count.
+    assert_eq!(
+        content_stamp(Utf8Path::new("a.shared"), "abc123", None, Some(&both)),
+        content_stamp(Utf8Path::new("a.shared"), "abc123", None, None)
+    );
+}
+
+/// The headline property, stated as the thing a user would notice: installing a
+/// second, conflicting plugin machine-wide must not move one byte of a project
+/// that never named it.
+///
+/// Asserted at the stamp, because the stamp is where the damage would be. A
+/// moved stamp is a re-chunk of every file the plugin owns, on a machine where
+/// nothing the project depends on changed.
+#[test]
+fn installing_a_conflicting_plugin_does_not_disturb_a_project_that_enabled_the_other() {
+    let before = TempDir::new().unwrap();
+    let before = utf8(&before);
+    write_plugin(&before, "a", &windows_manifest("alpha", &["shared"]));
+    let (lonely, _) = PluginRegistry::load(&before);
+
+    // The same machine, one `lore plugin add` later.
+    let after = TempDir::new().unwrap();
+    let after = utf8(&after);
+    write_plugin(&after, "a", &windows_manifest("alpha", &["shared"]));
+    write_plugin(&after, "b", &windows_manifest("beta", &["shared"]));
+    let (crowded, diagnostics) = PluginRegistry::load(&after);
+    assert_eq!(diagnostics.len(), 1, "the conflict is still reported");
+
+    let only_alpha = |registry: &PluginRegistry| {
+        registry.enabled_only(&["alpha".to_string()].into_iter().collect())
+    };
+    assert_eq!(
+        content_stamp(
+            Utf8Path::new("a.shared"),
+            "abc123",
+            None,
+            Some(&only_alpha(&crowded))
+        ),
+        content_stamp(
+            Utf8Path::new("a.shared"),
+            "abc123",
+            None,
+            Some(&only_alpha(&lonely))
+        ),
+        "installing an unrelated plugin re-chunked a project that never named it"
     );
 }
 
