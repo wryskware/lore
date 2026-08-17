@@ -40,6 +40,7 @@ pub mod manifest;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::Arc;
 
 use camino::{Utf8Path, Utf8PathBuf};
 
@@ -182,11 +183,48 @@ pub struct Plugin {
     pub chunkers: Vec<LoadedChunker>,
 }
 
+impl Plugin {
+    /// Read, parse and resolve one plugin root.
+    ///
+    /// The single-root half of [`PluginRegistry::load`], public because
+    /// `lore plugin add` validates an installation candidate by *actually
+    /// loading it* — a manifest checked by any other reader would eventually
+    /// disagree with the one the daemon runs.
+    ///
+    /// The `Err` is the same [`Diagnostic`] the registry would have reported,
+    /// so the CLI and `lore status` say the same thing about the same file.
+    pub fn load(root: &Utf8Path) -> Result<Self, Diagnostic> {
+        let mut diagnostics = Vec::new();
+        load_one(root, &mut diagnostics).ok_or_else(|| {
+            diagnostics.pop().unwrap_or_else(|| Diagnostic::Manifest {
+                root: root.to_owned(),
+                detail: "the plugin could not be loaded".to_string(),
+            })
+        })
+    }
+
+    /// Every extension this plugin still owns after conflict resolution, in
+    /// declaration order. What `lore status` and `lore plugin list` report.
+    pub fn extensions(&self) -> Vec<&str> {
+        self.chunkers
+            .iter()
+            .flat_map(|chunker| chunker.extensions.iter().map(String::as_str))
+            .collect()
+    }
+}
+
 /// Every plugin the daemon has loaded, and the extension → plugin map that
 /// routing consults.
+///
+/// Plugins are held behind [`Arc`] so [`Self::enabled_only`] can hand out a
+/// narrowed registry — one project's opt-in — without reloading a grammar or
+/// re-hashing an asset. The narrowed registry is an ordinary `PluginRegistry`
+/// on purpose: routing takes `Option<&PluginRegistry>` and knows nothing about
+/// enablement, which keeps "which plugins exist" and "which this project wants"
+/// from becoming two questions the chunker has to answer.
 #[derive(Debug, Default)]
 pub struct PluginRegistry {
-    plugins: Vec<Plugin>,
+    plugins: Vec<Arc<Plugin>>,
     /// Extension → (plugin index, chunker index). Built-in extensions and
     /// contested ones are absent by construction.
     by_extension: BTreeMap<String, (usize, usize)>,
@@ -232,8 +270,58 @@ impl PluginRegistry {
         self.by_extension.is_empty()
     }
 
-    pub fn plugins(&self) -> &[Plugin] {
+    /// Every loaded plugin, in the order their roots were visited (sorted, so
+    /// it is the same on every machine). Shared rather than owned so that
+    /// [`Self::enabled_only`] is a filter and not a reload; a caller reads
+    /// straight through the [`Arc`].
+    pub fn plugins(&self) -> &[Arc<Plugin>] {
         &self.plugins
+    }
+
+    /// The plugin loaded under this name, if any.
+    pub fn get(&self, name: &str) -> Option<&Plugin> {
+        self.plugins
+            .iter()
+            .map(Arc::as_ref)
+            .find(|plugin| plugin.name == name)
+    }
+
+    /// This registry narrowed to the plugins a project enabled — the
+    /// intersection of *installed* and `[plugins] enable` (see
+    /// [`crate::repo_config::enabled_plugins`]).
+    ///
+    /// Cheap: the plugins themselves are shared, and only the extension map is
+    /// rebuilt. Cheap matters because it happens once per index pass per
+    /// project, and the alternative — threading an enabled set through
+    /// [`crate::chunk::chunk_file_with`] and every stamping call beside it —
+    /// would put the same filter in two places that must never disagree.
+    ///
+    /// An enabled name nobody installed simply contributes nothing, which is
+    /// what makes it a reportable gap rather than an error.
+    pub fn enabled_only(&self, enabled: &BTreeSet<String>) -> Self {
+        let mut plugins = Vec::new();
+        // Old plugin index → new one; extensions of a disabled plugin are
+        // dropped rather than renumbered.
+        let mut moved: BTreeMap<usize, usize> = BTreeMap::new();
+        for (at, plugin) in self.plugins.iter().enumerate() {
+            if enabled.contains(&plugin.name) {
+                moved.insert(at, plugins.len());
+                plugins.push(Arc::clone(plugin));
+            }
+        }
+        let by_extension = self
+            .by_extension
+            .iter()
+            .filter_map(|(extension, (plugin, chunker))| {
+                moved
+                    .get(plugin)
+                    .map(|now| (extension.clone(), (*now, *chunker)))
+            })
+            .collect();
+        Self {
+            plugins,
+            by_extension,
+        }
     }
 
     /// The plugin owning `extension` (lowercase, bare), if any.
@@ -264,7 +352,8 @@ impl PluginRegistry {
     /// [`Diagnostic`] and costs only what it has to.
     pub fn load(dir: &Utf8Path) -> (Self, Vec<Diagnostic>) {
         let mut diagnostics = Vec::new();
-        let mut registry = Self::default();
+        let mut loaded: Vec<Plugin> = Vec::new();
+        let mut by_extension: BTreeMap<String, (usize, usize)> = BTreeMap::new();
 
         let mut roots: Vec<Utf8PathBuf> = Vec::new();
         match std::fs::read_dir(dir) {
@@ -279,14 +368,14 @@ impl PluginRegistry {
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return (registry, diagnostics);
+                return (Self::empty(), diagnostics);
             }
             Err(err) => {
                 diagnostics.push(Diagnostic::Manifest {
                     root: dir.to_owned(),
                     detail: format!("the plugin directory is unreadable: {err}"),
                 });
-                return (registry, diagnostics);
+                return (Self::empty(), diagnostics);
             }
         }
         // Directory order is not a promise any filesystem makes, and conflict
@@ -309,83 +398,99 @@ impl PluginRegistry {
                 });
                 continue;
             }
-            registry.register(plugin, &mut contested, &mut diagnostics);
+            register(
+                &mut loaded,
+                &mut by_extension,
+                plugin,
+                &mut contested,
+                &mut diagnostics,
+            );
         }
 
+        // Wrapped only once every conflict is settled: registration edits
+        // plugins that are already registered (a contested extension is taken
+        // back off its first holder), and shared plugins would make that a
+        // question about aliasing rather than about conflicts.
+        let registry = Self {
+            plugins: loaded.into_iter().map(Arc::new).collect(),
+            by_extension,
+        };
         (registry, diagnostics)
     }
+}
 
-    fn register(
-        &mut self,
-        mut plugin: Plugin,
-        contested: &mut BTreeMap<String, Vec<String>>,
-        diagnostics: &mut Vec<Diagnostic>,
-    ) {
-        let index = self.plugins.len();
-        let name = plugin.name.clone();
-        for (chunker_index, chunker) in plugin.chunkers.iter_mut().enumerate() {
-            // A built-in claim voids the whole entry, not just the offending
-            // extension: a chunker that claims `md` alongside `uxml` has
-            // misunderstood the contract, and half-honoring it would be worse
-            // than honoring none of it.
-            if let Some(builtin) = chunker
-                .extensions
-                .iter()
-                .find(|ext| crate::chunk::is_builtin_extension(ext))
-            {
-                diagnostics.push(Diagnostic::BuiltinExtension {
-                    plugin: name.clone(),
-                    extension: builtin.clone(),
+/// Fold one loaded plugin into the load-in-progress, resolving its extension
+/// claims against everything registered before it.
+fn register(
+    plugins: &mut Vec<Plugin>,
+    by_extension: &mut BTreeMap<String, (usize, usize)>,
+    mut plugin: Plugin,
+    contested: &mut BTreeMap<String, Vec<String>>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let index = plugins.len();
+    let name = plugin.name.clone();
+    for (chunker_index, chunker) in plugin.chunkers.iter_mut().enumerate() {
+        // A built-in claim voids the whole entry, not just the offending
+        // extension: a chunker that claims `md` alongside `uxml` has
+        // misunderstood the contract, and half-honoring it would be worse
+        // than honoring none of it.
+        if let Some(builtin) = chunker
+            .extensions
+            .iter()
+            .find(|ext| crate::chunk::is_builtin_extension(ext))
+        {
+            diagnostics.push(Diagnostic::BuiltinExtension {
+                plugin: name.clone(),
+                extension: builtin.clone(),
+            });
+            chunker.extensions.clear();
+            continue;
+        }
+        chunker.extensions.retain(|extension| {
+            if let Some(holders) = contested.get_mut(extension) {
+                holders.push(name.clone());
+                diagnostics.push(Diagnostic::ExtensionConflict {
+                    extension: extension.clone(),
+                    plugins: holders.clone(),
                 });
-                chunker.extensions.clear();
-                continue;
+                return false;
             }
-            chunker.extensions.retain(|extension| {
-                if let Some(holders) = contested.get_mut(extension) {
-                    holders.push(name.clone());
+            match by_extension.remove(extension) {
+                Some((held_by, held_chunker)) => {
+                    let first = plugins[held_by].name.clone();
+                    plugins[held_by].chunkers[held_chunker]
+                        .extensions
+                        .retain(|held| held != extension);
+                    let holders = vec![first, name.clone()];
                     diagnostics.push(Diagnostic::ExtensionConflict {
                         extension: extension.clone(),
                         plugins: holders.clone(),
                     });
-                    return false;
+                    contested.insert(extension.clone(), holders);
+                    false
                 }
-                match self.by_extension.remove(extension) {
-                    Some((held_by, held_chunker)) => {
-                        let first = self.plugins[held_by].name.clone();
-                        self.plugins[held_by].chunkers[held_chunker]
-                            .extensions
-                            .retain(|held| held != extension);
-                        let holders = vec![first, name.clone()];
-                        diagnostics.push(Diagnostic::ExtensionConflict {
-                            extension: extension.clone(),
-                            plugins: holders.clone(),
-                        });
-                        contested.insert(extension.clone(), holders);
-                        false
-                    }
-                    None => {
-                        self.by_extension
-                            .insert(extension.clone(), (index, chunker_index));
-                        true
-                    }
+                None => {
+                    by_extension.insert(extension.clone(), (index, chunker_index));
+                    true
                 }
-            });
-
-            if let LoadedStrategy::Grammar {
-                config,
-                grammar: Err(reason),
-            } = &chunker.strategy
-                && !chunker.extensions.is_empty()
-            {
-                diagnostics.push(Diagnostic::GrammarUnavailable {
-                    plugin: name.clone(),
-                    grammar: config.grammar.clone(),
-                    reason: reason.clone(),
-                });
             }
+        });
+
+        if let LoadedStrategy::Grammar {
+            config,
+            grammar: Err(reason),
+        } = &chunker.strategy
+            && !chunker.extensions.is_empty()
+        {
+            diagnostics.push(Diagnostic::GrammarUnavailable {
+                plugin: name.clone(),
+                grammar: config.grammar.clone(),
+                reason: reason.clone(),
+            });
         }
-        self.plugins.push(plugin);
     }
+    plugins.push(plugin);
 }
 
 /// Reads, parses and resolves one plugin root. `None` (with a diagnostic) when

@@ -304,6 +304,81 @@ fn a_plugin_can_never_claim_a_built_in_extension() {
     );
 }
 
+/// Per-project opt-in is a *filter over the loaded registry*, not a second
+/// load: what a project enables decides which of the installed plugins can
+/// claim its files, and nothing else about them changes.
+#[test]
+fn enabling_narrows_the_registry_without_reloading_anything() {
+    let dir = TempDir::new().unwrap();
+    let dir = utf8(&dir);
+    copy_fixture(&dir);
+    write_plugin(
+        &dir,
+        "other",
+        WINDOWS_ONLY.replace("toydata", "otherdata").as_str(),
+    );
+    let (registry, _) = PluginRegistry::load(&dir);
+    assert_eq!(registry.plugins().len(), 2);
+
+    let enabled =
+        |names: &[&str]| registry.enabled_only(&names.iter().map(|n| n.to_string()).collect());
+
+    // Nothing enabled is exactly no registry: every claim disappears, which is
+    // what makes an un-opted-in project chunk byte-identically to one on a
+    // daemon with no plugins installed at all.
+    let none = enabled(&[]);
+    assert!(none.is_empty());
+    assert!(none.claim(Utf8Path::new("a.uxml")).is_none());
+    assert!(none.claim(Utf8Path::new("a.otherdata")).is_none());
+
+    // One of two: its own extensions still route, the other plugin's do not.
+    let toy = enabled(&["toy"]);
+    assert_eq!(toy.plugins().len(), 1);
+    let claim = toy.claim(Utf8Path::new("a.uxml")).expect("toy is enabled");
+    assert_eq!(claim.plugin, "toy");
+    // The fingerprint is the same object the full registry reports — the
+    // filter must not disturb the identity the content stamp folds in.
+    assert_eq!(claim.fingerprint, registry.get("toy").unwrap().fingerprint);
+    assert_eq!(toy.claim(Utf8Path::new("a.toydata")).unwrap().plugin, "toy");
+    assert!(toy.claim(Utf8Path::new("a.otherdata")).is_none());
+
+    // The *second* plugin's extension map survives the renumbering, which is
+    // the one thing a filtered index map can plausibly get wrong.
+    let other = enabled(&["other"]);
+    assert_eq!(
+        other.claim(Utf8Path::new("a.otherdata")).unwrap().plugin,
+        "other"
+    );
+    assert!(other.claim(Utf8Path::new("a.uxml")).is_none());
+
+    // Enabling a name nobody installed is not an error and not a claim.
+    let missing = enabled(&["toy", "unity"]);
+    assert_eq!(missing.plugins().len(), 1);
+    assert!(missing.claim(Utf8Path::new("a.unity")).is_none());
+}
+
+/// `lore plugin add` validates a candidate by loading it exactly as the daemon
+/// would, so the two can never disagree about what a plugin is.
+#[test]
+fn a_single_root_loads_or_says_why_in_the_registrys_own_words() {
+    let dir = TempDir::new().unwrap();
+    let dir = utf8(&dir);
+    let root = copy_fixture(&dir);
+
+    let plugin = lore::plugin::Plugin::load(&root).expect("the fixture is a plugin");
+    assert_eq!(plugin.name, "toy");
+    assert_eq!(plugin.extensions(), ["uxml", "toydata"]);
+    // Identical to what the directory load reports, byte for byte.
+    let (registry, _) = PluginRegistry::load(&dir);
+    assert_eq!(plugin.fingerprint, registry.get("toy").unwrap().fingerprint);
+
+    let broken = write_plugin(&dir, "broken", "[plugin]\nname = \"broken\"\nwat = 1\n");
+    let err = lore::plugin::Plugin::load(&broken).unwrap_err();
+    assert!(err.to_string().contains("wat"), "{err}");
+    let absent = lore::plugin::Plugin::load(&dir.join("nope")).unwrap_err();
+    assert!(absent.to_string().contains("lore-plugin.toml"), "{absent}");
+}
+
 #[test]
 fn two_plugins_may_not_share_a_name() {
     let dir = TempDir::new().unwrap();
