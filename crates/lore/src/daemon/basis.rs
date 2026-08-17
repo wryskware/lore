@@ -52,10 +52,7 @@ use std::process::{Command, Stdio};
 
 use camino::{Utf8Path, Utf8PathBuf};
 
-/// The entry whose presence marks a git work tree. A *file* in a linked
-/// worktree or a submodule, a directory in an ordinary clone — both count, so
-/// this is an existence test and never a directory test.
-const GIT_ENTRY: &str = ".git";
+use super::walk::is_repo_root;
 
 /// Windows `CREATE_NO_WINDOW`: a daemon that flashes a console window on every
 /// index pass is a daemon nobody leaves running.
@@ -102,8 +99,12 @@ impl Basis {
 /// repository as a project is legitimate, and such a root has no `.git` of its
 /// own while still being governed by one. A few `exists()` calls, and a
 /// non-git project never pays for a process spawn.
+///
+/// "Is this directory a repository root" is [`super::walk::is_repo_root`], the
+/// same question the walker asks of every subdirectory it descends into. One
+/// definition, because two would eventually disagree about a linked worktree.
 pub fn in_work_tree(root: &Utf8Path) -> bool {
-    root.ancestors().any(|dir| dir.join(GIT_ENTRY).exists())
+    root.ancestors().any(is_repo_root)
 }
 
 /// The whole basis for a full observation: one `git ls-files`.

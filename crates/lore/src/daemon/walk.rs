@@ -12,13 +12,18 @@
 //! 2. Never a directory named in [`HARD_EXCLUDES`] — which is `.git` alone.
 //!    Anything more opinionated than that is ecosystem policy, and ecosystem
 //!    policy belongs in a file the user can read and edit.
-//! 3. [`LORE_IGNORE_FILE`] (`.loreignore`) — gitignore syntax, nested like
+//! 3. Never *into* a subdirectory that is itself a repository root — see
+//!    [`is_repo_root`] for what that means and why the `ignore` crate does not
+//!    do it for us. Unlike rules 1 and 2 this is a default rather than a
+//!    refusal: the project's own `.loreignore` can re-include such a directory
+//!    with `!`.
+//! 4. [`LORE_IGNORE_FILE`] (`.loreignore`) — gitignore syntax, nested like
 //!    `.gitignore`, and honored **regardless of VCS**. This is the
 //!    user-visible knob, generated per project by
 //!    [`super::ignorefile`]: a Unity VCS or Perforce workspace has no
 //!    `.gitignore`, so without it telemetry dumps and serialized-asset YAML
 //!    index as if they were code.
-//! 4. Otherwise ripgrep's rules via the `ignore` crate: `.gitignore`
+//! 5. Otherwise ripgrep's rules via the `ignore` crate: `.gitignore`
 //!    (including nested and parent files), `.git/info/exclude`, hidden files
 //!    skipped.
 //!
@@ -56,6 +61,41 @@ pub const LORE_IGNORE_FILE: &str = ".loreignore";
 /// file says. Only `.git`: it is not an ecosystem opinion but the mechanism
 /// the ignore rules are themselves read from.
 pub const HARD_EXCLUDES: &[&str] = &[".git"];
+
+/// The entry whose presence makes a directory a repository root.
+///
+/// Deliberately an *existence* test and never a directory test: in an ordinary
+/// clone `.git` is a directory, but in a linked worktree — and in a submodule
+/// under git's modern layout — it is a **file** holding a `gitdir:` pointer.
+/// A rule that only looked for the directory would miss exactly the case that
+/// motivated this one.
+pub const GIT_ENTRY: &str = ".git";
+
+/// Is `dir` the root of its own repository?
+///
+/// The walker refuses to descend into such a directory when it is *below* the
+/// project root, because everything under it belongs to another repository and
+/// indexing it duplicates that repository inside this project — every file
+/// chunked twice, both copies competing in the rankings, the embedding cost
+/// paid twice. The concrete case is an agent tool's `git worktree` living
+/// inside the repo it was made from, which is a byte-for-byte second copy.
+///
+/// The `ignore` crate does **not** do this. It knows about repository
+/// boundaries only for deciding which `.gitignore` files apply
+/// (`require_git`); it walks straight through a nested clone and a nested
+/// worktree alike, under either setting. That is established by
+/// `the_ignore_crate_walks_into_a_nested_repository_on_its_own`, which pins
+/// the upstream behavior so a crate upgrade that changed it would be noticed
+/// rather than silently making this rule redundant.
+///
+/// This is a *default*, not a refusal like [`HARD_EXCLUDES`]: vendoring a
+/// repository into a project and wanting it indexed is legitimate, and
+/// `!vendor/dep/` in the project's `.loreignore` re-includes it. That escape
+/// hatch cannot rescue a *hidden* directory (`.claude/worktrees/`), which the
+/// crate's `hidden(true)` prunes before any of this is consulted.
+pub fn is_repo_root(dir: &Utf8Path) -> bool {
+    dir.join(GIT_ENTRY).exists()
+}
 
 /// Credential patterns that never enter a manifest, whatever any ignore file
 /// says (D-0015, "Ignore rules and secrets").
@@ -318,6 +358,21 @@ pub fn walk_files(
     // must agree with, or the two would fight over the same files forever.
     let fallback = !root.join(LORE_IGNORE_FILE).exists();
 
+    // The one escape hatch for rule 3, built from the *project's* own
+    // `.loreignore` only. A nested repository is skipped during descent, so the
+    // crate's own matcher stack never gets to weigh in on it — this asks the
+    // same question the crate would have asked, over the one file whose author
+    // is unambiguously the project owner rather than the vendored repository
+    // itself. A malformed line is ignored rather than failing the walk; the
+    // `ignore` crate reports the same line again when it parses the file for
+    // real.
+    let reinclude = {
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+        let _ = builder.add(root.join(LORE_IGNORE_FILE));
+        builder.build().ok()
+    };
+
+    let root_owned = root.to_owned();
     let data_dir = data_dir.to_owned();
     builder.filter_entry(move |entry| {
         let name = entry.file_name().to_string_lossy();
@@ -335,6 +390,25 @@ pub fn walk_files(
         match Utf8Path::from_path(entry.path()) {
             Some(path) => {
                 if paths::is_within(&data_dir, path) {
+                    return false;
+                }
+                // Rule 3. Strictly below the root, because the project root is
+                // itself a repository root in the overwhelmingly common case —
+                // and a linked worktree registered directly as its own project
+                // must index normally rather than returning nothing at all.
+                // Belt and braces today: this crate version does not run
+                // `filter_entry` against the walk root, so the guard is
+                // load-bearing only if that changes. It is one string compare,
+                // and the alternative is a rule whose most important
+                // must-not-break case rests on an undocumented upstream
+                // detail.
+                if entry.file_type().is_some_and(|kind| kind.is_dir())
+                    && paths::relative_to(&root_owned, path).is_some()
+                    && is_repo_root(path)
+                    && !reinclude
+                        .as_ref()
+                        .is_some_and(|set| set.matched(path, true).is_whitelist())
+                {
                     return false;
                 }
                 // Keep `start`'s subtree and the directories on the way down
@@ -552,6 +626,175 @@ mod tests {
         // re-include it.
         std::fs::write(root.join(LORE_IGNORE_FILE), "!.git/\n").unwrap();
         assert_eq!(walk(&root), ["kept.rs"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Nested repository boundaries
+    //
+    // Real checkouts throughout, never a hand-built directory shape: the whole
+    // question is what `git worktree add` actually puts on disk (a `.git`
+    // *file*) versus what a clone does (a `.git` directory), and a mocked
+    // fixture would be a restatement of this module's assumptions rather than
+    // a test of them.
+    // -----------------------------------------------------------------------
+
+    fn git_in(dir: &Utf8Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("git is on PATH");
+        assert!(
+            output.status.success(),
+            "git {args:?} in {dir}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A repository with one commit — `git worktree add` needs a commit to
+    /// check out.
+    fn init_repo(dir: &Utf8Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        git_in(dir, &["init", "-q", "."]);
+        git_in(
+            dir,
+            &["config", "--local", "user.email", "t@example.invalid"],
+        );
+        git_in(dir, &["config", "--local", "user.name", "test"]);
+        git_in(dir, &["commit", "-q", "--allow-empty", "-m", "root"]);
+    }
+
+    /// A project root that is a real repository, with a real linked worktree
+    /// of itself nested inside it and a real second repository vendored in.
+    /// Both nested checkouts are at *non-hidden* paths, because `hidden(true)`
+    /// would otherwise prune them and hide what is being tested.
+    fn nested_checkouts() -> (tempfile::TempDir, Utf8PathBuf) {
+        let (dir, root) = fixture(&[("src/main.rs", "fn main() {}"), ("keep.md", "# notes")]);
+        init_repo(&root);
+        git_in(&root, &["add", "-A"]);
+        git_in(&root, &["commit", "-q", "-m", "content"]);
+        // The defect, exactly: an agent tool's worktree of this very
+        // repository, living inside it. Every committed file appears twice.
+        git_in(&root, &["worktree", "add", "-q", "wt/agent", "-b", "agent"]);
+        // And an ordinary nested clone, whose `.git` is a directory.
+        let vendored = root.join("vendor/dep");
+        init_repo(&vendored);
+        std::fs::write(vendored.join("lib.rs"), "pub fn dep() {}").unwrap();
+        (dir, root)
+    }
+
+    /// What the `ignore` crate does on its own, pinned. Its repository-boundary
+    /// notions (`require_git`) decide which `.gitignore` files apply, **not**
+    /// where the walk stops: under either setting it descends into a nested
+    /// worktree and a nested clone alike. If a crate upgrade ever changed
+    /// that, this failing would be the notice that [`is_repo_root`] had become
+    /// redundant.
+    #[test]
+    fn the_ignore_crate_walks_into_a_nested_repository_on_its_own() {
+        let (_dir, root) = nested_checkouts();
+        for require_git in [false, true] {
+            let mut builder = WalkBuilder::new(&root);
+            builder
+                .follow_links(false)
+                .hidden(true)
+                .parents(true)
+                .git_ignore(true)
+                .git_exclude(true)
+                .require_git(require_git)
+                .git_global(false);
+            let mut files: Vec<String> = builder
+                .build()
+                .flatten()
+                .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+                .filter_map(|entry| {
+                    Utf8Path::from_path(entry.path()).and_then(|p| paths::relative_to(&root, p))
+                })
+                .map(|p| p.to_string())
+                .collect();
+            files.sort();
+            assert!(
+                files.iter().any(|p| p == "wt/agent/src/main.rs"),
+                "require_git={require_git}: the crate stopped at the nested worktree by itself: \
+                 {files:#?}"
+            );
+            assert!(
+                files.iter().any(|p| p == "vendor/dep/lib.rs"),
+                "require_git={require_git}: the crate stopped at the nested clone by itself: \
+                 {files:#?}"
+            );
+        }
+    }
+
+    /// The defect. A worktree of the project inside the project is a
+    /// byte-for-byte duplicate of it, and a vendored clone is somebody else's
+    /// repository; neither is part of this project's content.
+    #[test]
+    fn a_nested_repository_is_not_walked_as_part_of_its_parent() {
+        let (_dir, root) = nested_checkouts();
+        assert_eq!(walk(&root), ["keep.md", "src/main.rs"]);
+    }
+
+    /// The case that must not break: a linked worktree registered *directly*
+    /// as its own project (what the benchmark harness does) is a repository
+    /// root too, and the rule applies to subdirectories only — a walk that
+    /// refused the root it was pointed at would index nothing at all.
+    #[test]
+    fn a_worktree_registered_as_its_own_project_indexes_normally() {
+        let (dir, main) = fixture(&[("src/main.rs", "fn main() {}")]);
+        init_repo(&main);
+        git_in(&main, &["add", "-A"]);
+        git_in(&main, &["commit", "-q", "-m", "content"]);
+        let sibling = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .unwrap()
+            .join("checkout");
+        git_in(
+            &main,
+            &["worktree", "add", "-q", sibling.as_str(), "-b", "wt"],
+        );
+
+        // A `.git` *file*, which is what makes this the case a directory test
+        // would have missed.
+        let marker = sibling.join(GIT_ENTRY);
+        assert!(marker.is_file(), "expected a gitdir: pointer file");
+        assert!(
+            std::fs::read_to_string(&marker)
+                .unwrap()
+                .starts_with("gitdir:"),
+            "expected a gitdir: pointer file"
+        );
+        assert!(is_repo_root(&sibling));
+        assert_eq!(walk(&sibling), ["src/main.rs"]);
+    }
+
+    /// The escape hatch, and the reason rule 3 is a default rather than a
+    /// refusal: vendoring a repository and wanting it indexed is legitimate.
+    #[test]
+    fn a_loreignore_reinclude_overrides_the_nested_repository_skip() {
+        let (_dir, root) = nested_checkouts();
+        std::fs::write(root.join(LORE_IGNORE_FILE), "!vendor/dep/\n").unwrap();
+        assert_eq!(
+            walk(&root),
+            ["keep.md", "src/main.rs", "vendor/dep/lib.rs"],
+            "the re-include must reach the vendored repo and nothing else"
+        );
+    }
+
+    /// The incremental path must reach the same verdict as the full scan, or
+    /// the watcher indexes a nested repository's files and the next full scan
+    /// deletes them, forever.
+    ///
+    /// Worth having here rather than trusting a layer above: the git basis
+    /// this landed beside (D-0017, since retired by D-0020) disagreed with
+    /// itself about exactly this — `git ls-files --others` collapses a nested
+    /// repository to one directory entry, while `git check-ignore`, which the
+    /// watcher batch used, reports paths inside it as *not ignored*. Deciding
+    /// it in the walker decides it once for both paths.
+    #[test]
+    fn listing_a_directory_inside_a_nested_repository_returns_nothing() {
+        let (_dir, root) = nested_checkouts();
+        assert!(walk_from(&root, &root.join("wt/agent/src"), Some(1)).is_empty());
+        assert!(walk_from(&root, &root.join("vendor/dep"), Some(1)).is_empty());
     }
 
     // -----------------------------------------------------------------------
