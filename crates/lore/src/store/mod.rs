@@ -87,8 +87,11 @@ const BM25_WEIGHTS: &str = "1.0, 0.5, 2.0";
 pub enum StoreError {
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
-    #[error("schema migration failed: {0}")]
-    Migration(#[from] rusqlite_migration::Error),
+    #[error("could not discard the incompatible store at {path}: {source}")]
+    Discard {
+        path: String,
+        source: std::io::Error,
+    },
     #[error("chunk metadata (de)serialization failed: {0}")]
     Metadata(#[from] serde_json::Error),
     #[error("chunk {chunk_id} claims path `{chunk_path}` but was written for file `{file_path}`")]
@@ -379,6 +382,66 @@ pub struct ProjectStatus {
     pub decision_violations: Vec<DecisionViolation>,
 }
 
+/// Which path [`Store::open_reporting`] took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Opened {
+    /// The file did not exist (or was empty); the schema was created.
+    Created,
+    /// The file already carried this build's schema; nothing was written.
+    Existing,
+    /// The file carried something else and was discarded (see
+    /// [`discard_store`]).
+    Rebuilt,
+}
+
+/// Delete a store this build cannot read, so the caller can create a current
+/// one in its place.
+///
+/// **D-0018, and only until the first tagged release.** Pre-release there are no
+/// migrations, so a schema mismatch is repaired by throwing the index away: it
+/// is derived data, repos are the source of truth, and rebuilding costs minutes
+/// of re-indexing and re-embedding rather than anything unrecoverable. When that
+/// posture expires this function is what a migration path replaces.
+///
+/// **Only the database and its own WAL sidecars are removed.** Everything else
+/// in the data directory — the project registry (`projects.toml`), the
+/// handshake, session Markdown — is *input* to the rebuild and must survive it;
+/// that is exactly why the registry is a separate file (see [`crate::registry`]).
+///
+/// Loud on purpose: this is unattended data loss from the user's point of view,
+/// even though nothing unrecoverable goes with it.
+fn discard_store(path: &Path, user_version: i64) -> Result<()> {
+    tracing::warn!(
+        store = %path.display(),
+        found_version = user_version,
+        expected_version = schema::VERSION,
+        "the store on disk was written by a different schema; discarding it and rebuilding from \
+         scratch. Pre-release Lore authors no migrations (D-0018). Registered projects survive \
+         (the registry is a separate file), but every file will be re-indexed and every chunk \
+         re-embedded, which can take minutes on a large corpus and leaves search lexical-only \
+         until it finishes"
+    );
+
+    // SQLite's own sidecars, and nothing else in the directory. Absent is
+    // success: a cleanly closed WAL database has no `-wal`/`-shm` at all.
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        let file = std::path::PathBuf::from(name);
+        match std::fs::remove_file(&file) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(StoreError::Discard {
+                    path: file.display().to_string(),
+                    source,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The SQLite-backed SearchStore.
 pub struct Store {
     conn: Connection,
@@ -391,21 +454,39 @@ impl std::fmt::Debug for Store {
 }
 
 impl Store {
-    /// Open (creating if absent) and migrate to the latest schema.
+    /// Open (creating if absent), rebuilding the store if what is on disk is
+    /// not this build's schema.
     ///
-    /// Idempotent: reopening an up-to-date database applies no migrations.
+    /// Idempotent: reopening a current database writes nothing.
     pub fn open(db_path: impl AsRef<Path>) -> Result<Self> {
-        let mut conn = Connection::open(db_path)?;
+        Ok(Self::open_reporting(db_path)?.0)
+    }
 
-        conn.busy_timeout(BUSY_TIMEOUT)?;
-        // WAL: readers (CLI/status) never block the daemon's writer.
-        // journal_mode returns a row, so it cannot go through execute_batch.
-        let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
-        // FK enforcement must be off while migrating (rusqlite_migration's
-        // documented requirement); it is turned on immediately after.
-        conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = OFF;")?;
+    /// [`Self::open`], plus which of the three paths it took.
+    ///
+    /// The outcome exists so the rebuild is an *asserted* result rather than
+    /// something only a log line witnesses — discarding a user's index is not a
+    /// behaviour that should be provable only by reading stderr.
+    fn open_reporting(db_path: impl AsRef<Path>) -> Result<(Self, Opened)> {
+        let path = db_path.as_ref();
+        let mut conn = Self::connect(path)?;
 
-        schema::migrations().to_latest(&mut conn)?;
+        let opened = match schema::inspect(&conn)? {
+            schema::Found::Current => Opened::Existing,
+            schema::Found::Empty => {
+                schema::create(&conn)?;
+                Opened::Created
+            }
+            schema::Found::Foreign { user_version } => {
+                // The connection has to go before the files do: on Windows an
+                // open handle makes the delete fail outright.
+                drop(conn);
+                discard_store(path, user_version)?;
+                conn = Self::connect(path)?;
+                schema::create(&conn)?;
+                Opened::Rebuilt
+            }
+        };
 
         // recursive_triggers so that rows removed by an ON DELETE CASCADE
         // still fire the FTS sync triggers. Every code path here also deletes
@@ -413,7 +494,20 @@ impl Store {
         // cascade (e.g. project deletion) silently orphaning FTS rows.
         conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA recursive_triggers = ON;")?;
 
-        Ok(Self { conn })
+        Ok((Self { conn }, opened))
+    }
+
+    /// A connection with the pragmas that are properties of the *file*, set
+    /// before anything looks at what is in it. Foreign keys are turned on by
+    /// the caller, after the schema exists.
+    fn connect(path: &Path) -> Result<Connection> {
+        let conn = Connection::open(path)?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        // WAL: readers (CLI/status) never block the daemon's writer.
+        // journal_mode returns a row, so it cannot go through execute_batch.
+        let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
+        conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
+        Ok(conn)
     }
 
     // ---- projects ---------------------------------------------------------
@@ -1696,7 +1790,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5, "every shipped migration applied");
+        assert_eq!(version, 1, "one flat schema, one version (D-0018)");
     }
 
     /// The external-content FTS5 table can drift from its content table if a
@@ -2011,83 +2105,6 @@ mod tests {
         assert_eq!(fts_footprint(&store), before_fts);
     }
 
-    /// The upgrade path the review demanded be survivable (S1#3/S1#7): a
-    /// database written before V2 has no keys and no uniqueness on `name`, so
-    /// two projects can legitimately share a display name. Migration plus
-    /// startup reconciliation must give them distinct keys and must not refuse
-    /// to start over a rule that only applies to *new* registrations.
-    #[test]
-    fn a_pre_v2_database_with_duplicate_display_names_migrates_and_gets_distinct_keys() {
-        let dir = tempfile::tempdir().unwrap();
-        let data_dir = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
-        let db = data_dir.join("lore.db");
-
-        // A V1 database, exactly as a pre-provenance daemon left it.
-        {
-            let mut conn = Connection::open(&db).unwrap();
-            schema::migrations().to_version(&mut conn, 1).unwrap();
-            for root in ["C:/repos/a/shared", "D:/work/shared"] {
-                conn.execute(
-                    "INSERT INTO projects (root, name) VALUES (?, 'shared')",
-                    params![root],
-                )
-                .unwrap();
-            }
-            let version: i64 = conn
-                .query_row("PRAGMA user_version", [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(version, 1, "the fixture really is pre-V2");
-        }
-
-        // Opening migrates. Keys start NULL, which `list_projects` reports as
-        // empty rather than failing.
-        let mut store = Store::open(&db).unwrap();
-        assert!(
-            store
-                .list_projects()
-                .unwrap()
-                .iter()
-                .all(|p| p.key.is_empty() && p.kind == SourceKind::Repo)
-        );
-
-        // Startup reconciliation is what assigns them.
-        let outcome = crate::registry::reconcile(&mut store, &data_dir).expect("must not fail");
-        assert!(
-            matches!(
-                outcome,
-                crate::registry::Reconciliation::Bootstrapped {
-                    projects: 2,
-                    keys_assigned: 2
-                }
-            ),
-            "{outcome:?}"
-        );
-
-        let projects = store.list_projects().unwrap();
-        assert_eq!(projects[0].key, "shared");
-        assert_ne!(projects[0].key, projects[1].key, "{projects:?}");
-        assert!(projects[1].key.starts_with("shared-"), "{projects:?}");
-
-        // Documented residual, asserted rather than assumed: the pre-existing
-        // duplicate *display names* are left alone. Name enforcement guards new
-        // registrations; it does not rewrite a user's history. So name
-        // resolution stays ambiguous for these two rows — which is exactly why
-        // `project_key` exists and why search results carry it.
-        assert_eq!(projects[0].name, projects[1].name);
-        assert_eq!(
-            crate::daemon::resolve_project(&projects, "shared").map(|p| p.id),
-            Some(projects[0].id),
-            "by name, the first row silently wins"
-        );
-        for project in &projects {
-            assert_eq!(
-                crate::daemon::resolve_project_key(&projects, &project.key).map(|p| p.id),
-                Some(project.id),
-                "by key, each one is reachable"
-            );
-        }
-    }
-
     /// Every project id ever allocated, in order.
     fn project_ids(store: &Store) -> Vec<ProjectId> {
         store
@@ -2149,178 +2166,132 @@ mod tests {
         assert!(third > again, "{third} must be past every retired id");
     }
 
-    /// The upgrade path: a v4 database is the one that recycled ids, so the
-    /// fixture proves the reuse first and then proves the migration stops it —
-    /// while carrying every existing row, id and column across untouched.
+    /// Everything keyed by a project id has to actually be keyed by it: files,
+    /// chunks (keyed through files), the vector hanging off a chunk rowid, and
+    /// the parsed decision set. Forgetting a project must take all four with it
+    /// and strand no reference — the flat schema declares those cascades in one
+    /// place now, so this is the test that says the declaration is right.
     #[test]
-    fn a_pre_v5_database_migrates_its_projects_and_stops_reusing_deleted_ids() {
+    fn forgetting_a_project_cascades_to_every_table_that_names_it() {
         let dir = tempfile::tempdir().unwrap();
-        let db = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
-            .unwrap()
-            .join("lore.db");
-
-        // A v4 database with a project registered, deleted, and re-registered
-        // into the dead project's id — exactly what shipped.
-        {
-            let mut conn = Connection::open(&db).unwrap();
-            schema::migrations().to_version(&mut conn, 4).unwrap();
-            for (root, name, key) in [
-                ("C:/repos/keeper", "keeper", "keeper"),
-                ("C:/repos/doomed", "doomed", "doomed"),
-            ] {
-                conn.execute(
-                    "INSERT INTO projects (root, name, key) VALUES (?, ?, ?)",
-                    params![root, name, key],
-                )
-                .unwrap();
-            }
-            conn.execute(
-                "UPDATE projects SET push_epoch = 7 WHERE key = 'keeper'",
-                [],
+        let mut store = Store::open(dir.path().join("lore.db")).unwrap();
+        let project = store
+            .register_project(Utf8Path::new("C:/repos/x"), "x")
+            .unwrap();
+        let path = Utf8Path::new("src/lib.rs");
+        let c = chunk("src/lib.rs", "a", "fn a() { alpha }");
+        store
+            .replace_file_chunks(project, path, "h1", std::slice::from_ref(&c))
+            .unwrap();
+        store
+            .upsert_embeddings(&[NewEmbedding {
+                project,
+                chunk_id: c.id.clone(),
+                vector: vec![1.0f32],
+            }])
+            .unwrap();
+        store
+            .set_decisions(
+                project,
+                &Decisions {
+                    active: BTreeSet::from(["D-0001".to_string()]),
+                    total: 1,
+                    violations: Vec::new(),
+                },
             )
             .unwrap();
-            conn.execute("DELETE FROM projects WHERE key = 'doomed'", [])
-                .unwrap();
-            conn.execute(
-                "INSERT INTO projects (root, name, key) VALUES ('C:/repos/next', 'next', 'next')",
-                [],
-            )
-            .unwrap();
-            // Everything keyed by a project id, so the rebuild has to be shown
-            // not to strand it: files, chunks (keyed through files), the vector
-            // hanging off a chunk rowid, and the parsed decision set.
-            conn.execute_batch(
-                "INSERT INTO files (project_id, path, content_hash, indexed_at)
-                     VALUES (1, 'src/lib.rs', 'h', 0);
-                 INSERT INTO chunks (
-                     project_id, chunk_id, path, anchor, kind,
-                     byte_start, byte_end, line_start, line_end, text, authority_tier
-                 ) VALUES (1, 'c1', 'src/lib.rs', 'code:A', '\"Code\"', 0, 4, 1, 2, 'body', 1);
-                 INSERT INTO embeddings (chunk_rowid, project_id, dims, vector)
-                     SELECT id, 1, 1, x'0000803f' FROM chunks WHERE chunk_id = 'c1';
-                 INSERT INTO project_decisions (project_id, decision_id) VALUES (1, 'D-0001');",
-            )
-            .unwrap();
-            let ids: Vec<i64> = conn
-                .prepare("SELECT id FROM projects ORDER BY id")
-                .unwrap()
-                .query_map([], |r| r.get(0))
-                .unwrap()
-                .collect::<std::result::Result<_, _>>()
-                .unwrap();
-            assert_eq!(ids, vec![1, 2], "the fixture really did recycle id 2");
-        }
+        assert_eq!(child_row_counts(&store), (1, 1, 1, 1));
 
-        let mut store = Store::open(&db).unwrap();
-
-        // Nothing was renumbered, renamed or dropped on the way through.
-        let projects = store.list_projects().unwrap();
+        assert!(store.remove_project(project).unwrap());
         assert_eq!(
-            projects
-                .iter()
-                .map(|p| (p.id, p.key.as_str(), p.name.as_str(), p.root.as_str()))
-                .collect::<Vec<_>>(),
-            vec![
-                (1, "keeper", "keeper", "C:/repos/keeper"),
-                (2, "next", "next", "C:/repos/next"),
-            ]
+            child_row_counts(&store),
+            (0, 0, 0, 0),
+            "a forgotten project left rows behind"
         );
-        let epoch: i64 = store
-            .conn
-            .query_row("SELECT push_epoch FROM projects WHERE id = 1", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(epoch, 7, "columns added after v1 survive the rebuild");
-
-        // The constraints came back with the table: `root` is still unique, and
-        // so is `key` (a separate index, which a rebuild is free to forget).
-        assert!(
-            store
-                .conn
-                .execute(
-                    "INSERT INTO projects (root, name, key) VALUES ('C:/repos/x', 'x', 'keeper')",
-                    [],
-                )
-                .is_err(),
-            "projects_by_key must survive the table rebuild"
-        );
-
-        // The rebuilt table is the same referent: nothing that named a project
-        // id was stranded, and the cascade off `files.project_id` still reaches
-        // chunks and their vectors.
         let violations: i64 = store
             .conn
             .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(violations, 0, "every reference still resolves");
-        assert_eq!(child_row_counts(&store), (1, 1, 1, 1));
-        assert!(store.remove_project(1).unwrap());
-        assert_eq!(
-            child_row_counts(&store),
-            (0, 0, 0, 0),
-            "ON DELETE CASCADE still points at the rebuilt table"
-        );
-
-        // From here ids only ever climb, including past the id the pre-v5
-        // database had already recycled once.
-        assert!(store.remove_project(2).unwrap());
-        let fresh = store
-            .register_project(Utf8Path::new("C:/repos/fresh"), "fresh")
-            .unwrap();
-        assert_eq!(fresh, 3, "{:?}", project_ids(&store));
-        assert!(store.remove_project(fresh).unwrap());
-        assert_eq!(
-            store
-                .register_project(Utf8Path::new("C:/repos/fresher"), "fresher")
-                .unwrap(),
-            4
-        );
+        assert_eq!(violations, 0, "every remaining reference must resolve");
+        assert!(project_ids(&store).is_empty());
     }
 
-    /// A removal interrupted between its child deletes and its project delete
-    /// leaves rows naming an id no `projects` row remembers. That orphan is the
-    /// last witness that the id was ever allocated, so the migration has to seed
-    /// the sequence above it rather than above `max(projects.id)`.
+    /// D-0018: a store this build cannot read is discarded, not migrated. The
+    /// index is derived data, so the cost is a re-index — but it *is* a cost,
+    /// which is why the rebuild is a reported outcome rather than a silent
+    /// error path.
     #[test]
-    fn migration_seeds_the_sequence_above_ids_only_orphaned_rows_still_name() {
+    fn a_store_from_another_schema_is_discarded_and_rebuilt_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let db = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
-            .unwrap()
-            .join("lore.db");
+        let db = dir.path().join("lore.db");
 
+        // A store with real content in it, stamped with a version this build
+        // does not know. (Direction does not matter: a newer database written
+        // by a binary that has since been rolled back rebuilds identically.)
         {
-            let mut conn = Connection::open(&db).unwrap();
-            // An orphan is by definition a row no live enforcement would let in;
-            // this build enforces foreign keys by default, so the fixture has to
-            // turn them off to reproduce what an interrupted delete leaves.
-            conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
-            schema::migrations().to_version(&mut conn, 4).unwrap();
-            conn.execute(
-                "INSERT INTO projects (id, root, name, key) VALUES (1, 'C:/repos/a', 'a', 'a')",
-                [],
-            )
-            .unwrap();
-            // Project 9 is gone; its files never were.
-            conn.execute(
-                "INSERT INTO files (project_id, path, content_hash, indexed_at)
-                 VALUES (9, 'src/lib.rs', 'h', 0)",
-                [],
-            )
-            .unwrap();
+            let mut store = Store::open(&db).unwrap();
+            store
+                .register_project(Utf8Path::new("C:/repos/x"), "x")
+                .unwrap();
+            store
+                .conn
+                .execute_batch("PRAGMA user_version = 99;")
+                .unwrap();
         }
+        assert!(db.exists());
+        let stale_bytes = std::fs::metadata(&db).unwrap().len();
 
-        let mut store = Store::open(&db).unwrap();
-        let next = store
-            .register_project(Utf8Path::new("C:/repos/b"), "b")
-            .unwrap();
-        assert_eq!(
-            next,
-            10,
-            "an id an orphaned row still names is not free: {:?}",
-            project_ids(&store)
+        let (store, opened) = Store::open_reporting(&db).unwrap();
+        assert_eq!(opened, Opened::Rebuilt);
+        assert!(
+            store.list_projects().unwrap().is_empty(),
+            "the old contents survived the rebuild"
         );
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, schema::VERSION);
+        assert_ne!(
+            std::fs::metadata(&db).unwrap().len(),
+            stale_bytes,
+            "the file was reused rather than recreated"
+        );
+
+        // The rebuild is one-shot: the next open finds a current store and
+        // leaves it alone.
+        drop(store);
+        assert_eq!(Store::open_reporting(&db).unwrap().1, Opened::Existing);
+    }
+
+    /// The rebuild removes the database and SQLite's own sidecars, and nothing
+    /// else. The registry, the handshake and session Markdown live in the same
+    /// directory and are the *input* to the re-index.
+    #[test]
+    fn discarding_a_store_touches_only_the_database_and_its_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("lore.db");
+        for name in ["lore.db", "lore.db-wal", "lore.db-shm", "projects.toml"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        std::fs::create_dir(dir.path().join("sessions")).unwrap();
+        std::fs::write(dir.path().join("sessions/a.md"), b"notes").unwrap();
+
+        discard_store(&db, 4).unwrap();
+
+        for gone in ["lore.db", "lore.db-wal", "lore.db-shm"] {
+            assert!(!dir.path().join(gone).exists(), "{gone} survived");
+        }
+        assert!(dir.path().join("projects.toml").exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("sessions/a.md")).unwrap(),
+            b"notes"
+        );
+
+        // Absent sidecars are not an error: a cleanly closed WAL database has
+        // none, and a second discard must not fail.
+        discard_store(&db, 4).unwrap();
     }
 }

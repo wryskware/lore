@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use camino::Utf8Path;
 use lore::daemon::{DATA_DIR_ENV, discover, ownership};
 
-/// Generous: each starter cold-opens SQLite and runs migrations, and CI
+/// Generous: each starter cold-opens SQLite and creates its schema, and CI
 /// machines are slow at exactly that.
 const PATIENCE: Duration = Duration::from_secs(30);
 

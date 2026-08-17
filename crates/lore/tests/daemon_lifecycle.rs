@@ -13,8 +13,8 @@ use lore::daemon::{DaemonOptions, discover, handshake, run};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
-/// Generous: a cold start compiles nothing but does open SQLite and run
-/// migrations, and CI machines are slow at exactly that.
+/// Generous: a cold start compiles nothing but does cold-open SQLite and
+/// create its schema, and CI machines are slow at exactly that.
 const PATIENCE: Duration = Duration::from_secs(30);
 
 fn utf8(dir: &TempDir) -> Utf8PathBuf {

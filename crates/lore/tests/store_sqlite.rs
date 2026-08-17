@@ -69,11 +69,11 @@ fn p(s: &str) -> &Utf8Path {
 }
 
 // ---------------------------------------------------------------------------
-// open / migrate
+// open / rebuild
 // ---------------------------------------------------------------------------
 
 #[test]
-fn open_migrate_and_reopen_are_idempotent() {
+fn open_and_reopen_are_idempotent() {
     let dir = TempDir::new().unwrap();
     let project;
     {
@@ -82,8 +82,9 @@ fn open_migrate_and_reopen_are_idempotent() {
         assert_eq!(store.bump_generation().unwrap(), 1);
     }
     {
-        // Reopening runs the migration machinery again against an
-        // already-current schema; it must be a no-op and preserve state.
+        // Reopening inspects an already-current schema; it must write nothing
+        // and preserve state (and must certainly not take the D-0018 rebuild
+        // path, which would silently empty the store).
         let mut store = open(&dir);
         let again = store.register_project(p("C:/repos/lore"), "lore").unwrap();
         assert_eq!(again, project, "register_project is idempotent on root");
