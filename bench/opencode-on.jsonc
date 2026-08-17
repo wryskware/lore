@@ -24,10 +24,14 @@
       }
     }
   },
+  // Pinned copy, NOT the live target\debug build: a round must not be
+  // re-pinned by whatever the working checkout last compiled. Populated by
+  // `setup-worktrees.ps1 -Apply -PinBinary`; run.ps1 refuses to start a cell
+  // if it is missing, and records its SHA-256 in every metrics.json.
   "mcp": {
     "lore": {
       "type": "local",
-      "command": ["C:\\Users\\perag\\wryskware\\lore\\target\\debug\\lore-mcp.exe"],
+      "command": ["C:\\Users\\perag\\bench-e2e\\bin\\lore-mcp.exe"],
       "enabled": true
     }
   }

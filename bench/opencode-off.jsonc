@@ -8,10 +8,13 @@
   "permission": {
     "external_directory": "allow"
   },
+  // Mirrors the on arm's pinned path so the two configs differ in exactly one
+  // key (`enabled`). Never launched here — the block exists only to override
+  // the global config's lore entry, which would otherwise merge in.
   "mcp": {
     "lore": {
       "type": "local",
-      "command": ["C:\\Users\\perag\\wryskware\\lore\\target\\debug\\lore-mcp.exe"],
+      "command": ["C:\\Users\\perag\\bench-e2e\\bin\\lore-mcp.exe"],
       "enabled": false
     }
   },
