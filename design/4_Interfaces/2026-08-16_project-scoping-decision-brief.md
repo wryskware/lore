@@ -289,3 +289,13 @@ on the identity *mechanism* (how a client names its project to a remote
 daemon), which stays held on #18's ingestion fork — where Wrysk's stated
 direction is a flavor of ingestion inversion (client pushes file content), with
 the local walk/watch placement still open.
+
+### Resolution addendum (2026-08-16, later same day): the hold is closed
+
+The ingestion fork this hold was waiting on is decided — **D-0015** (snapshot-
+manifest push, one observer per machine). With it, the identity mechanism is
+decided as **D-0016**: the registry binds the declared `.lore.toml` name,
+`lore add` rejects duplicate names, and cwd-containment is demoted to a local
+discovery convenience. A declared name is never an authorization identity;
+deployments serving more than one trusting party authorize callers in front of
+the daemon (issue #18's scope). See [[../1_Architecture/1.2_Ingestion]].

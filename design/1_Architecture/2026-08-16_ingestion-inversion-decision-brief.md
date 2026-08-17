@@ -5,7 +5,11 @@ last_reviewed: 2026-08-16
 
 # Ingestion inversion — decision brief
 
-**Status: unclassified exploration.** Nothing here is decided. This brief
+**Status: historical proposal — the decision has since been taken.** The
+fork this brief argues for was accepted as **D-0015** (with project identity
+resolved as **D-0016**) on 2026-08-16; the canonical design statement is
+[[1.2_Ingestion]], and the Resolutions section at the bottom records how
+each open question landed. The text below is preserved as written. This brief
 proposes one design for the ingestion fork recorded in the project-scoping
 brief (`../4_Interfaces/2026-08-16_project-scoping-decision-brief.md`, "The part that may
 dominate everything else") and in issue #18, states what that design refuses
@@ -227,39 +231,35 @@ residual risk to weigh.
   local-daemon hop stays loopback; the daemon→server hop is new surface with
   its own transport requirements.
 
-## Open questions for the decision session
+## Resolutions (2026-08-16, Wrysk; recorded in D-0015/D-0016)
 
-1. **Lease conflict policy:** takeover-with-epoch-bump (matches the
-   handshake publish-over posture) or refuse-while-held? Takeover favors
-   liveness; refusal favors surprise-avoidance.
+The questions below were the brief's open list; each is answered in
+[[1.2_Ingestion]] in full.
+
+1. **Lease conflict policy:** takeover-with-epoch-bump, matching the
+   handshake publish-over posture; epoch churn surfaced in `status`.
 2. **Ignore/exclude enforcement locus:** trusted client evaluation with
-   server backstop scanning, or duplicated server-side enforcement? The
-   backstop-only shape is simpler; duplication protects multi-user servers
-   from a hostile or broken pusher.
-3. **Project identity:** does this session formally resolve the held scoping
-   question (declared identity, amended-B shape), or does it stay held until
-   the wire contract lands?
-4. **Local mode plumbing:** in-process snapshot interface only (proposed), or
-   does the local walker literally speak the push protocol over loopback?
-   Wire-identical is better dogfooding of the remote path but adds
-   serialization cost to every local index pass for no user-visible gain.
-5. **Manifest wire format:** full listing only in v1 (proposed), with
-   checksummed delta encoding deferred until a measured need?
-6. **Mass-delete guard:** threshold, and the override UX (`--force` on which
-   surface, reported how in status?).
-7. **Remote `expand` context:** retain compressed current-generation text
-   (proposed), or accept chunk-boundary-degraded context to retain nothing
-   beyond the chunk store?
-8. **Watch latency:** what debounce cadence for micro-manifests keeps the
-   live-index feel that T5-style tasks depend on, and does cadence differ
-   local vs. remote?
-9. **Secrets floor for non-git projects:** is walker + hard-excludes enough,
-   or do non-git roots require an explicit allowlist before their first
-   remote push?
-10. **Ledger touchpoints:** does D-0003's local-only-embeddings clause get
-    scoped to local deployments, and does D-0007 get an amendment naming the
-    daemon→server hop, or does the whole fork land as one new decision that
-    partially supersedes both?
-11. **Entropy/credential scanning cost:** acceptable false-positive rate for
-    the hard-exclude heuristics, and what the override ritual looks like
-    when a legitimate file trips it.
+   receiver-side backstop scanning; no duplicated full evaluation.
+3. **Project identity:** resolved as D-0016 — registry binds the declared
+   `.lore.toml` name, duplicates rejected at `lore add`, containment demoted
+   to discovery convenience; declared names are never authorization.
+4. **Local mode plumbing:** in-process, but through the wire-message types
+   from `lore-core`, so the wire protocol is those types serialized.
+5. **Manifest wire format:** full listing only in v1; checksummed delta
+   encoding permitted later as pure transport optimization.
+6. **Mass-delete guard:** trips at >50% *and* >100 files; per-invocation CLI
+   override only; visible in `status`.
+7. **Remote `expand` context:** retain compressed current-generation text.
+8. **Watch latency:** debounce widens to ~20–30s in the local watcher too —
+   bench round 1 showed retrieval is front-loaded at task start, so
+   sub-10s freshness buys nothing; a receiving daemon enforces a hard
+   minimum push interval. `lore index` remains the immediate path.
+9. **Secrets floor for non-git projects:** best-effort (walker + pattern
+   hard-excludes + `lore setup` guidance); no mandatory gate. Encrypted
+   stores are the substantive protection (store opens with an externally
+   supplied in-memory key; backlogged).
+10. **Ledger touchpoints:** one decision for ingestion (D-0015, scoping
+    D-0003's local-only-embeddings clause, extending D-0007's surface) and
+    one for identity (D-0016).
+11. **Entropy/credential scanning:** entropy scanning killed; pattern-based
+    hard-excludes only.
