@@ -148,6 +148,28 @@ pub struct ProjectSpec {
     pub kind: SourceKind,
 }
 
+/// Why [`Store::register_project`] refused.
+///
+/// A separate type from [`StoreError`] because the caller has to tell the two
+/// apart: a name already bound is the *registry's current state* refusing a
+/// well-formed request, which the user can change and which the HTTP layer
+/// therefore reports as a 409 naming the remedy; a [`StoreError`] is ours and
+/// is a 500. Folding this into `StoreError` would push a variant that only
+/// one method can produce onto every `match` in the crate.
+#[derive(Debug, thiserror::Error)]
+pub enum RegisterError {
+    /// D-0016: one declared name binds to one root.
+    #[error("a project named `{name}` is already registered at {held_by}")]
+    NameTaken {
+        name: String,
+        /// The root that already holds the name — what makes the refusal
+        /// actionable.
+        held_by: Utf8PathBuf,
+    },
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
 /// A file's indexing state, for change detection and orphan pruning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRecord {
@@ -403,8 +425,40 @@ impl Store {
     /// A new row gets a freshly allocated [`Project::key`], so the table is
     /// never left in a keyless state even when nothing consulted the manifest
     /// (unit tests, a direct store user).
-    pub fn register_project(&mut self, root: &Utf8Path, name: &str) -> Result<ProjectId> {
-        self.upsert_project(root, name, None, SourceKind::Repo)
+    ///
+    /// # Why the name check lives here
+    ///
+    /// D-0016 makes a project's identity its registry-bound declared name, so
+    /// binding one name to two roots is not a cosmetic clash — it is two
+    /// projects with one identity, and `expand(project, chunk_id)` then
+    /// resolves the wrong source or 404s (S1#3).
+    ///
+    /// The refusal used to be a pre-flight query in the HTTP handler, one
+    /// store acquisition before the one that wrote the row. Under
+    /// [`crate::daemon::store_handle`] that is a lock released and retaken, so
+    /// two registrations racing for one name could both read a free registry
+    /// and both write. Here the read and the write happen under a single
+    /// `&mut self`, which is the same exclusion the daemon uses for every
+    /// other write — so the invariant holds for *any* caller of this method
+    /// rather than for the one route that remembered to ask first.
+    ///
+    /// [`Self::upsert_project`] deliberately does not enforce it:
+    /// [`crate::registry`] reconciliation repairs a hand-edited manifest by
+    /// renaming the later duplicate, because refusing to start over a typo in
+    /// a text file would cost the user their daemon.
+    pub fn register_project(
+        &mut self,
+        root: &Utf8Path,
+        name: &str,
+    ) -> std::result::Result<ProjectId, RegisterError> {
+        let registered = self.list_projects()?;
+        if let Some(held_by) = crate::registry::name_holder(&registered, root, name) {
+            return Err(RegisterError::NameTaken {
+                name: name.to_string(),
+                held_by: held_by.to_path_buf(),
+            });
+        }
+        Ok(self.upsert_project(root, name, None, SourceKind::Repo)?)
     }
 
     /// Register or update a source with full control over its identity.

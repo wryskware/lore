@@ -9,7 +9,8 @@ use std::collections::BTreeSet;
 use camino::{Utf8Path, Utf8PathBuf};
 use lore::repo_config::{Behavior, Profile, RepoAuthority};
 use lore::store::{
-    EmbeddingFingerprint, NewEmbedding, SearchFilter, StatusFilter, Store, StoreError,
+    EmbeddingFingerprint, NewEmbedding, RegisterError, SearchFilter, StatusFilter, Store,
+    StoreError,
 };
 use lore::types::{Chunk, ChunkKind, DesignStatus, VaultMeta};
 use tempfile::TempDir;
@@ -106,6 +107,45 @@ fn register_project_updates_name_but_not_id() {
     let projects = store.list_projects().unwrap();
     assert_eq!(projects.len(), 1);
     assert_eq!(projects[0].name, "new");
+}
+
+/// D-0016: the declared name *is* the project's identity, so it binds to one
+/// root. The refusal lives in the store rather than in the HTTP handler, so
+/// the check and the write happen under one exclusive borrow — the pre-flight
+/// version was a separate store acquisition two registrations could race
+/// through — and so it holds for every caller, not just the route that
+/// remembered to ask.
+#[test]
+fn a_name_bound_to_another_root_is_refused_and_names_that_root() {
+    let dir = TempDir::new().unwrap();
+    let mut store = open(&dir);
+    store.register_project(p("C:/repos/lore"), "lore").unwrap();
+
+    let err = store
+        .register_project(p("D:/work/lore-fork"), "lore")
+        .expect_err("a second root cannot claim a bound name");
+    match &err {
+        RegisterError::NameTaken { name, held_by } => {
+            assert_eq!(name, "lore");
+            assert_eq!(held_by, p("C:/repos/lore"));
+        }
+        other => panic!("expected a name conflict, got {other:?}"),
+    }
+    // The refusal is total: nothing was written on the way out.
+    assert_eq!(store.list_projects().unwrap().len(), 1);
+
+    // Re-registering the *same* root is not a collision with itself, under
+    // either its current name or a new one.
+    store.register_project(p("C:/repos/lore"), "lore").unwrap();
+    store
+        .register_project(p("C:/repos/lore"), "lore-renamed")
+        .unwrap();
+    // …and freeing the name makes it claimable, which is what `lore remove`
+    // buys the user the refusal points at.
+    store
+        .register_project(p("D:/work/lore-fork"), "lore")
+        .unwrap();
+    assert_eq!(store.list_projects().unwrap().len(), 2);
 }
 
 // ---------------------------------------------------------------------------

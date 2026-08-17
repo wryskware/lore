@@ -18,11 +18,15 @@
 //! reachable from here at all — the `project` parameter is gone rather than
 //! defaulted, because a parameter an agent can set is a parameter it will set.
 //!
-//! Resolution is the daemon's `GET /v1/resolve` against this process's working
-//! directory (an editor spawns the server inside the workspace it opened), and
-//! `LORE_PROJECT` overrides it entirely for the cases where that is not true.
-//! Both are interim: which mechanism finally names a project to a *remote*
-//! daemon is deliberately still open.
+//! The identifier itself is the registry-bound declared name (D-0016), which
+//! is what `LORE_PROJECT` carries and what every call ultimately sends. When
+//! it is unset, resolution falls back to the daemon's `GET /v1/resolve`
+//! against this process's working directory — an editor spawns the server
+//! inside the workspace it opened, so containment usually guesses right. That
+//! ordering is the whole of the rule: containment *fills in* an identity that
+//! was not supplied and never overrides one, so a `LORE_PROJECT` naming no
+//! registered project is an error rather than a silent fall back to whatever
+//! directory this process was started in.
 
 use std::sync::Arc;
 

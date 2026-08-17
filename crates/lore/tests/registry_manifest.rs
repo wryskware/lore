@@ -180,6 +180,12 @@ fn a_rename_keeps_the_key() {
 
 /// Two roots whose display names slug identically get distinct keys — the
 /// `shared`/`shared` collision the review used as its failure scenario.
+///
+/// `register_project` refuses the second one outright now (D-0016), so the
+/// collision is staged the only way it can still arise: `upsert_project`, the
+/// unenforced path reconciliation uses to apply a hand-edited manifest. Key
+/// allocation still has to survive it, because that manifest is what a user
+/// may hand the daemon on the next start.
 #[test]
 fn colliding_names_still_get_distinct_keys() {
     let mut fixture = Fixture::new();
@@ -189,7 +195,12 @@ fn colliding_names_still_get_distinct_keys() {
         .unwrap();
     fixture
         .store
-        .register_project(Utf8Path::new("D:/work/shared"), "shared")
+        .upsert_project(
+            Utf8Path::new("D:/work/shared"),
+            "shared",
+            None,
+            SourceKind::Repo,
+        )
         .unwrap();
 
     let keys: Vec<String> = fixture.rows().into_iter().map(|(_, key, _)| key).collect();

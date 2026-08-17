@@ -39,10 +39,16 @@
 //! made unique. Two projects both named `shared` made `expand(project,
 //! chunk_id)` resolve the wrong one or 404 (S1#3). Every source now carries a
 //! stable opaque `key`, assigned once at registration and never recomputed —
-//! renaming a project does not change it. Display names are additionally kept
-//! unique at registration so the human-facing resolver stays deterministic.
+//! renaming a project does not change it.
+//!
+//! Display names are additionally kept unique, because under D-0016 the
+//! declared name *is* the project's identity rather than a label on it.
+//! Registration refuses a name another root holds ([`name_holder`], enforced
+//! in [`crate::store::Store::register_project`]); reconciliation, which has to
+//! accept whatever a hand-edited manifest says, renames the later duplicate
+//! instead.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher, RandomState};
 
 use anyhow::{Context, Result};
@@ -329,7 +335,7 @@ fn apply(store: &mut Store, data_dir: &Utf8Path, manifest: Manifest) -> Result<R
                 .unwrap_or(entry.root.as_str())
                 .to_string();
         }
-        // `POST /v1/projects` refuses a name another root already holds, but a
+        // Registration refuses a name another root already holds, but a
         // hand-edited manifest can walk straight past that door and recreate
         // the ambiguity — two projects one display name, so `expand(project,
         // …)` and `lore search --project` resolve to whichever sorted first
@@ -451,15 +457,29 @@ fn root_key(root: &Utf8Path) -> String {
     }
 }
 
-/// Display names that are already in use by a *different* root — the check
-/// registration runs so name resolution stays deterministic (S1#3).
-pub fn names_taken_by_others(projects: &[Project], root: &Utf8Path) -> BTreeSet<String> {
+/// The root of the project already bound to `name`, if it is a *different*
+/// root than `root`.
+///
+/// This is the lookup behind registration's duplicate-name refusal. D-0016
+/// makes a project's identity its registry-bound declared name, so a name is
+/// held by exactly one root and a second claimant is refused rather than
+/// disambiguated; re-registering the same root under the same name is not a
+/// collision with itself, which is what the root comparison excludes.
+///
+/// The conflicting root — not merely the fact of a conflict — is what the
+/// caller needs, because naming it is what makes the refusal actionable
+/// (S1#3: two projects sharing a display name is how a search hit becomes an
+/// `expand` 404).
+pub fn name_holder<'a>(
+    projects: &'a [Project],
+    root: &Utf8Path,
+    name: &str,
+) -> Option<&'a Utf8Path> {
     let mine = root_key(root);
     projects
         .iter()
-        .filter(|project| root_key(&project.root) != mine)
-        .map(|project| project.name.clone())
-        .collect()
+        .find(|project| project.name == name && root_key(&project.root) != mine)
+        .map(|project| project.root.as_path())
 }
 
 #[cfg(test)]
