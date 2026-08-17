@@ -1228,6 +1228,51 @@ mod tests {
         assert_eq!(fixture.links(), ["alias.md"]);
     }
 
+    /// **Every boundary is relative to the walk root, not to "the project".**
+    ///
+    /// This is what makes a declared source root (D-0022) work: a mount is
+    /// walked as its own root, and everything — the repository boundary, the
+    /// `!` escape hatch, the whole ignore stack — is then evaluated against
+    /// *it*. Two halves, and only the first was pinned before:
+    ///
+    /// 1. the walk root is exempt from the repository boundary, so a mount
+    ///    that is itself a checkout indexes rather than returning nothing
+    ///    (`a_worktree_registered_as_its_own_project_indexes_normally`);
+    /// 2. a repository nested *inside* that root is still refused, and the
+    ///    hatch consulted is that root's own `.loreignore` — not the one
+    ///    belonging to whatever project happened to declare the mount.
+    ///
+    /// The second half is the one a mount depends on, and it is what "rules
+    /// travel down a root and never between roots" means in the walker.
+    #[test]
+    fn every_boundary_is_relative_to_the_walk_root() {
+        // A repository, with a second one vendored inside it, standing in for
+        // a mounted tree that is somebody else's checkout.
+        let fixture = Fixture::new(&[("keep.md", "# notes")]);
+        commit_all(&fixture.root);
+        let vendored = fixture.root.join("vendor/dep");
+        init_repo(&vendored);
+        std::fs::write(vendored.join("lib.rs"), "pub fn dep() {}").unwrap();
+
+        // Walked as its own root: exempt itself, still stopping at the nested
+        // repository below it.
+        assert_eq!(
+            fixture.walk_rooted_at(&fixture.root.clone()),
+            ["keep.md"],
+            "the root is exempt; the repository inside it is not"
+        );
+
+        // And the hatch is *this* root's file. Written here rather than in
+        // some declaring project, because that is the file whose author owns
+        // this tree.
+        fixture.write(LORE_IGNORE_FILE, "!vendor/dep/\n");
+        assert_eq!(
+            fixture.walk_rooted_at(&fixture.root.clone()),
+            [".loreignore", "keep.md", "vendor/dep/lib.rs"],
+            "the re-include is read from the walk root, not from anywhere above it"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // The hard floor
     // -----------------------------------------------------------------------
