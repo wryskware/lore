@@ -33,7 +33,15 @@ param(
     # Source for the pinned lore-mcp binary. Build it yourself first; this only
     # copies, so the round's binary cannot drift when the live checkout is
     # rebuilt mid-round.
-    [string]$McpSource = 'C:\Users\perag\wryskware\lore\target\debug\lore-mcp.exe',
+    #
+    # RELEASE, deliberately. A round measures wall time, so nothing in the
+    # measured path should be a debug build. The daemon already is release —
+    # `cargo install --path crates/lore` builds release by default, and the
+    # daemon is where search, ranking and chunking actually happen. lore-mcp is
+    # a thin stdio proxy so the difference is small, but there is no reason to
+    # pin a debug build of it. Round 1 did, which is worth knowing when
+    # comparing anything against round-1 timings.
+    [string]$McpSource = 'C:\Users\perag\wryskware\lore\target\release\lore-mcp.exe',
     [int]$DrainTimeoutMinutes = 240
 )
 
@@ -182,7 +190,7 @@ if ($Authority) {
 if ($PinBinary) {
     Write-Host 'Pinning lore-mcp binary' -ForegroundColor Cyan
     if (-not (Test-Path -LiteralPath $McpSource)) {
-        throw "no such binary: $McpSource — build it first (cargo build -p lore-mcp)"
+        throw "no such binary: $McpSource — build it first (cargo build -p lore-mcp --release)"
     }
     Step "$McpSource  ->  $McpPinned"
     if ($Apply) {

@@ -97,9 +97,20 @@ sharing a tree) and throws before launching anything if they do not hold.
 
 ## Round-2 setup (live machine, in order)
 
-1. **Land the code you are benchmarking** and build it:
-   `cargo build -p lore -p lore-mcp`. For a steering round this is Lever B from
-   `design/99_Scratch/2026-08-16_round-2-steering-drafts.md`.
+1. **Land the code you are benchmarking** and build it — **release, both
+   binaries**, since a round measures wall time:
+
+   ```powershell
+   lore stop                                   # the running daemon holds lore.exe
+   cargo install --path crates/lore --force    # cargo install is release by default
+   cargo build -p lore-mcp --release           # what -PinBinary copies from
+   Start-ScheduledTask -TaskName 'Lore Daemon'
+   ```
+
+   Do **not** `cargo install` lore-mcp: any running Claude Code session holds
+   the installed binary open and the install fails. The bench uses its own
+   pinned copy anyway. For a steering round this is also where Lever B from
+   `design/99_Scratch/2026-08-16_round-2-steering-drafts.md` goes in.
 2. **Pin the binary:** `.\setup-worktrees.ps1 -Apply -PinBinary`. This copies
    `lore-mcp.exe` to `bench-e2e\bin\`. The arm configs point at that copy, so a
    later rebuild of the working checkout cannot silently re-pin a round in
