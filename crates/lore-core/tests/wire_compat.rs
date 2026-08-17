@@ -23,6 +23,7 @@
 
 use lore_core::{
     ExpandRequest, ProjectInfo, ProjectStatus, SearchRequest, SearchResult, WatchState,
+    snapshot::MassDeleteTrip,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -85,6 +86,10 @@ fn populated_project_status() -> ProjectStatus {
             "design/0_Canon/decisions/D-0004-a.md: duplicate decision id D-0004".into(),
         ],
         watch: WatchState::Armed,
+        mass_delete_guard: Some(MassDeleteTrip {
+            deletes: 900,
+            stored: 1000,
+        }),
     }
 }
 
@@ -151,6 +156,9 @@ fn every_pre_existing_wire_field_survives_and_the_additions_are_the_specified_on
                 "decision_violations",
                 "decisions_active",
                 "decisions_total",
+                // D-0015: a refused apply, so an index that stopped tracking
+                // its project says why.
+                "mass_delete_guard",
             ],
         },
         Shape {

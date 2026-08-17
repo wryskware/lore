@@ -15,6 +15,9 @@
 use serde::{Deserialize, Serialize};
 
 pub mod discovery;
+pub mod snapshot;
+
+use snapshot::MassDeleteTrip;
 
 /// API version negotiated on every request; bump on breaking changes.
 pub const API_VERSION: u32 = 1;
@@ -71,6 +74,11 @@ pub struct DaemonStatus {
 /// value is "not zero".
 fn is_zero(value: &u64) -> bool {
     *value == 0
+}
+
+/// `skip_serializing_if` predicate for additive flags whose default is off.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Nearest-rank latency percentiles for one endpoint (`search`,
@@ -160,6 +168,12 @@ pub struct ProjectStatus {
     /// client sees [`WatchState::Unknown`].
     #[serde(default)]
     pub watch: WatchState,
+    /// The last apply this daemon refused because the mass-delete guard
+    /// tripped (D-0015). Present until an apply for this project succeeds, so
+    /// a project whose index has stopped tracking its files says why instead
+    /// of quietly going stale. Absent is the normal case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mass_delete_guard: Option<MassDeleteTrip>,
 }
 
 /// Whether a project's edits are being indexed live.
@@ -251,6 +265,12 @@ pub struct RemoveProjectResponse {
 pub struct IndexRequest {
     /// Project name or id; `None` reindexes all registered projects.
     pub project: Option<String>,
+    /// Override the mass-delete guard for this pass only
+    /// ([`snapshot::mass_delete_trip`]). Per invocation by design: a config
+    /// key would switch the guard off permanently, which is the one thing
+    /// D-0015 says it must never be.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_mass_delete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
