@@ -214,7 +214,7 @@ fn git_metadata_never_reaches_a_manifest() {
 }
 
 /// With nothing installed and nothing committed, the observer sends the project
-/// whole. **Chosen, not overlooked** (D-0020/D-0021): lore ships no ignore rules
+/// whole. **Chosen, not overlooked** (D-0020): lore ships no ignore rules
 /// of its own, so out of the box a manifest is the repo minus `.git`.
 #[test]
 fn with_no_rules_anywhere_the_manifest_is_the_whole_project() {

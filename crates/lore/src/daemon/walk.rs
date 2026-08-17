@@ -308,7 +308,7 @@ mod tests {
     // Out of the box
     // -----------------------------------------------------------------------
 
-    /// **Chosen, not overlooked** (D-0020/D-0021): lore ships no ignore rules of
+    /// **Chosen, not overlooked** (D-0020): lore ships no ignore rules of
     /// its own. With no user-level file, no `.gitignore` and no `.loreignore`, a
     /// project is observed whole — build output, dot-files and a plaintext
     /// credential included. Every exclusion lore applies is a line in a file
