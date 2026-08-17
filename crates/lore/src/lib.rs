@@ -24,5 +24,6 @@ pub mod embed;
 pub mod registry;
 pub mod repo_config;
 pub mod setup;
+pub mod sources;
 pub mod store;
 pub mod types;

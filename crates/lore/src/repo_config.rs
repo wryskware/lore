@@ -226,6 +226,11 @@ impl RepoAuthority {
 struct RepoConfigFile {
     authority: Option<AuthorityTable>,
     project: Option<ProjectTable>,
+    /// Declared here only so that `deny_unknown_fields` above does not reject
+    /// a file carrying `[[sources]]`. The table is resolved by
+    /// [`crate::sources::Sources`], which is a third independent thing in this
+    /// file and implies nothing about the two above it.
+    sources: Vec<crate::sources::SourceEntry>,
 }
 
 /// The repository's committed project name, written by `lore add`.
