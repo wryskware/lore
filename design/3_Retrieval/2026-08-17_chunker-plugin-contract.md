@@ -252,20 +252,67 @@ Drafted for Wrysk to promote or edit; not an accepted entry.
   code stays on its unmerged worktree branch as Phase 1 reference (it
   carries the MSVC shim and a default-on wasm feature that must not merge
   as-is).
-- **Phase 1 — core seam (lore repo).** (Toolset prerequisite cleared, see
-  spike results.) Plugin registry + manifest
-  parsing; routing in `chunk_file` after built-ins, before fallback;
-  `Spec` grows a wasm-language source + thread-local `WasmStore`/parser
-  pooling; ABI gate at load; fingerprint in the indexer file hash;
-  `status`/push-surface advertisement; fallback counters; `lore plugin
-  list/add`; wasm support behind a core Cargo feature. Fixture-driven
-  tests with a toy plugin checked into the test tree. Test authoring is
-  its own pass per working rules.
-- **Phase 2 — Unity plugin (new repo, e.g. `wryskware/lore-unity`).**
-  Wrysk authors this later, post-cutoff, as the contract's first real
-  consumer: XML/CSS wasm grammars, UXML/USS mappings, windowed serialized
-  YAML, fixtures from a real Unity project; dogfood against Lexomancy.
-  The contract is done only when this needs zero core changes.
+- **Phase 1 — core seam. DONE (2026-08-17)**, shipped in this branch's
+  commits: registry + manifest parsing, both strategies through the
+  existing walker/windower, per-thread wasm parser pooling, ABI gate,
+  fingerprint-in-stamp invalidation, per-project opt-in, `status` +
+  push-lease advertisement, fallback counters, `lore plugin list/add`,
+  `wasm-grammars` Cargo feature (default-on), toy fixture plugin.
+  Built by two implementation packages plus an independent adversarial
+  test pass; suite 479 → 607.
+- **Phase 2 — Unity plugin. AUTHORED (2026-08-17)** at
+  `wryskware/lore-unity` (private): XML/CSS wasm grammars, UXML/USS
+  mappings derived from dumps of all 54 real Lexomancy UI files (691
+  chunks, zero parse errors, zero name fallbacks), measured YAML windows
+  cap, `.shader` windows entry. Authoring it fed five schema fixes back
+  into Phase 1 before integration — which is what dogfooding a contract
+  is for. Live Lexomancy dogfood is the acceptance step.
 - **Phase 3 — adoption bookkeeping.** Promote the decision entry (Wrysk),
-  amend 3.1/5.1, start the built-in feature-gating from the migration
-  issue.
+  amend 3.1/5.1 (held until promotion — both are decided canon), start
+  the built-in feature-gating from the migration issue (#25).
+
+## What the first consumer taught the contract (recorded 2026-08-17)
+
+Resolved during implementation:
+
+- **Conflict scope**: contests are settled against the plugins a project
+  *enabled*, per this doc's wording — install-scope resolution was
+  implemented first and rejected in review because a machine-wide install
+  could re-chunk a project that never asked for anything.
+- **Whitespace-preserving grammars** (XML's `CharData`) need whitespace
+  nodes as attachments for comment attachment to work at all, which
+  silently disabled the blank-line guard; fixed — a pure-whitespace
+  attachment node is treated as the gap it reifies.
+- **`symbol` defaults from the grammar filename stem**, not
+  `language_tag`: the right tag names the *format* (`uxml`), the entry
+  point names the *grammar* (`xml`).
+
+Open items, none blocking:
+
+- No manifest field for grammar provenance (upstream repo/release/ABI);
+  it lives in the plugin's README, but `lore plugin list` is where a user
+  would want it.
+- Deeply nested markup yields repetitive symbol paths
+  (`ui:UXML.ui:VisualElement.ui:VisualElement…`) in the embedding header;
+  no mechanism says "nests but contributes no path segment" (`path_only`
+  is the inverse). Real for markup generally.
+- Only the literal `md` extension is walled; `markdown`/`mdx` are
+  claimable. Not laundering — `VaultMeta` has no code path from a plugin
+  — just an authority-free route for Markdown-family files. Pinned by
+  test.
+- Promoting an extension to built-in later retroactively voids any
+  claiming chunker entry *including its unrelated extensions* — loud in
+  diagnostics, but an upgrade re-chunks that corpus.
+- `lore plugin add` validation loads the manifest but does not void
+  built-in claims; the daemon voids them at load with a diagnostic. The
+  wall holds (three layers deep at routing), the asymmetry is cosmetic.
+- Remote mode: a pushed `.lore.toml` is inert content — the RECEIVER's
+  on-disk copy governs enablement, consistent with "the receiving
+  daemon's plugin set governs" but worth knowing when a remote project
+  seems to ignore its committed config.
+- tree-sitter-css 0.25 flags Unity 6's media range syntax
+  (`@media (width < 800px)`) as an ERROR node; spans stay exact and
+  inner rules chunk correctly.
+- Size caps are standing in for a path rule in the YAML windows entry;
+  the deferred `path_glob` remains the honest tool if generated blobs
+  ever come in small.
