@@ -574,9 +574,24 @@ language_tag = "yaml"
 
     #[test]
     fn asset_paths_stay_inside_the_plugin_root() {
-        for bad in ["../xml.wasm", "/etc/xml.wasm", "C:/xml.wasm", ""] {
+        // Bad on every platform: a parent escape, a rooted path, and nothing
+        // at all. `/etc/...` is worth keeping in the shared list precisely
+        // because `is_absolute()` answers *false* for it on Windows — it is
+        // the `RootDir` component test that catches it, and a regression to
+        // an absolute-only check would show up here.
+        for bad in ["../xml.wasm", "/etc/xml.wasm", ""] {
             let message = err(&GRAMMAR.replace("\"xml.wasm\"", &format!("\"{bad}\"")));
             assert!(message.contains("grammar"), "{bad}: {message}");
+        }
+        // Drive-qualified paths are a Windows notion. On POSIX `C:` is an
+        // ordinary directory name, so `C:/xml.wasm` is a perfectly good
+        // relative path that resolves *inside* the plugin root — accepting it
+        // there is correct, and asserting otherwise only pins the test to one
+        // platform.
+        #[cfg(windows)]
+        {
+            let message = err(&GRAMMAR.replace("\"xml.wasm\"", "\"C:/xml.wasm\""));
+            assert!(message.contains("grammar"), "{message}");
         }
         // Nested asset directories are fine.
         assert!(parse_str(&GRAMMAR.replace("\"xml.wasm\"", "\"grammars/xml.wasm\"")).is_ok());
