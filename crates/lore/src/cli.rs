@@ -272,6 +272,213 @@ pub async fn remove(project: String) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// `lore plugin`
+// ---------------------------------------------------------------------------
+
+/// The chunker-plugin surface: two commands, no registry and no fetching
+/// (2026-08-17 contract). Distribution is "clone the plugin repo and add it".
+#[derive(Debug, clap::Subcommand)]
+pub enum PluginCommand {
+    /// List the chunker plugins installed on this machine.
+    List,
+    /// Install a chunker plugin directory into the daemon's data directory.
+    Add {
+        /// Directory holding the plugin's `lore-plugin.toml` and its assets.
+        path: String,
+    },
+}
+
+/// `lore plugin list` — what this machine has installed.
+///
+/// **The running daemon is the truth**, because it is the thing that actually
+/// routes: it loaded its registry at startup, so a plugin added since then is
+/// on disk but not in force, and a report read off the disk would say the
+/// opposite of what the index is doing.
+///
+/// With no daemon running there is nothing to be authoritative, so the
+/// directory is read directly and the answer is labeled as what it is: what the
+/// *next* daemon will load.
+pub async fn plugin_list() -> Result<()> {
+    let client = match Client::connect() {
+        Ok(client) => client,
+        Err(err) => return plugin_list_from_disk(&format!("{err}")),
+    };
+    let status: DaemonStatus = parse(&client.get("status").await?)?;
+    if status.plugins.is_empty() && status.plugin_diagnostics.is_empty() {
+        println!("no chunker plugins installed ({})", plugins_dir()?);
+        println!("install one with `lore plugin add <path>`");
+        return Ok(());
+    }
+    println!(
+        "plugins ({}), as loaded by the running daemon:",
+        status.plugins.len()
+    );
+    for plugin in &status.plugins {
+        println!(
+            "  {name}  {fingerprint}  {extensions}",
+            name = plugin.name,
+            fingerprint = short_fingerprint(&plugin.fingerprint),
+            extensions = extension_list(&plugin.extensions),
+        );
+    }
+    for diagnostic in &status.plugin_diagnostics {
+        println!("  PLUGIN: {diagnostic}");
+    }
+    Ok(())
+}
+
+/// The no-daemon half of [`plugin_list`]: the same directory the daemon reads,
+/// read by the client, and said out loud to be exactly that.
+fn plugin_list_from_disk(why: &str) -> Result<()> {
+    let dir = plugins_dir()?;
+    let (registry, diagnostics) = lore::plugin::PluginRegistry::load(&dir);
+    println!("{why}");
+    println!("\nreading {dir} directly; this is what the next daemon will load:");
+    if registry.plugins().is_empty() {
+        println!("  (no chunker plugins installed)");
+    }
+    for plugin in registry.plugins() {
+        println!(
+            "  {name}  {fingerprint}  {extensions}",
+            name = plugin.name,
+            fingerprint = short_fingerprint(&plugin.fingerprint),
+            extensions = extension_list(
+                &plugin
+                    .extensions()
+                    .into_iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
+    for diagnostic in &diagnostics {
+        println!("  PLUGIN: {diagnostic}");
+    }
+    Ok(())
+}
+
+/// `lore plugin add <path>` — copy a plugin directory into the data dir.
+///
+/// Validation is **loading it**, with the daemon's own loader: a manifest
+/// checked by anything else would eventually disagree with the thing that runs
+/// it. A name already installed under a different fingerprint is refused rather
+/// than replaced — plugin identity is its name, and silently swapping one out
+/// would re-chunk every file it owns without anybody asking for it.
+///
+/// Writing into the daemon's directory from a client is safe because nothing
+/// here opens the store: the daemon reads `plugins/` exactly once, at startup,
+/// which is also why the closing line says so.
+pub fn plugin_add(path: String) -> Result<()> {
+    let source = absolute_utf8(&path)?;
+    if !source.is_dir() {
+        bail!(
+            "not a directory: {source}\nA chunker plugin is a directory holding lore-plugin.toml and its assets."
+        );
+    }
+    let plugin = lore::plugin::Plugin::load(&source)
+        .map_err(|diagnostic| anyhow::anyhow!("{diagnostic}\nFix the plugin, then try again."))?;
+
+    let target = plugins_dir()?.join(&plugin.name);
+    if target.exists() {
+        match lore::plugin::Plugin::load(&target) {
+            // Byte-for-byte the same plugin: installing it again is a no-op,
+            // and saying "already installed" is more useful than a refusal.
+            Ok(installed) if installed.fingerprint == plugin.fingerprint => {
+                println!(
+                    "{name} is already installed and unchanged ({target})",
+                    name = plugin.name
+                );
+                return Ok(());
+            }
+            Ok(installed) => bail!(
+                "a different plugin named `{name}` is already installed at {target}\n  \
+                 installed: {installed}\n  candidate: {candidate}\n\
+                 Plugin names are unique, and replacing one re-chunks every file it owns.\n\
+                 Delete that directory yourself if the replacement is intended, then add this one.",
+                name = plugin.name,
+                installed = short_fingerprint(&installed.fingerprint),
+                candidate = short_fingerprint(&plugin.fingerprint),
+            ),
+            // Something is at that path that is not a loadable plugin. Refusing
+            // is the same answer for the same reason: whatever it is, it is not
+            // this command's to delete.
+            Err(diagnostic) => bail!(
+                "`{name}` cannot be installed: {target} already exists and is not a plugin this \
+                 build can load ({diagnostic}).\nDelete that directory yourself, then add this one.",
+                name = plugin.name,
+            ),
+        }
+    }
+
+    copy_tree(&source, &target).with_context(|| format!("copying {source} to {target}"))?;
+    println!(
+        "installed {name}  {fingerprint}  {extensions}",
+        name = plugin.name,
+        fingerprint = short_fingerprint(&plugin.fingerprint),
+        extensions = extension_list(
+            &plugin
+                .extensions()
+                .into_iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        ),
+    );
+    println!("  {target}");
+    // Both halves, because either one alone leaves a user with a plugin that
+    // appears to do nothing.
+    println!(
+        "  restart the daemon to load it (`lore stop`, then `lore daemon`), and enable it in a \
+         project's .lore.toml:\n\n    [plugins]\n    enable = [\"{name}\"]\n",
+        name = plugin.name
+    );
+    println!("  then `lore index <project>` re-chunks the files it claims (nothing else moves)");
+    Ok(())
+}
+
+/// Where installed plugins live: the daemon's data directory, resolved exactly
+/// as the daemon resolves it (`LORE_DATA_DIR` included).
+fn plugins_dir() -> Result<Utf8PathBuf> {
+    Ok(discovery::data_dir()?.join(lore::daemon::paths::PLUGINS_DIR))
+}
+
+/// Copy a plugin directory. Recursive, files and directories only: a plugin is
+/// data, and a link inside one would point at bytes the fingerprint never
+/// hashed.
+fn copy_tree(source: &Utf8Path, target: &Utf8Path) -> Result<()> {
+    std::fs::create_dir_all(target)?;
+    for entry in source.read_dir_utf8()? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = target.join(entry.file_name());
+        // `file_type` does not follow links, so a symlinked file or directory
+        // reports as neither and is skipped by the `else`.
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            copy_tree(from, &to)?;
+        } else if kind.is_file() {
+            std::fs::copy(from, &to)?;
+        } else {
+            println!("  skipped {from} (not a regular file or directory)");
+        }
+    }
+    Ok(())
+}
+
+/// Fingerprints are 64 hex characters; a human comparing two of them needs a
+/// handle, not a hash. Same rule as chunk ids: the wire carries the whole
+/// thing, the renderer shortens it.
+fn short_fingerprint(fingerprint: &str) -> String {
+    fingerprint.chars().take(12).collect()
+}
+
+fn extension_list(extensions: &[String]) -> String {
+    match extensions.is_empty() {
+        true => "(claims nothing)".to_string(),
+        false => extensions.join(", "),
+    }
+}
+
 /// `lore setup [target]` — install Lore's host-side assets, or report on them.
 ///
 /// The one command that needs no daemon: these files belong to the user's agent
@@ -881,6 +1088,7 @@ fn render_status(status: &DaemonStatus) -> String {
     );
     let _ = writeln!(out, "{}", render_embeddings(&status.embeddings));
     push_abandoned(&mut out, status.embed_abandoned);
+    push_installed_plugins(&mut out, status);
     for l in &status.latency {
         let _ = writeln!(
             out,
@@ -921,12 +1129,81 @@ fn render_status(status: &DaemonStatus) -> String {
             watch = watch_note(project.watch),
         );
         push_sources(&mut out, project);
+        push_plugins(&mut out, project);
         push_authority(&mut out, project);
         push_authority_violations(&mut out, project);
         push_mass_delete_guard(&mut out, project);
         push_lease_state(&mut out, project);
     }
     out
+}
+
+/// The chunker plugins this daemon has installed, and what the load refused.
+///
+/// Silent on a machine with no plugins and nothing to complain about, which is
+/// every machine until someone installs one — the same silent-when-clean rule
+/// the abandoned-chunk line follows. A diagnostic is never silent: a plugin
+/// that half-loaded is indistinguishable from one that is working, and this is
+/// the only place that difference surfaces.
+fn push_installed_plugins(out: &mut String, status: &DaemonStatus) {
+    if !status.plugins.is_empty() {
+        let _ = writeln!(
+            out,
+            "plugins: {}",
+            status
+                .plugins
+                .iter()
+                .map(|plugin| format!(
+                    "{} {} ({})",
+                    plugin.name,
+                    short_fingerprint(&plugin.fingerprint),
+                    extension_list(&plugin.extensions)
+                ))
+                .collect::<Vec<_>>()
+                .join("  ")
+        );
+    }
+    for diagnostic in &status.plugin_diagnostics {
+        let _ = writeln!(out, "PLUGIN: {diagnostic}");
+    }
+}
+
+/// Which chunker plugins are in force for this project, and the two ways that
+/// can be disappointing.
+///
+/// Silent for a project that enabled none, which is nearly all of them. Loud
+/// about a name enabled but not installed, and about files that fell back:
+/// both produce a perfectly ordinary index of plain line windows, which is
+/// exactly why neither is discoverable from the results.
+fn push_plugins(out: &mut String, project: &ProjectStatus) {
+    if !project.plugins_enabled.is_empty() {
+        let _ = writeln!(
+            out,
+            "    plugins: {}",
+            project
+                .plugins_enabled
+                .iter()
+                .map(|plugin| format!("{} {}", plugin.name, short_fingerprint(&plugin.fingerprint)))
+                .collect::<Vec<_>>()
+                .join("  ")
+        );
+    }
+    if !project.plugins_missing.is_empty() {
+        let _ = writeln!(
+            out,
+            "    PLUGINS: {names} enabled in .lore.toml but not installed; the files they would \
+             claim are chunked as plain text (install with `lore plugin add <path>`)",
+            names = project.plugins_missing.join(", "),
+        );
+    }
+    if project.plugin_fallback_files > 0 {
+        let _ = writeln!(
+            out,
+            "    PLUGINS: {files} file(s) fell back to the built-in chunker in the last index \
+             pass because a plugin claimed them and could not run (see the PLUGIN line above)",
+            files = project.plugin_fallback_files,
+        );
+    }
 }
 
 /// An apply the mass-delete guard refused (D-0015). Loud, and naming the one

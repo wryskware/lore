@@ -62,6 +62,16 @@ enum Command {
         #[arg(long)]
         allow_mass_delete: bool,
     },
+    /// Inspect and install chunker plugins.
+    ///
+    /// A plugin is a directory of data — a manifest plus assets — that teaches
+    /// Lore to chunk file types it has no built-in chunker for. Installing one
+    /// is machine-wide; using one is per project, via `[plugins] enable` in
+    /// that project's `.lore.toml`.
+    Plugin {
+        #[command(subcommand)]
+        command: cli::PluginCommand,
+    },
     /// Show daemon and index status.
     Status {
         /// Print the daemon's raw JSON response instead of the table.
@@ -94,6 +104,13 @@ fn main() -> anyhow::Result<()> {
             project,
             allow_mass_delete,
         } => cli::run(cli::index(project, allow_mass_delete)),
+        Command::Plugin { command } => match command {
+            cli::PluginCommand::List => cli::run(cli::plugin_list()),
+            // Installing touches only the filesystem, so it needs no runtime
+            // and no daemon — deliberately, since the moment a user installs a
+            // plugin is often before anything is running.
+            cli::PluginCommand::Add { path } => cli::plugin_add(path),
+        },
         Command::Status { json, project } => cli::run(cli::status(json, project)),
         Command::Search(search) => cli::run(cli::search(search)),
     }
