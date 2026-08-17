@@ -26,6 +26,8 @@ use tokio_util::sync::CancellationToken;
 
 use lore_core::snapshot::{Manifest, ManifestEntry};
 
+use crate::sources::Sources;
+
 use super::walk;
 
 /// Where a snapshot's file content comes from.
@@ -43,22 +45,37 @@ pub trait ContentSource: Send {
     fn read(&self, path: &Utf8Path) -> std::io::Result<Vec<u8>>;
 }
 
-/// The local content source: files under a project root, read on demand.
+/// The local content source: files under a project's declared source roots,
+/// read on demand.
+///
+/// Holds the whole [`Sources`] rather than one root because a manifest path is
+/// *logical* — `<mount>/<path>` — and only the source table knows which
+/// physical directory that names.
 pub struct DiskContent {
-    root: Utf8PathBuf,
+    sources: Sources,
 }
 
 impl DiskContent {
-    pub fn new(root: &Utf8Path) -> Self {
+    pub fn new(sources: &Sources) -> Self {
         Self {
-            root: root.to_owned(),
+            sources: sources.clone(),
         }
     }
 }
 
 impl ContentSource for DiskContent {
     fn read(&self, path: &Utf8Path) -> std::io::Result<Vec<u8>> {
-        std::fs::read(self.root.join(path))
+        match self.sources.resolve_path(path) {
+            Some(abs) => std::fs::read(abs),
+            // A path no source owns is a path that is gone: the mount that
+            // held it was removed from `.lore.toml`, or renamed. `NotFound` is
+            // exactly right — the pipeline drops the file rather than counting
+            // an error, which is what a removed mount should do.
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no declared source owns `{path}`"),
+            )),
+        }
     }
 }
 
@@ -140,18 +157,28 @@ impl Snapshot {
 /// intersected after it, and a credential screen no ignore file could argue
 /// with — into the one evaluator inside [`walk::walk_files`]. What a pusher
 /// sends is now exactly what one ignore evaluation admits.
+///
+/// One walk per declared source root, and every path it yields carries that
+/// source's mount. Rules travel down a root and never between roots, so each
+/// walk gets its own evaluator with its own matcher stack — which is what the
+/// `ignore` crate does naturally, and what the walker's `parents(false)` makes
+/// true rather than merely intended.
 pub fn observe_project(
-    root: &Utf8Path,
+    sources: &Sources,
     data_dir: &Utf8Path,
     cancel: &CancellationToken,
 ) -> Snapshot {
-    let walk = walk::walk_files(root, root, None, data_dir, Some(cancel));
-    let files: BTreeSet<Utf8PathBuf> = walk.files.into_iter().collect();
-    let links: BTreeSet<Utf8PathBuf> = walk.links.into_iter().collect();
+    let mut files: BTreeSet<Utf8PathBuf> = BTreeSet::new();
+    let mut links: BTreeSet<Utf8PathBuf> = BTreeSet::new();
+    for source in sources.iter() {
+        let walk = walk::walk_files(&source.root, &source.root, None, data_dir, Some(cancel));
+        files.extend(walk.files.iter().map(|rel| source.logical(rel)));
+        links.extend(walk.links.iter().map(|rel| source.logical(rel)));
+    }
     // A cancelled walk is partial: applying it would treat every unwalked file
     // as deleted.
     let complete = !cancel.is_cancelled();
-    hash_all(root, files, links, Scope::Project, complete, cancel)
+    hash_all(sources, files, links, Scope::Project, complete, cancel)
 }
 
 /// Observe exactly these project-relative paths — what a watcher batch turns
@@ -178,7 +205,7 @@ pub fn observe_project(
 /// also the whole cost now: the git subprocess this used to spend per batch is
 /// gone with the basis.
 pub fn observe_paths(
-    root: &Utf8Path,
+    sources: &Sources,
     data_dir: &Utf8Path,
     requested: &BTreeSet<Utf8PathBuf>,
     cancel: &CancellationToken,
@@ -186,8 +213,14 @@ pub fn observe_paths(
     let mut scope: BTreeSet<Utf8PathBuf> = BTreeSet::new();
     let mut files: BTreeSet<Utf8PathBuf> = BTreeSet::new();
     let mut links: BTreeSet<Utf8PathBuf> = BTreeSet::new();
-    // Parent directory -> the files under it this batch mentions.
-    let mut by_parent: BTreeMap<Utf8PathBuf, Vec<&Utf8Path>> = BTreeMap::new();
+    // Physical parent directory -> the source that owns it and the logical
+    // paths under it this batch mentions. Keyed physically because that is
+    // what gets listed; the source is carried rather than looked up again,
+    // because a parent that *is* a source root is not "inside" it and a
+    // containment query would answer `None` for exactly the files sitting at
+    // the top of a mount.
+    let mut by_parent: BTreeMap<Utf8PathBuf, (&crate::sources::Source, Vec<&Utf8Path>)> =
+        BTreeMap::new();
 
     for rel in requested {
         // The hard floor is the only thing rejected on a name. Every other
@@ -197,31 +230,40 @@ pub fn observe_paths(
         if walk::is_git_metadata(rel) {
             continue;
         }
+        // In scope whatever happens next: a path whose mount has since been
+        // removed from `.lore.toml` has to be *deletable*, and absence from
+        // the manifest is how deletion is said.
         scope.insert(rel.to_owned());
-        let abs = root.join(rel);
+        let Some((source, abs)) = sources.resolve(rel) else {
+            continue;
+        };
         match std::fs::metadata(&abs) {
             Err(_) => {}
             Ok(meta) if meta.is_dir() => {
-                let walk = walk::walk_files(root, &abs, None, data_dir, Some(cancel));
-                files.extend(walk.files);
-                links.extend(walk.links);
+                let walk = walk::walk_files(&source.root, &abs, None, data_dir, Some(cancel));
+                files.extend(walk.files.iter().map(|rel| source.logical(rel)));
+                links.extend(walk.links.iter().map(|rel| source.logical(rel)));
             }
             Ok(_) => {
-                let parent = rel.parent().unwrap_or(Utf8Path::new("")).to_owned();
-                by_parent.entry(parent).or_default().push(rel);
+                let parent = abs.parent().unwrap_or(&source.root).to_owned();
+                by_parent
+                    .entry(parent)
+                    .or_insert_with(|| (source, Vec::new()))
+                    .1
+                    .push(rel);
             }
         }
     }
 
-    for (parent, named) in by_parent {
-        let start = if parent.as_str().is_empty() {
-            root.to_owned()
-        } else {
-            root.join(&parent)
-        };
-        let walk = walk::walk_files(root, &start, Some(1), data_dir, Some(cancel));
-        let allowed: BTreeSet<Utf8PathBuf> = walk.files.into_iter().collect();
-        links.extend(walk.links);
+    for (parent, (source, named)) in by_parent {
+        // Rooted at the owning source, never at the parent: the crate matches
+        // a parent `.loreignore` against the entry path alone, so a rule that
+        // prunes this directory during a descent matches nothing once the walk
+        // begins inside it.
+        let walk = walk::walk_files(&source.root, &parent, Some(1), data_dir, Some(cancel));
+        let allowed: BTreeSet<Utf8PathBuf> =
+            walk.files.iter().map(|rel| source.logical(rel)).collect();
+        links.extend(walk.links.iter().map(|rel| source.logical(rel)));
         files.extend(
             named
                 .into_iter()
@@ -234,7 +276,7 @@ pub fn observe_paths(
     // missing (its parent listing came back partial); deleting on partial
     // evidence deletes real index rows.
     let complete = !cancel.is_cancelled();
-    hash_all(root, files, links, Scope::Paths(scope), complete, cancel)
+    hash_all(sources, files, links, Scope::Paths(scope), complete, cancel)
 }
 
 /// Read and hash every observed file into a manifest.
@@ -246,7 +288,7 @@ pub fn observe_paths(
 /// pipeline asks for its content, which is the price of the seam and is served
 /// from the page cache rather than the disk.
 fn hash_all(
-    root: &Utf8Path,
+    sources: &Sources,
     files: impl IntoIterator<Item = Utf8PathBuf>,
     links: BTreeSet<Utf8PathBuf>,
     scope: Scope,
@@ -262,7 +304,12 @@ fn hash_all(
             complete = false;
             break;
         }
-        match std::fs::read(root.join(&rel)) {
+        // Logical path in, physical read out: the source table is the only
+        // thing that knows which declared root a manifest path names.
+        let Some(abs) = sources.resolve_path(&rel) else {
+            continue;
+        };
+        match std::fs::read(&abs) {
             Ok(content) => entries.push(ManifestEntry {
                 path: rel.to_string(),
                 hash: blake3::hash(&content).to_hex().to_string(),
@@ -284,6 +331,6 @@ fn hash_all(
         complete,
         unreadable,
         links,
-        content: Box::new(DiskContent::new(root)),
+        content: Box::new(DiskContent::new(sources)),
     }
 }

@@ -20,6 +20,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use daemon_support::link_dir;
 use lore::daemon::snapshot::{Snapshot, observe_paths, observe_project};
 use lore::daemon::walk::USER_IGNORE_FILE;
+use lore::sources::Sources;
 use tokio_util::sync::CancellationToken;
 
 /// A project root, plus the daemon's data directory — which is both outside the
@@ -36,8 +37,10 @@ impl Project {
         let dir = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         let project = Self {
-            root: Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap(),
-            data_dir: Utf8PathBuf::from_path_buf(data.path().to_path_buf()).unwrap(),
+            // Canonical, exactly as `lore add` stores it — the source table
+            // compares declared paths against this.
+            root: lore::daemon::paths::canonicalize_root(dir.path()).unwrap(),
+            data_dir: lore::daemon::paths::canonicalize_root(data.path()).unwrap(),
             _dir: dir,
             _data: data,
         };
@@ -63,15 +66,22 @@ impl Project {
         self
     }
 
+    /// Read from the fixture's own `.lore.toml`, so a test that declares
+    /// `[[sources]]` gets them and one that does not gets the project root —
+    /// exactly what the daemon does at the top of every pass.
+    fn sources(&self) -> Sources {
+        Sources::load(&self.root)
+    }
+
     fn observe(&self) -> Snapshot {
-        observe_project(&self.root, &self.data_dir, &CancellationToken::new())
+        observe_project(&self.sources(), &self.data_dir, &CancellationToken::new())
     }
 
     /// The watcher's form, over the paths a debounced batch would name.
     fn observe_batch(&self, named: &[&str]) -> Snapshot {
         let requested: BTreeSet<Utf8PathBuf> = named.iter().map(Utf8PathBuf::from).collect();
         observe_paths(
-            &self.root,
+            &self.sources(),
             &self.data_dir,
             &requested,
             &CancellationToken::new(),
@@ -314,4 +324,178 @@ fn a_linked_corpus_is_absent_from_the_manifest_and_named_in_the_snapshot() {
 fn a_project_without_links_reports_none() {
     let project = Project::new(&[("src/main.rs", "fn main() {}")]);
     assert!(project.observe().links.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Declared extent: [[sources]] (D-0021's replacement for following links)
+// ---------------------------------------------------------------------------
+
+/// A mounted tree is observed, and every path it contributes carries the
+/// mount — which is what keeps one file at one logical address in a store
+/// keyed `(project, path)`.
+///
+/// The shape is the one that started all of this: a project whose real corpus
+/// lives in another directory entirely. Under D-0021 a junction to it stays
+/// unwalked; declaring it is how you say you meant it.
+#[test]
+fn a_declared_mount_is_observed_under_its_prefix() {
+    let outside = tempfile::tempdir().unwrap();
+    let outside = Utf8PathBuf::from_path_buf(outside.path().to_path_buf()).unwrap();
+    std::fs::create_dir_all(outside.join("render")).unwrap();
+    std::fs::write(outside.join("render/pass.rs"), "pub fn pass() {}").unwrap();
+    std::fs::write(outside.join("lib.rs"), "pub mod render;").unwrap();
+
+    let project = Project::new(&[("src/main.rs", "fn main() {}")]);
+    project.user_rules(
+        ".*
+",
+    );
+    project.write(
+        ".lore.toml",
+        &format!(
+            "[[sources]]
+path = \".\"
+
+[[sources]]
+path = \"{}\"
+mount = \"engine\"
+",
+            declared_path(&project, &outside)
+        ),
+    );
+
+    assert_eq!(
+        listed(&project.observe()),
+        ["engine/lib.rs", "engine/render/pass.rs", "src/main.rs"],
+        "both roots contribute, and only the mount is prefixed"
+    );
+}
+
+/// Rules travel down a root and never between roots.
+///
+/// The mount's own `.loreignore` governs the mount; the project's governs the
+/// project; neither reaches the other. A mounted tree is somebody else's
+/// directory that this project happens to name, and reaching into it would be
+/// crossing a boundary the declaring project does not own.
+#[test]
+fn ignore_rules_do_not_cross_between_source_roots() {
+    let outside = tempfile::tempdir().unwrap();
+    let outside = Utf8PathBuf::from_path_buf(outside.path().to_path_buf()).unwrap();
+    std::fs::write(outside.join("keep.rs"), "pub fn keep() {}").unwrap();
+    std::fs::write(outside.join("drop.rs"), "pub fn drop_me() {}").unwrap();
+    // The mount excludes its own file, and says nothing about the project's.
+    std::fs::write(
+        outside.join(".loreignore"),
+        "drop.rs
+",
+    )
+    .unwrap();
+
+    let project = Project::new(&[
+        ("src/main.rs", "fn main() {}"),
+        ("src/notes.rs", "// notes"),
+        // The project excludes one of its own, and names a path that exists
+        // only inside the mount. That line must not reach across.
+        (
+            ".loreignore",
+            "notes.rs
+keep.rs
+",
+        ),
+    ]);
+    project.user_rules(
+        ".*
+",
+    );
+    project.write(
+        ".lore.toml",
+        &format!(
+            "[[sources]]
+path = \".\"
+
+[[sources]]
+path = \"{}\"
+mount = \"engine\"
+",
+            declared_path(&project, &outside)
+        ),
+    );
+
+    assert_eq!(
+        listed(&project.observe()),
+        ["engine/keep.rs", "src/main.rs"],
+        "each root applied its own rules and neither applied the other's"
+    );
+}
+
+/// The watcher's shape has to agree with the full scan across a mount too, or
+/// a batch would index what the next full scan deletes.
+#[test]
+fn a_watcher_batch_reaches_the_same_verdict_inside_a_mount() {
+    let outside = tempfile::tempdir().unwrap();
+    let outside = Utf8PathBuf::from_path_buf(outside.path().to_path_buf()).unwrap();
+    std::fs::write(outside.join("keep.rs"), "pub fn keep() {}").unwrap();
+    std::fs::write(outside.join("drop.rs"), "pub fn drop_me() {}").unwrap();
+    std::fs::write(
+        outside.join(".loreignore"),
+        "drop.rs
+",
+    )
+    .unwrap();
+
+    let project = Project::new(&[("src/main.rs", "fn main() {}")]);
+    project.user_rules(
+        ".*
+",
+    );
+    project.write(
+        ".lore.toml",
+        &format!(
+            "[[sources]]
+path = \".\"
+
+[[sources]]
+path = \"{}\"
+mount = \"engine\"
+",
+            declared_path(&project, &outside)
+        ),
+    );
+
+    let batch = project.observe_batch(&["engine/keep.rs", "engine/drop.rs"]);
+    assert_eq!(listed(&batch), ["engine/keep.rs"]);
+    // Both were observed, so the excluded one is in scope and absent — which
+    // is how it leaves the index rather than lingering as an orphan.
+    assert!(batch.covers(Utf8Path::new("engine/drop.rs")));
+}
+
+/// A path under a mount that `.lore.toml` no longer declares resolves to
+/// nothing, so it is absent from the manifest and — being in scope — deleted.
+/// Removing a mount has to retract its content, not strand it.
+#[test]
+fn a_path_under_an_undeclared_mount_reaches_no_manifest() {
+    let project = Project::new(&[("src/main.rs", "fn main() {}")]);
+    project.user_rules(
+        ".*
+",
+    );
+
+    let batch = project.observe_batch(&["engine/gone.rs"]);
+    assert!(listed(&batch).is_empty());
+    assert!(batch.covers(Utf8Path::new("engine/gone.rs")));
+}
+
+/// The mount path as a committed `.lore.toml` would spell it: **relative to
+/// the project root**, which is the only form `[[sources]]` accepts — an
+/// absolute path works on exactly one machine and this file travels.
+///
+/// Both directories come from `tempfile::tempdir()`, so they are siblings and
+/// `../<name>` is the honest spelling rather than a contrivance.
+fn declared_path(project: &Project, outside: &Utf8Path) -> String {
+    assert_eq!(
+        outside.parent(),
+        project.root.parent(),
+        "the fixture assumes both temp dirs share a parent"
+    );
+    format!("../{}", outside.file_name().expect("a temp dir has a name"))
 }

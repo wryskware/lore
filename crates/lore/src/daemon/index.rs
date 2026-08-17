@@ -39,6 +39,7 @@ use lore_core::snapshot::{ManifestEntry, MassDeleteTrip, mass_delete_trip};
 use crate::authority::{DecisionIndex, Decisions, Demotion, is_decision_source, is_ledger_path};
 use crate::chunk::{FileChunks, chunk_file};
 use crate::repo_config::{Profile, RepoAuthority};
+use crate::sources::Sources;
 use crate::store::{FileWrite, Project, ProjectId, Recompute, StoreError};
 
 use super::queue::{IndexQueue, ProjectWork};
@@ -192,8 +193,9 @@ pub fn full_scan(ctx: &IndexContext, project: &Project) -> PassSummary {
 /// may carry.
 pub fn full_scan_with(ctx: &IndexContext, project: &Project, options: ApplyOptions) -> PassSummary {
     let started = Instant::now();
-    let snapshot = snapshot::observe_project(&project.root, &ctx.data_dir, &ctx.cancel);
-    apply(ctx, project, snapshot, options, started)
+    let sources = Sources::load(&project.root);
+    let snapshot = snapshot::observe_project(&sources, &ctx.data_dir, &ctx.cancel);
+    apply(ctx, project, &sources, snapshot, options, started)
 }
 
 /// Index exactly these project-relative paths — what a watcher batch turns
@@ -205,8 +207,16 @@ pub fn index_paths(
     requested: &BTreeSet<Utf8PathBuf>,
 ) -> PassSummary {
     let started = Instant::now();
-    let snapshot = snapshot::observe_paths(&project.root, &ctx.data_dir, requested, &ctx.cancel);
-    apply(ctx, project, snapshot, ApplyOptions::default(), started)
+    let sources = Sources::load(&project.root);
+    let snapshot = snapshot::observe_paths(&sources, &ctx.data_dir, requested, &ctx.cancel);
+    apply(
+        ctx,
+        project,
+        &sources,
+        snapshot,
+        ApplyOptions::default(),
+        started,
+    )
 }
 
 /// Apply a snapshot this daemon did not observe — the push commit path
@@ -223,7 +233,12 @@ pub fn apply_snapshot(
     snapshot: Snapshot,
     options: ApplyOptions,
 ) -> PassSummary {
-    apply(ctx, project, snapshot, options, Instant::now())
+    // A push carries its own content and its own manifest; the receiver has
+    // no business resolving the pusher's source table, and under D-0015 no
+    // business touching a filesystem it does not own. The project root alone
+    // is what the disk-reading paths below fall back to.
+    let sources = Sources::from_declared(&project.root, &[]);
+    apply(ctx, project, &sources, snapshot, options, Instant::now())
 }
 
 /// The stored `files.content_hash` for content that hashed to `hash`.
@@ -258,6 +273,7 @@ pub fn content_stamp(rel: &Utf8Path, hash: &str, profile: Option<Profile>) -> St
 fn apply(
     ctx: &IndexContext,
     project: &Project,
+    sources: &Sources,
     snapshot: Snapshot,
     options: ApplyOptions,
     started: Instant,
@@ -351,7 +367,7 @@ fn apply(
             // backfill path, where the stored effective tiers may be the V2
             // migration's declared-tier approximation and the active-decision
             // set may never have been parsed at all.
-            Scope::Project => refresh_authority(ctx, project, profile, true, &mut summary),
+            Scope::Project => refresh_authority(ctx, project, sources, profile, true, &mut summary),
             // Otherwise only when this batch touched a decision source — a
             // mono ledger or a per-file record (D-0013). Every *other* file
             // already got its effective tier stamped on write; re-deriving the
@@ -373,7 +389,14 @@ fn apply(
                     .chain(deletions.iter().map(Utf8PathBuf::as_path))
                     .any(is_decision_source);
                 if decisions_touched || summary.profile_changed {
-                    refresh_authority(ctx, project, profile, summary.profile_changed, &mut summary);
+                    refresh_authority(
+                        ctx,
+                        project,
+                        sources,
+                        profile,
+                        summary.profile_changed,
+                        &mut summary,
+                    );
                 }
             }
         }
@@ -464,11 +487,12 @@ fn refresh_profile(
 fn refresh_authority(
     ctx: &IndexContext,
     project: &Project,
+    sources: &Sources,
     profile: Option<Profile>,
     force: bool,
     summary: &mut PassSummary,
 ) {
-    let mut sources = 0usize;
+    let mut decision_sources = 0usize;
     let decisions = match profile {
         None => Decisions::default(),
         Some(_) => {
@@ -484,8 +508,20 @@ fn refresh_authority(
             let mut index = DecisionIndex::default();
             let mut unreadable = false;
             for record in files.iter().filter(|f| is_decision_source(&f.path)) {
-                sources += 1;
-                match std::fs::read_to_string(project.root.join(&record.path)) {
+                decision_sources += 1;
+                // Through the source table: a ledger may legitimately live in
+                // a mounted design vault, and `root.join` would look for it in
+                // a directory that does not hold it.
+                let on_disk = sources
+                    .resolve_path(Utf8Path::new(&record.path))
+                    .map(std::fs::read_to_string)
+                    .unwrap_or_else(|| {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "no declared source owns this path",
+                        ))
+                    });
+                match on_disk {
                     Ok(text) if is_ledger_path(&record.path) => {
                         index.add_ledger(&record.path, &text);
                     }
@@ -558,9 +594,14 @@ fn refresh_authority(
         .store
         .blocking(|store| store.recompute_effective_authority(project.id))
     {
-        Ok(recompute) => {
-            record_recompute(project, sources, &decisions, changed, recompute, summary)
-        }
+        Ok(recompute) => record_recompute(
+            project,
+            decision_sources,
+            &decisions,
+            changed,
+            recompute,
+            summary,
+        ),
         Err(err) => {
             tracing::warn!(project = %project.name, error = %err, "recomputing effective authority failed");
             summary.errors += 1;

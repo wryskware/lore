@@ -62,8 +62,9 @@
 //! `(project, path)`, so a single logical path per file is what keeps one
 //! content from competing with itself — the same reason D-0021 refuses to
 //! index a file through a link to it. [`Sources::resolve`] is the only place
-//! that turns a logical path back into a physical one, and
-//! [`Sources::locate`] the only place that goes the other way.
+//! that turns a logical path back into a physical one, and [`Sources::locate`]
+//! the only place that goes the other way — while [`Sources::from_declared`]
+//! is what decides, once, which roots exist at all.
 //!
 //! ## Failing visibly
 //!
@@ -134,7 +135,7 @@ impl Sources {
             },
             Err(_) => Vec::new(),
         };
-        Self::resolve(project_root, &declared)
+        Self::from_declared(project_root, &declared)
     }
 
     /// Resolve declared entries against a project root.
@@ -142,7 +143,7 @@ impl Sources {
     /// Split from [`Self::load`] so the rules below are testable without a
     /// `.lore.toml` on disk — the validation is the substance here, and the
     /// file read is not.
-    pub fn resolve(project_root: &Utf8Path, declared: &[SourceEntry]) -> Self {
+    pub fn from_declared(project_root: &Utf8Path, declared: &[SourceEntry]) -> Self {
         // No table at all is the overwhelmingly common case and is not a
         // degenerate one: a project is its root.
         if declared.is_empty() {
@@ -174,9 +175,17 @@ impl Sources {
         project_root: &Utf8Path,
         declared: &[SourceEntry],
     ) -> Result<Vec<Source>, String> {
+        // Compared against the *canonical* project root, never the one handed
+        // in. The daemon canonicalizes at registration so the two normally
+        // agree, but "is this entry the project root?" decides whether a mount
+        // is required — and answering it wrongly turns `path = "."` into a
+        // rejected table and the whole project into a fallback. Too sharp an
+        // edge to leave resting on a caller's habit.
+        let canonical_root = paths::canonicalize_root(project_root.as_std_path())
+            .unwrap_or_else(|_| project_root.to_owned());
         let mut sources: Vec<Source> = Vec::new();
         for entry in declared {
-            let source = Self::resolve_one(project_root, entry)?;
+            let source = Self::resolve_one(project_root, &canonical_root, entry)?;
             // Mounts are the store's path prefixes, so a collision would put
             // two trees at one logical address. Folded, because two mounts
             // differing only in case is human error rather than intent.
@@ -209,7 +218,11 @@ impl Sources {
         Ok(sources)
     }
 
-    fn resolve_one(project_root: &Utf8Path, entry: &SourceEntry) -> Result<Source, String> {
+    fn resolve_one(
+        project_root: &Utf8Path,
+        canonical_root: &Utf8Path,
+        entry: &SourceEntry,
+    ) -> Result<Source, String> {
         let declared = Utf8Path::new(entry.path.trim());
         if declared.as_str().is_empty() {
             return Err("a source has an empty `path`".to_string());
@@ -235,7 +248,7 @@ impl Sources {
             return Err(format!("source path `{declared}` is not a directory"));
         }
 
-        let is_project_root = root == project_root;
+        let is_project_root = root == canonical_root;
         let mount = match entry.mount.as_deref().map(str::trim) {
             Some(mount) => mount.to_string(),
             // Defaulted rather than required: `../shared-engine` mounting at
@@ -316,13 +329,21 @@ impl Sources {
     /// under a mount that has since been removed reads as "gone" rather than
     /// resolving to something else.
     pub fn resolve_path(&self, logical: &Utf8Path) -> Option<Utf8PathBuf> {
+        self.resolve(logical).map(|(_, abs)| abs)
+    }
+
+    /// [`Self::resolve_path`], keeping the source that answered.
+    ///
+    /// Callers that are about to walk or watch need the owning root as well as
+    /// the file, and asking twice would invite the two answers to drift.
+    pub fn resolve(&self, logical: &Utf8Path) -> Option<(&Source, Utf8PathBuf)> {
         let logical = logical.as_str();
         for source in &self.sources {
             if source.is_root() {
                 continue;
             }
             if let Some(rest) = strip_mount(logical, &source.mount) {
-                return Some(source.root.join(rest));
+                return Some((source, source.root.join(rest)));
             }
         }
         // The root source is tried last so that a mount always wins over a
@@ -332,7 +353,7 @@ impl Sources {
         self.sources
             .iter()
             .find(|source| source.is_root())
-            .map(|source| source.root.join(logical))
+            .map(|source| (source, source.root.join(logical)))
     }
 
     /// Physical path → the source that owns it and the logical path it has.
@@ -429,7 +450,7 @@ mod tests {
         }
 
         fn resolve(&self, declared: &[SourceEntry]) -> Sources {
-            Sources::resolve(&self.root, declared)
+            Sources::from_declared(&self.root, declared)
         }
     }
 
