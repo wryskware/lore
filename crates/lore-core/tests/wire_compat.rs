@@ -365,6 +365,11 @@ fn a_push_message_missing_its_additive_fields_still_parses() {
         serde_json::from_value(json!({ "needed": ["src/lib.rs"] })).expect("needed-only parses");
     assert_eq!(needed.needed, ["src/lib.rs"]);
     assert_eq!(needed.deletes, 0);
+    assert!(
+        needed.refused.is_empty(),
+        "a daemon that predates the hard-exclude backstop refused nothing, \
+         which is exactly what an absent list has to mean"
+    );
 
     let staged: PushFileResponse =
         serde_json::from_value(json!({ "staged": 3 })).expect("staged-only parses");

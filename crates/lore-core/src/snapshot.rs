@@ -108,6 +108,43 @@ impl Manifest {
     }
 }
 
+/// Why a string could not be a manifest path at all, if it could not.
+///
+/// This is a *structural* verdict, not a policy one, and the difference decides
+/// how a receiver answers. A path that is empty, absolute, backslashed or
+/// traversal-shaped is not a file this protocol has an opinion about — it is a
+/// client that does not implement the contract, and the honest answer is to
+/// refuse the whole listing by name. A perfectly well-formed path that names a
+/// secret is the opposite case: the client works, its configuration is wrong,
+/// and the receiver drops that entry and says which (see the receiver's
+/// hard-exclude backstop, D-0015).
+///
+/// Nothing here is a security boundary. A receiver must never derive a
+/// filesystem path from a client's string in the first place — the push
+/// staging area names files by their content hash for exactly that reason.
+/// This is about *detecting a broken client loudly*, before its listing's
+/// absences are allowed to delete anything.
+pub fn malformed_path(path: &str) -> Option<&'static str> {
+    if path.is_empty() {
+        return Some("is empty");
+    }
+    if path.contains('\\') {
+        return Some("contains a backslash; manifest paths use forward slashes on every platform");
+    }
+    if path.starts_with('/') {
+        return Some("is absolute; manifest paths are project-relative");
+    }
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        return Some("names a drive letter; manifest paths are project-relative");
+    }
+    path.split('/').find_map(|part| match part {
+        "" => Some("contains an empty path component"),
+        ".." => Some("contains a `..` component"),
+        _ => None,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Push session identity
 // ---------------------------------------------------------------------------
@@ -216,6 +253,23 @@ pub struct PushManifestResponse {
     /// listing looks like a catastrophe *before* uploading anything.
     #[serde(default)]
     pub deletes: u64,
+    /// Listed paths the receiver refuses to index, dropped from the accepted
+    /// manifest (D-0015's hard-exclude backstop).
+    ///
+    /// The manifest is still *accepted*: a client listing `.env` is
+    /// misconfigured, not broken, and refusing its whole snapshot would take a
+    /// working index offline over one file. The refused entries simply are not
+    /// in it — which means absence semantics now apply to them, so a copy
+    /// indexed before the backstop existed (or before the file matched) is
+    /// **deleted** by the next commit. That is the backstop actively purging,
+    /// and it is the point: a secret that reached the index once must be able
+    /// to leave it.
+    ///
+    /// Paths only. Which rule refused each one is in the daemon's log — a
+    /// pusher's remedy is the same whichever pattern matched, and naming the
+    /// pattern on the wire would invite clients to branch on it.
+    #[serde(default)]
+    pub refused: Vec<String>,
 }
 
 /// Step 3 of the push flow: one needed path's content.
@@ -310,4 +364,51 @@ impl fmt::Display for MassDeleteTrip {
 pub fn mass_delete_trip(deletes: u64, stored: u64) -> Option<MassDeleteTrip> {
     (deletes > MASS_DELETE_MIN_FILES && deletes * 2 > stored)
         .then_some(MassDeleteTrip { deletes, stored })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_malformed_path_is_named_by_the_way_it_is_malformed() {
+        for (path, reason) in [
+            ("", "is empty"),
+            ("/etc/shadow", "is absolute"),
+            ("//server/share/file", "is absolute"),
+            ("C:/Windows/win.ini", "names a drive letter"),
+            ("c:relative", "names a drive letter"),
+            (r"src\lib.rs", "contains a backslash"),
+            ("../escape", "contains a `..` component"),
+            ("a/../../escape", "contains a `..` component"),
+            ("src//lib.rs", "contains an empty path component"),
+            ("src/", "contains an empty path component"),
+        ] {
+            let verdict = malformed_path(path).unwrap_or_else(|| panic!("{path:?} was accepted"));
+            assert!(verdict.starts_with(reason), "{path:?}: {verdict}");
+        }
+    }
+
+    /// The half that matters more: over-rejecting refuses a whole manifest and
+    /// takes a working index offline, so ordinary paths — including the odd
+    /// ones real repositories contain — must survive.
+    #[test]
+    fn ordinary_manifest_paths_are_accepted() {
+        for path in [
+            "src/lib.rs",
+            "README.md",
+            ".github/workflows/ci.yml",
+            "a/b/c/d/e.txt",
+            "docs/日本語.md",
+            "weird name with spaces.md",
+            "trailing.dots...",
+            // A leading `.` component and a `..` *inside* a name are neither
+            // traversal nor absolute.
+            "./relative.rs",
+            "src/..hidden.rs",
+            "src/a..b.rs",
+        ] {
+            assert_eq!(malformed_path(path), None, "{path:?}");
+        }
+    }
 }

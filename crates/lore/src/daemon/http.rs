@@ -46,9 +46,9 @@ use axum::{Json, Router};
 use camino::{Utf8Path, Utf8PathBuf};
 
 use lore_core::snapshot::{
-    PushCommitRequest, PushCommitResponse, PushEpoch, PushFileParams, PushFileResponse,
+    Manifest, PushCommitRequest, PushCommitResponse, PushEpoch, PushFileParams, PushFileResponse,
     PushLeaseRequest, PushLeaseResponse, PushManifestRequest, PushManifestResponse,
-    PushRenewRequest, PushSessionId,
+    PushRenewRequest, PushSessionId, malformed_path,
 };
 use lore_core::{
     DaemonStatus, ExpandRequest, IndexRequest, IndexResponse, ProjectInfo, ProjectList,
@@ -65,7 +65,7 @@ use super::queue::IndexQueue;
 use super::snapshot::{Scope, Snapshot};
 use super::store_handle::StoreHandle;
 use super::watch::{WatchCommand, WatchSender, WatchStatus};
-use super::{expand, ignorefile, index, paths, push, search};
+use super::{expand, ignorefile, index, paths, push, search, walk};
 
 /// Request bodies are small JSON documents; a megabyte is generous for the
 /// largest realistic one (a pasted query) and cheap insurance otherwise.
@@ -802,6 +802,7 @@ fn push_err(err: PushError) -> ApiErr {
         | PushError::CommitInFlight { .. } => StatusCode::CONFLICT,
         PushError::TooSoon { .. } => StatusCode::TOO_MANY_REQUESTS,
         PushError::ManifestCorrupt
+        | PushError::ManifestMalformed { .. }
         | PushError::NoManifest
         | PushError::NotInManifest { .. }
         | PushError::SizeMismatch { .. }
@@ -920,12 +921,40 @@ async fn push_renew(
 /// it uploads anything. Enforcement stays where it already lives — the apply
 /// pipeline's guard at commit — so there is exactly one notion of "too many",
 /// and the per-invocation override rides along to it on the session.
+///
+/// # The hard-exclude backstop (D-0015)
+///
+/// Ignore evaluation is trusted client-side; the receiver keeps a backstop, and
+/// it answers two different kinds of bad entry two different ways.
+///
+/// **Structurally impossible paths refuse the whole manifest** (400). Empty,
+/// absolute, backslashed, `..`-shaped: a client that emits one is not
+/// implementing the contract, so nothing else it listed can be trusted either —
+/// least of all the *absences*, which delete files.
+///
+/// **Hard-excluded paths are refused individually** and the manifest is
+/// accepted without them. A client listing `.env` is misconfigured, not broken;
+/// refusing its whole snapshot would take a working index offline over one
+/// file. Everything downstream then runs on the accepted set: the needed list,
+/// the delete preview, the stored manifest, and therefore the mass-delete
+/// guard's arithmetic at commit. One consequence is deliberate — a refused path
+/// the store already has is now *absent*, and absence is deletion, so committing
+/// purges it. A secret that reached the index once has to be able to leave it.
 async fn push_manifest(
     State(state): State<AppState>,
     ApiJson(request): ApiJson<PushManifestRequest>,
 ) -> ApiResult<PushManifestResponse> {
     if !request.manifest.is_intact() {
         return Err(push_err(PushError::ManifestCorrupt));
+    }
+    // Before the project is even resolved: a listing this shape is not a
+    // listing, whoever it was meant for.
+    if let Some((path, reason)) =
+        request.manifest.entries.iter().find_map(|entry| {
+            malformed_path(&entry.path).map(|reason| (entry.path.clone(), reason))
+        })
+    {
+        return Err(push_err(PushError::ManifestMalformed { path, reason }));
     }
     let project = push_project(&state, &request.project).await?;
     let claim = claim(&project, &request.session, request.epoch);
@@ -955,12 +984,13 @@ async fn push_manifest(
         .map_err(|err| ApiErr::internal("push manifest", err))?
         .map_err(|err| ApiErr::internal("push manifest", err))?;
 
+    let (manifest, refused) = refuse_hard_excludes(&project.name, request.manifest);
+
     let known: BTreeMap<&str, &str> = stored
         .iter()
         .map(|record| (record.path.as_str(), record.content_hash.as_str()))
         .collect();
-    let needed: Vec<String> = request
-        .manifest
+    let needed: Vec<String> = manifest
         .entries
         .iter()
         .filter(|entry| {
@@ -969,15 +999,17 @@ async fn push_manifest(
         })
         .map(|entry| entry.path.clone())
         .collect();
-    // Deletion is absence, and a manifest speaks for the whole project.
+    // Deletion is absence, and a manifest speaks for the whole project — the
+    // *accepted* manifest, so a stored copy of a refused path counts here and
+    // is purged at commit, and the mass-delete guard sees the same number.
     let deletes = stored
         .iter()
-        .filter(|record| request.manifest.get(record.path.as_str()).is_none())
+        .filter(|record| manifest.get(record.path.as_str()).is_none())
         .count() as u64;
 
     let missing = state
         .push
-        .record_manifest(&claim, request.manifest, request.allow_mass_delete, needed)
+        .record_manifest(&claim, manifest, request.allow_mass_delete, needed)
         .map_err(push_err)?;
 
     tracing::debug!(
@@ -985,12 +1017,53 @@ async fn push_manifest(
         epoch = %request.epoch,
         needed = missing.len(),
         deletes,
+        refused = refused.len(),
         "push manifest negotiated"
     );
     Ok(Json(PushManifestResponse {
         needed: missing,
         deletes,
+        refused,
     }))
+}
+
+/// Split a listing into what this daemon will index and what it refuses.
+///
+/// The refusal is [`walk::refusal`] — the same function the local observer
+/// screens with, so "never indexed" has one definition whether the paths came
+/// off this machine's disk or off a wire. The pusher-side escape hatch
+/// (`[ingest] allow_secret_paths`) deliberately does **not** apply here: it
+/// lives in a repository this daemon may never have seen, and a backstop a
+/// remote client can talk its way past is not a backstop.
+///
+/// Rebuilds the manifest only when something was actually refused —
+/// [`Manifest::new`] re-sorts and re-checksums, which is real work on a
+/// 300k-entry listing and pure waste in the overwhelmingly common case.
+fn refuse_hard_excludes(project: &str, manifest: Manifest) -> (Manifest, Vec<String>) {
+    let refused: Vec<String> = manifest
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            let pattern = walk::refusal(Utf8Path::new(&entry.path))?;
+            tracing::warn!(
+                project,
+                path = %entry.path,
+                pattern,
+                "refusing a manifest entry this daemon never indexes; it is dropped from the \
+                 accepted listing, and any stored copy is deleted by the commit"
+            );
+            Some(entry.path.clone())
+        })
+        .collect();
+    if refused.is_empty() {
+        return (manifest, refused);
+    }
+    let kept = manifest
+        .entries
+        .into_iter()
+        .filter(|entry| walk::refusal(Utf8Path::new(&entry.path)).is_none())
+        .collect();
+    (Manifest::new(kept), refused)
 }
 
 /// `POST /v1/push/file?project=&session=&epoch=&path=` — stage one needed

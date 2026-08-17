@@ -122,6 +122,13 @@ pub enum PushError {
     ManifestCorrupt,
 
     #[error(
+        "manifest entry `{path}` {reason}; refusing the whole listing, because a client that \
+         sends one path this shape is not implementing the manifest contract and the rest of \
+         its listing cannot be trusted to delete files by absence"
+    )]
+    ManifestMalformed { path: String, reason: &'static str },
+
+    #[error(
         "a manifest for project `{project}` was accepted {since_secs}s ago and this daemon's \
          minimum push interval is {floor_secs}s; pace the pusher at or above the floor \
          (receiver config: `push.min_interval_secs`)"
