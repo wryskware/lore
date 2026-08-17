@@ -36,7 +36,7 @@ A plugin declares, per claimed file extension, one of two **strategies**:
 
 1. **`grammar`** — a tree-sitter grammar compiled to `.wasm`, loaded at
    runtime through the tree-sitter crate's `wasm` feature (wasmtime,
-   sandboxed), plus a mapping that fills the same role vocabulary as the
+   memory-isolated — see the spike's sandboxing caveat), plus a mapping that fills the same role vocabulary as the
    internal `Spec` (`crates/lore/src/chunk/code/mod.rs`): `path_only`,
    `containers`, `symbols`, `wrappers`, `bodies`, `attachments`,
    `trailing_scope` as TOML string arrays, and declarative name extraction
@@ -152,6 +152,58 @@ line replaces "UXML/USS first-class; bounded experimental Unity YAML" with
 "chunker plugin contract"; 5.1's Go/C/C++ backlog item re-points at plugin
 authorship.
 
+## Spike results (2026-08-17): FEASIBLE, with caveats
+
+Worktree spike (branch `worktree-agent-ab7cba9785182e68a`, unmerged), Opus
+agent, findings **parent-verified by re-running the demonstrating binary**:
+tree-sitter 0.26.12's `wasm` feature (wasmtime 36.0.13 via its C API) loads
+`.wasm` grammars at runtime on Windows/MSVC. XML grammar (ABI 14, prebuilt
+release asset) parses sample UXML with `has_error false` and every byte span
+slicing the source exactly; CSS grammar (ABI 15) parses USS including
+`-unity-*` properties. Wasm parse ≈ 1.63× native — noise under the
+embedding-bound budget. Runtime accepts grammar ABI 13..=15.
+
+**Distribution is better than hoped.** Most grammars ship `.wasm` release
+assets (xml, css, c-sharp, yaml, toml, json, rust, python, typescript —
+verified; **hlsl does not**), and where they don't, `tree-sitter build
+--wasm` (CLI 0.26) needs no Emscripten/Docker — it auto-downloads wasi-sdk
+once (~510 MB cached) and builds in under a second. A plugin author's whole
+toolchain is `npm i tree-sitter-cli`.
+
+Caveats and consequences for Phase 1:
+
+- **MSVC toolset prerequisite.** VS 2022 17.2's toolset (14.32) lacks C11
+  `<stdalign.h>` and cannot compile the feature; the spike used a shim
+  header that must not reach `main`. Upgrading VS Build Tools (dev machine
+  *and* CI) is a hard prerequisite. Expect ~40 benign LNK4217 warnings.
+- **Cost is real: +42 s clean build, +10.2 MiB binary, +101 crates**
+  (Cranelift). This settles the former open question: **wasm plugin support
+  goes behind a Cargo feature of core** so grammar-bundled-only builds
+  don't pay it. (The spike crate currently defaults the feature on and sits
+  in the workspace members — flip before any merge.)
+- **Sandboxed means memory-isolated, NOT resource-bounded.** Verified:
+  tree-sitter never arms wasmtime fuel or epoch deadlines, so both trap
+  during its own stdlib instantiation and are unusable; a hostile grammar's
+  external scanner that never returns hangs the thread (reasoned from call
+  sites, not demonstrated). The contract text must not promise timeouts;
+  if bounding a runaway grammar ever matters, that is a killable worker
+  process, not the wasm engine. Declarative-data plugins keep this a
+  malice-only concern, not an accident-prone one.
+- **`Spec::language: fn() -> Language` cannot express a wasm grammar** —
+  a wasm-backed `Language` comes from a fallible call against a live
+  `WasmStore`. The walker itself is grammar-agnostic; only that field and
+  `chunk_code`'s throwaway `Parser::new()` change.
+- **Parser construction becomes stateful per thread.** One shared `Engine`;
+  one `WasmStore` + `Parser` per thread (a store must never be shared, and
+  `set_wasm_store` moves it); `Language` clones freely across stores.
+  Store creation ~7–10 ms + 16–60 ms per-grammar load argues for
+  thread-local pooling, not per-file construction.
+- **Loader validation is cheap and clean:** bad artifacts fail with
+  `WasmErrorKind::Parse`, no panic; grammars must be side modules with a
+  `dylink.0` section (i.e. produced by `tree-sitter build --wasm`).
+  Manifest should carry the expected ABI; gate on `Language::abi_version()`
+  + `is_wasm()` at load.
+
 ## Open questions
 
 > [!open] Declarative name extraction: default to the grammar's `name`
@@ -160,12 +212,13 @@ authorship.
 > (`@definition.*`/`@name` captures, the ecosystem convention many grammars
 > already ship)? Field-based reuses the walker as-is; queries are more
 > expressive and a plausible later convergence target for `Spec` itself.
-> Spike evidence and the first UXML fixture should settle it.
+> The first UXML fixture should settle it.
 
-> [!open] Whether the wasm feature's build cost (wasmtime is a heavy
-> dependency) belongs behind a Cargo feature of core itself, making
-> plugin support opt-in at build time. Depends on the spike's measured
-> build-time/binary-size deltas.
+> [!open] HLSL/ShaderLab for Unity: `tree-sitter-hlsl` publishes no `.wasm`
+> release asset, so the Unity plugin would build its own (cheap, per the
+> spike) — and `.shader` ShaderLab has no obvious grammar at all; likely a
+> `windows` strategy candidate. Scope question for the Unity plugin, not
+> the contract.
 
 > [!open] Whether `windows`-strategy caps may exceed core's global bounds
 > (`MAX_FILE_BYTES` etc.) or only tighten them. Leaning: tighten-only.
@@ -185,7 +238,7 @@ Drafted for Wrysk to promote or edit; not an accepted entry.
 - **Status:** Proposed
 - **Scope:** Chunking extensibility (amends 3.1 file-class table and the 5.1 M2 line; touches D-0004, D-0005, D-0015)
 - **Decided by:** Wrysk (M2 contract session, 2026-08-17)
-- **Decision:** File-type support beyond the built-in set arrives via **declarative chunker plugins**: a manifest plus assets, no plugin code. Strategies: tree-sitter grammars compiled to WASM (loaded sandboxed at runtime, mapped onto the internal Spec walker) and configured line-windowing. Core alone derives chunk IDs, builds embedding headers, and extracts authority metadata; built-ins win extension conflicts and `.md` is never claimable. Per-plugin invalidation via content fingerprint (manifest + assets) folded into the per-file hash. Plugins install daemon-side (receiver-side in remote mode, advertised in the push surface); projects opt in via `.lore.toml`; absent-plugin fallback is surfaced in `status`, never silent. Unity support (UXML/USS/serialized YAML) ships as the first out-of-tree plugin, not as core features. In-tree language chunkers are marked for migration (feature-gate, then plugin crates); Markdown stays native.
+- **Decision:** File-type support beyond the built-in set arrives via **declarative chunker plugins**: a manifest plus assets, no plugin code. Strategies: tree-sitter grammars compiled to WASM (loaded at runtime, memory-isolated, mapped onto the internal Spec walker) and configured line-windowing. Wasm plugin support is a Cargo feature of core. Core alone derives chunk IDs, builds embedding headers, and extracts authority metadata; built-ins win extension conflicts and `.md` is never claimable. Per-plugin invalidation via content fingerprint (manifest + assets) folded into the per-file hash. Plugins install daemon-side (receiver-side in remote mode, advertised in the push surface); projects opt in via `.lore.toml`; absent-plugin fallback is surfaced in `status`, never silent. Unity support (UXML/USS/serialized YAML) ships as the first out-of-tree plugin, not as core features. In-tree language chunkers are marked for migration (feature-gate, then plugin crates); Markdown stays native.
 - **Rationale:** Data-only plugins make the brief's constraints structural instead of policed; the measured embedding-bound perf budget absorbs wasm parse cost; WASM grammars are single-artifact and sandboxed where native DLLs are neither.
 - **Supersedes:** None (amends the 3.1/5.1 prose listed in Scope).
 - **Canonical sources:** [[../3_Retrieval/2026-08-17_chunker-plugin-contract]]; [[../3_Retrieval/2026-08-16_pluggable-chunkers-brief]]
@@ -193,17 +246,19 @@ Drafted for Wrysk to promote or edit; not an accepted entry.
 
 ## Implementation plan
 
-- **Phase 0 — spike (running, 2026-08-17).** tree-sitter 0.26 `wasm`
-  feature on MSVC: load an XML grammar from `.wasm`, parse sample UXML,
-  span exactness, build-time/size deltas, grammar-sourcing friction.
-  Outcome feeds the open questions above; an infeasible verdict reopens
-  the mechanism fork (native grammar DLLs are the named fallback).
-- **Phase 1 — core seam (lore repo).** Plugin registry + manifest parsing;
-  routing in `chunk_file` after built-ins, before fallback; fingerprint in
-  the indexer file hash; `status`/push-surface advertisement; fallback
-  counters; `lore plugin list/add`. Fixture-driven tests with a toy plugin
-  checked into the test tree. Test authoring is its own pass per working
-  rules.
+- **Phase 0 — spike. DONE (2026-08-17): FEASIBLE**, results above. Spike
+  code stays on its unmerged worktree branch as Phase 1 reference (it
+  carries the MSVC shim and a default-on wasm feature that must not merge
+  as-is).
+- **Phase 1 — core seam (lore repo).** Prerequisite: VS Build Tools
+  upgrade (dev + CI) for `<stdalign.h>`. Plugin registry + manifest
+  parsing; routing in `chunk_file` after built-ins, before fallback;
+  `Spec` grows a wasm-language source + thread-local `WasmStore`/parser
+  pooling; ABI gate at load; fingerprint in the indexer file hash;
+  `status`/push-surface advertisement; fallback counters; `lore plugin
+  list/add`; wasm support behind a core Cargo feature. Fixture-driven
+  tests with a toy plugin checked into the test tree. Test authoring is
+  its own pass per working rules.
 - **Phase 2 — Unity plugin (new repo, e.g. `wryskware/lore-unity`).**
   Wrysk authors this later, post-cutoff, as the contract's first real
   consumer: XML/CSS wasm grammars, UXML/USS mappings, windowed serialized
