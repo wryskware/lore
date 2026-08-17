@@ -187,29 +187,39 @@ better to go than re-proposing following.
 > reach into the subtree it just mounted, so the owner could not scope what
 > they had added.
 >
-> **Answered, 2026-08-17 (Wrysk): composition, localmost wins.** This was
-> filed as an either/or and that framing was wrong — the rule already exists
-> and this is just another rung of it. D-0020's stack *composes*: a lower
-> source stands wherever a higher one is silent, and the more local file wins
-> where they conflict. That is already true of user-level versus project
-> (`a_project_file_inherits_the_user_level_rules_it_is_silent_about`) and
-> already true *within* a project, where a nested `.loreignore` governs its own
-> subtree (`loreignore_nests_like_gitignore`). A mounted tree is one more
-> level of the same nesting, not a new regime.
+> **Answered, 2026-08-17 (Wrysk): compose *within* a source root, never
+> across.** Filing this as "whose file governs the mount" was the wrong
+> question, and an intermediate answer here — that the declaring project's
+> rules reach into the mount — was wrong too. The rule is:
 >
-> So: the declaring project's `.loreignore` reaches into the mount, and the
-> mounted tree's own `.loreignore` nests beneath it and wins locally. The
-> owner can scope what they mounted; the mounted tree can still exclude its own
-> build output without the declaring project having to know about it.
+> - **Within a source root, rules compose and the most local wins.** A
+>   `.loreignore` in an ordinary subfolder is respected on top of that root's
+>   own `.loreignore`, exactly as `.gitignore` nests. Already true and already
+>   pinned (`loreignore_nests_like_gitignore`), plus the machine-wide rung
+>   beneath it (`a_project_file_inherits_the_user_level_rules_it_is_silent_about`).
+> - **Across source roots, nothing is inherited in either direction.** A
+>   `[[sources]]` entry is treated as **ad hoc — an independent root**. The
+>   declaring project's `.loreignore` does not reach into it, and its rules do
+>   not leak back out.
 >
-> **The implementation constraint that falls out of this is the load-bearing
-> part:** a mount cannot be walked as an independent root with its own fresh
-> rule stack, because `current_dir(root)` and the crate's per-directory matcher
-> would rebase the whole stack at the mount and the declaring project's rules
-> would never be consulted. Either the walk is single-rooted with mounts
-> grafted in, or the parent's rules are explicitly rebased across the `mount`
-> prefix before the mount's own walk begins. Anything that "just walks the
-> other path" gets this wrong silently.
+> The two halves are one principle: rules travel *down* a root, never *between*
+> roots. A mounted tree is somebody else's directory that this project happens
+> to name; inheriting into it would be the declaring project reaching across a
+> boundary it does not own, which is the same instinct D-0021 refuses for
+> links.
+>
+> **This makes the implementation the easy shape rather than the hard one.**
+> Each source root gets its own walk with `current_dir` at that root and its
+> own matcher stack — which is what the `ignore` crate does naturally, and what
+> an earlier draft of this note wrongly warned against. Nothing needs rebasing
+> across a `mount` prefix.
+>
+> **It also depends on `parents(false)`** (shipped): with ancestor scanning on,
+> a mount at `../shared-engine` would pick up ignore files from `..` and above
+> — possibly including the declaring project's own parent — and "independent
+> root" would be nominal rather than real. The machine-wide `loreignore` still
+> applies to every root, because it is added explicitly as the lowest rung
+> rather than discovered by walking upward.
 
 If an intermediate mode is ever wanted, the only acceptable one is
 `follow_symlinks = "within-project"` — canonicalizing targets, requiring them
