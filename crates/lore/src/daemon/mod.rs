@@ -78,12 +78,20 @@ pub fn discover(data_dir: &camino::Utf8Path) -> Result<Option<Handshake>> {
 /// change. A project literally named "7" therefore shadows id 7 — acceptable,
 /// and the alternative (id-first) would let a rename silently retarget a
 /// human's command.
+///
+/// The name comparison is case-folded ([`crate::registry::name_key`]), matching
+/// the uniqueness rule that admitted the name in the first place: `--project
+/// LORE` has to find `lore`, because the registry would have refused a second
+/// project by that name and so there is nothing else it could mean.
 pub fn resolve_project<'a>(projects: &'a [Project], key: &str) -> Option<&'a Project> {
-    projects.iter().find(|p| p.name == key).or_else(|| {
-        key.parse::<i64>()
-            .ok()
-            .and_then(|id| projects.iter().find(|p| p.id == id))
-    })
+    projects
+        .iter()
+        .find(|p| p.name.eq_ignore_ascii_case(key))
+        .or_else(|| {
+            key.parse::<i64>()
+                .ok()
+                .and_then(|id| projects.iter().find(|p| p.id == id))
+        })
 }
 
 /// Resolve by stable opaque key — exact, unambiguous, and unaffected by
@@ -91,6 +99,10 @@ pub fn resolve_project<'a>(projects: &'a [Project], key: &str) -> Option<&'a Pro
 /// resolver that accepted names *and* keys would reintroduce exactly the
 /// ambiguity the key exists to remove, the moment someone names a project
 /// after another project's key.
+///
+/// Exact, not folded: a key is an opaque handle rather than a human's word for
+/// the project, and it is already lowercase ASCII by construction
+/// ([`crate::registry::slug`]), so there is no case for folding to reconcile.
 pub fn resolve_project_key<'a>(projects: &'a [Project], key: &str) -> Option<&'a Project> {
     projects.iter().find(|p| p.key == key)
 }

@@ -315,9 +315,13 @@ async fn status(
 
     // Scoping the report, when asked. Identity is matched the same three ways
     // everything else accepts a project (name, key, id), so a caller holding
-    // any of them can narrow without first translating it.
+    // any of them can narrow without first translating it — and the name is
+    // folded exactly as `resolve_project` folds it, because this route is also
+    // how `lore-mcp` resolves a `LORE_PROJECT` pin.
     if let Some(wanted) = query.project.as_deref() {
-        projects.retain(|p| p.name == wanted || p.key == wanted || p.id.to_string() == wanted);
+        projects.retain(|p| {
+            p.name.eq_ignore_ascii_case(wanted) || p.key == wanted || p.id.to_string() == wanted
+        });
         if projects.is_empty() {
             return Err(ApiErr::not_found(format!(
                 "unknown project `{wanted}`; {NAME_A_PROJECT}"
@@ -333,14 +337,18 @@ async fn status(
         // said>`, which may be a name or a key; matching the scoped project's
         // own identifiers keeps the row visible either way.
         latency: {
-            let identifiers: Vec<&str> = projects
-                .iter()
-                .flat_map(|p| [p.name.as_str(), p.key.as_str()])
-                .collect();
+            // The label is whatever the request said, so a name is matched the
+            // same folded way it was resolved; a key is opaque and matched
+            // exactly.
+            let names_a_kept_project = |label: &str| {
+                projects
+                    .iter()
+                    .any(|p| p.name.eq_ignore_ascii_case(label) || p.key == label)
+            };
             let mut latency = state.latency.snapshot();
             latency.retain(|l| match l.endpoint.split_once(':') {
                 None => true, // global endpoints always
-                Some((_, project)) => query.project.is_some() && identifiers.contains(&project),
+                Some((_, project)) => query.project.is_some() && names_a_kept_project(project),
             });
             latency
         },
@@ -409,12 +417,17 @@ async fn register_project(
             .await
             .map_err(|err| ApiErr::internal("register", err))?
             .map_err(|err| match err {
-                RegisterError::NameTaken { name, held_by } => ApiErr::conflict(format!(
-                    "a project named `{name}` is already registered at {held_by}, so {root} \
-                     cannot also claim it: a project's identity is the name it is registered \
-                     under, and one name binds to one root. Register this one under a \
-                     different name with `lore add <path> --name <name>` (or edit that repo's \
-                     .lore.toml), or free the name with `lore remove {name}`"
+                RegisterError::NameTaken {
+                    name,
+                    held_name,
+                    held_by,
+                } => ApiErr::conflict(format!(
+                    "a project named `{held_name}` is already registered at {held_by}, so {root} \
+                     cannot also claim `{name}`: a project's identity is the name it is \
+                     registered under, names are compared without regard to case, and one name \
+                     binds to one root. Register this one under a different name with \
+                     `lore add <path> --name <name>` (or edit that repo's .lore.toml), or free \
+                     the name with `lore remove {held_name}`"
                 )),
                 RegisterError::Store(err) => ApiErr::internal("register", err),
             })?

@@ -161,10 +161,17 @@ pub struct ProjectSpec {
 /// one method can produce onto every `match` in the crate.
 #[derive(Debug, thiserror::Error)]
 pub enum RegisterError {
-    /// D-0016: one declared name binds to one root.
-    #[error("a project named `{name}` is already registered at {held_by}")]
+    /// D-0016: one declared name binds to one root, compared without regard to
+    /// case ([`crate::registry::name_key`]).
+    #[error("a project named `{held_name}` is already registered at {held_by}")]
     NameTaken {
+        /// The name as the caller spelled it. Only differs from `held_name` in
+        /// case — which is the whole reason both are carried.
         name: String,
+        /// The name as it is actually stored. What every message must show:
+        /// telling a user their `Lore` is taken while the registry says `lore`
+        /// sends them looking for the wrong thing.
+        held_name: String,
         /// The root that already holds the name — what makes the refusal
         /// actionable.
         held_by: Utf8PathBuf,
@@ -525,7 +532,10 @@ impl Store {
     /// D-0016 makes a project's identity its registry-bound declared name, so
     /// binding one name to two roots is not a cosmetic clash — it is two
     /// projects with one identity, and `expand(project, chunk_id)` then
-    /// resolves the wrong source or 404s (S1#3).
+    /// resolves the wrong source or 404s (S1#3). The comparison is case-folded
+    /// ([`crate::registry::name_key`]), so `Lore` cannot slip past a registered
+    /// `lore`; on the *same* root a case variant is a rename like any other,
+    /// and the new spelling is stored.
     ///
     /// The refusal used to be a pre-flight query in the HTTP handler, one
     /// store acquisition before the one that wrote the row. Under
@@ -546,10 +556,11 @@ impl Store {
         name: &str,
     ) -> std::result::Result<ProjectId, RegisterError> {
         let registered = self.list_projects()?;
-        if let Some(held_by) = crate::registry::name_holder(&registered, root, name) {
+        if let Some(holder) = crate::registry::name_holder(&registered, root, name) {
             return Err(RegisterError::NameTaken {
                 name: name.to_string(),
-                held_by: held_by.to_path_buf(),
+                held_name: holder.name.clone(),
+                held_by: holder.root.clone(),
             });
         }
         Ok(self.upsert_project(root, name, None, SourceKind::Repo)?)

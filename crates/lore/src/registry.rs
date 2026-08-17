@@ -47,6 +47,11 @@
 //! in [`crate::store::Store::register_project`]); reconciliation, which has to
 //! accept whatever a hand-edited manifest says, renames the later duplicate
 //! instead.
+//!
+//! Uniqueness — and every lookup by name — is **case-folded**, platform
+//! independently, by [`name_key`]: `Lore` and `lore` are one identity wherever
+//! the registry is read. The stored spelling is whatever the user typed and is
+//! what every display and error message shows.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher, RandomState};
@@ -314,9 +319,11 @@ fn apply(store: &mut Store, data_dir: &Utf8Path, manifest: Manifest) -> Result<R
     let known: HashMap<String, ProjectId> =
         before.iter().map(|p| (root_key(&p.root), p.id)).collect();
     let mut taken: HashSet<String> = HashSet::new();
-    // Display names already claimed, and by which root — the root is what
-    // makes the warning actionable.
-    let mut named: HashMap<String, Utf8PathBuf> = HashMap::new();
+    // Display names already claimed, keyed by their folded identity
+    // ([`name_key`]) and carrying the spelling and root that claimed it — the
+    // spelling because the warning must show what is actually stored, the root
+    // because that is what makes the warning actionable.
+    let mut named: HashMap<String, (String, Utf8PathBuf)> = HashMap::new();
 
     let mut listed: HashSet<String> = HashSet::new();
     let mut normalized: Vec<ManifestEntry> = Vec::with_capacity(manifest.projects.len());
@@ -345,19 +352,30 @@ fn apply(store: &mut Store, data_dir: &Utf8Path, manifest: Manifest) -> Result<R
         // deterministically, loudly, and in a way that round-trips — the
         // manifest is rewritten below, so the next start sees distinct names
         // and changes nothing.
-        if let Some(first) = named.get(&entry.name) {
+        //
+        // "Duplicate" is the folded comparison, for the same reason
+        // registration's is: `lore` and `Lore` in one manifest are one identity
+        // and would resolve ambiguously, so the later one is renamed rather
+        // than admitted as a near-twin.
+        if let Some((first_name, first_root)) = named.get(&name_key(&entry.name)) {
             let clashed = entry.name.clone();
+            let (first_name, first_root) = (first_name.clone(), first_root.clone());
             entry.name = distinct_name(&clashed, &named);
             tracing::warn!(
                 name = %clashed,
-                first_claimed_by = %first,
+                first_claimed_as = %first_name,
+                first_claimed_by = %first_root,
                 renamed_to = %entry.name,
                 root = %entry.root,
-                "two projects in the registry claim one display name; renaming the later one. \
-                 Edit projects.toml (or that repo's .lore.toml) to give it a name you chose"
+                "two projects in the registry claim one display name (names are compared \
+                 without regard to case); renaming the later one. Edit projects.toml (or that \
+                 repo's .lore.toml) to give it a name you chose"
             );
         }
-        named.insert(entry.name.clone(), entry.root.clone());
+        named.insert(
+            name_key(&entry.name),
+            (entry.name.clone(), entry.root.clone()),
+        );
         if entry.key.is_empty() || !taken.insert(entry.key.clone()) {
             if !entry.key.is_empty() {
                 tracing::warn!(key = %entry.key, root = %entry.root, "duplicate project key in the registry; reassigning");
@@ -422,10 +440,13 @@ fn apply(store: &mut Store, data_dir: &Utf8Path, manifest: Manifest) -> Result<R
 /// name that is itself already taken, so the result is unique however odd the
 /// manifest is — and it is a function of the manifest's order alone, so
 /// reconciling the same file twice produces the same names.
-fn distinct_name(name: &str, taken: &HashMap<String, Utf8PathBuf>) -> String {
+///
+/// `taken` is keyed by [`name_key`], so candidates are checked folded: a
+/// manifest already holding `lore (2)` does not also get a `Lore (2)`.
+fn distinct_name(name: &str, taken: &HashMap<String, (String, Utf8PathBuf)>) -> String {
     (2..)
         .map(|n| format!("{name} ({n})"))
-        .find(|candidate| !taken.contains_key(candidate))
+        .find(|candidate| !taken.contains_key(&name_key(candidate)))
         .expect("an unbounded sequence contains a free name")
 }
 
@@ -440,6 +461,34 @@ pub fn publish(store: &Store, data_dir: &Utf8Path) -> Result<()> {
             projects: projects.iter().map(ManifestEntry::from).collect(),
         },
     )
+}
+
+/// Comparison key for a **declared name**, which under D-0016 is the project's
+/// identity: `Lore` and `lore` are one project, and the second claimant is
+/// refused rather than admitted as a near-twin.
+///
+/// # Why this is not [`root_key`]
+///
+/// `root_key` follows the *platform's* rules, because a path means whatever the
+/// filesystem under it says it means. A name means what Lore says it means, and
+/// it has to mean the same thing everywhere: D-0015 puts indexes on machines
+/// other than the one that minted the name, and a manifest that round-trips
+/// through a Linux daemon must not silently split one project in two. So this
+/// folds identically on every OS, and reusing the Windows-only path folding
+/// here would be a bug rather than a shortcut.
+///
+/// # Why ASCII only
+///
+/// `Lore`/`lore` is the collision users actually hit. Full Unicode case folding
+/// would make identity depend on the Unicode tables each build links, which is a
+/// far worse property for something that is supposed to be stable across
+/// machines and versions — so `Straße` and `STRASSE` remain two names. Revisit
+/// if non-ASCII project names ever show up in practice.
+///
+/// The key is a comparison artifact only: it is never stored and never
+/// displayed. Display always preserves the case the user typed.
+pub fn name_key(name: &str) -> String {
+    name.to_ascii_lowercase()
 }
 
 /// Comparison key for a root path, matching [`crate::daemon::paths`]'s
@@ -457,29 +506,32 @@ fn root_key(root: &Utf8Path) -> String {
     }
 }
 
-/// The root of the project already bound to `name`, if it is a *different*
-/// root than `root`.
+/// The project already holding `name`, if it is a *different* root than `root`.
 ///
 /// This is the lookup behind registration's duplicate-name refusal. D-0016
 /// makes a project's identity its registry-bound declared name, so a name is
 /// held by exactly one root and a second claimant is refused rather than
 /// disambiguated; re-registering the same root under the same name is not a
-/// collision with itself, which is what the root comparison excludes.
+/// collision with itself, which is what the root comparison excludes — and
+/// because the comparison is [`name_key`]-folded, re-registering the same root
+/// as `Lore` when it is stored as `lore` is a *rename*, not a collision.
 ///
-/// The conflicting root — not merely the fact of a conflict — is what the
-/// caller needs, because naming it is what makes the refusal actionable
-/// (S1#3: two projects sharing a display name is how a search hit becomes an
-/// `expand` 404).
+/// The whole holder — not merely the fact of a conflict — is what the caller
+/// needs. Its root is what makes the refusal actionable (S1#3: two projects
+/// sharing a display name is how a search hit becomes an `expand` 404), and its
+/// stored name is what the caller must echo, because under case folding the
+/// spelling that holds the name is not necessarily the spelling that was asked
+/// for.
 pub fn name_holder<'a>(
     projects: &'a [Project],
     root: &Utf8Path,
     name: &str,
-) -> Option<&'a Utf8Path> {
+) -> Option<&'a Project> {
     let mine = root_key(root);
+    let wanted = name_key(name);
     projects
         .iter()
-        .find(|project| project.name == name && root_key(&project.root) != mine)
-        .map(|project| project.root.as_path())
+        .find(|project| name_key(&project.name) == wanted && root_key(&project.root) != mine)
 }
 
 #[cfg(test)]

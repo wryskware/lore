@@ -126,8 +126,13 @@ fn a_name_bound_to_another_root_is_refused_and_names_that_root() {
         .register_project(p("D:/work/lore-fork"), "lore")
         .expect_err("a second root cannot claim a bound name");
     match &err {
-        RegisterError::NameTaken { name, held_by } => {
+        RegisterError::NameTaken {
+            name,
+            held_name,
+            held_by,
+        } => {
             assert_eq!(name, "lore");
+            assert_eq!(held_name, "lore");
             assert_eq!(held_by, p("C:/repos/lore"));
         }
         other => panic!("expected a name conflict, got {other:?}"),
@@ -147,6 +152,61 @@ fn a_name_bound_to_another_root_is_refused_and_names_that_root() {
         .register_project(p("D:/work/lore-fork"), "lore")
         .unwrap();
     assert_eq!(store.list_projects().unwrap().len(), 2);
+}
+
+/// D-0016 extended (Wrysk, 2026-08-17): a declared name is one identity however
+/// it is cased, so a second root cannot take the same name in a different
+/// spelling — and the refusal must name the spelling that is actually stored,
+/// or the user goes looking for a `Lore` the registry has never heard of.
+#[test]
+fn a_case_variant_of_a_bound_name_is_refused_and_names_the_stored_spelling() {
+    let dir = TempDir::new().unwrap();
+    let mut store = open(&dir);
+    store.register_project(p("C:/repos/lore"), "lore").unwrap();
+
+    let err = store
+        .register_project(p("D:/work/lore-fork"), "LoRe")
+        .expect_err("case is not identity");
+    match &err {
+        RegisterError::NameTaken {
+            name,
+            held_name,
+            held_by,
+        } => {
+            assert_eq!(name, "LoRe", "the refusal echoes what was asked for");
+            assert_eq!(held_name, "lore", "…and what is actually registered");
+            assert_eq!(held_by, p("C:/repos/lore"));
+        }
+        other => panic!("expected a name conflict, got {other:?}"),
+    }
+    assert_eq!(store.list_projects().unwrap().len(), 1);
+    assert_eq!(store.list_projects().unwrap()[0].name, "lore");
+}
+
+/// The same fold on the *same* root is a rename, not a collision with itself:
+/// the user is restyling their own project's name, and the new spelling is what
+/// gets stored and displayed from then on.
+#[test]
+fn re_registering_one_root_under_a_case_variant_is_a_rename() {
+    let dir = TempDir::new().unwrap();
+    let mut store = open(&dir);
+    let first = store.register_project(p("C:/repos/lore"), "lore").unwrap();
+    let again = store.register_project(p("C:/repos/lore"), "Lore").unwrap();
+
+    assert_eq!(again, first, "still one project");
+    let projects = store.list_projects().unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(
+        projects[0].name, "Lore",
+        "display keeps the case just typed"
+    );
+
+    // And the rename does not free the identity for anyone else.
+    assert!(
+        store
+            .register_project(p("D:/work/lore-fork"), "lore")
+            .is_err()
+    );
 }
 
 // ---------------------------------------------------------------------------

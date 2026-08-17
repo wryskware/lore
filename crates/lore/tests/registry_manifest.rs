@@ -382,6 +382,43 @@ fn a_manifest_with_duplicate_display_names_renames_rather_than_refusing() {
     );
 }
 
+/// Names are one identity however they are cased, so a hand-edited manifest
+/// listing `lore`, `Lore` and `LORE` is three claims on one name and gets the
+/// same deterministic repair. The survivor keeps the spelling it was written
+/// with — folding decides *identity*, never display.
+#[test]
+fn a_manifest_whose_duplicates_differ_only_in_case_is_repaired_the_same_way() {
+    let mut fixture = Fixture::new();
+    registry::write(
+        &fixture.data_dir,
+        &Manifest {
+            projects: vec![
+                entry("lore", "Lore", "C:/repos/lore"),
+                entry("worktree", "lore", "C:/repos/lore-worktree"),
+                entry("bench", "LORE", "C:/repos/lore-bench"),
+            ],
+        },
+    )
+    .unwrap();
+
+    fixture.reconcile();
+    let names: Vec<String> = fixture.rows().into_iter().map(|(name, ..)| name).collect();
+    assert_eq!(names, ["Lore", "lore (2)", "LORE (3)"], "{names:?}");
+
+    // And the repair round-trips: `lore (2)` and `LORE (3)` are themselves
+    // distinct under folding, so a second start changes nothing.
+    fixture.reconcile();
+    assert_eq!(
+        fixture
+            .rows()
+            .into_iter()
+            .map(|(name, ..)| name)
+            .collect::<Vec<_>>(),
+        names,
+        "reconciling twice must not rename anything a second time"
+    );
+}
+
 /// The counter steps over a name that is genuinely taken rather than
 /// colliding with it, so the result is unique whatever the manifest says.
 #[test]

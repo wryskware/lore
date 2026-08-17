@@ -1295,6 +1295,44 @@ async fn a_project_can_be_removed_by_key_and_an_unknown_one_is_a_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// D-0016 extended (Wrysk, 2026-08-17): a declared name is one identity however
+/// it is cased, and the registry refuses a second project by that name — so
+/// every lookup by name has to fold too, or a user who types `LORE` is told
+/// their project does not exist while the daemon can plainly see it.
+///
+/// Every name-keyed route, in one test: registration's refusal, the status
+/// filter (which is also how `lore-mcp` resolves a `LORE_PROJECT` pin), and
+/// `resolve_project` behind the removal route.
+#[tokio::test]
+async fn a_project_is_found_by_any_casing_of_its_name() {
+    let h = harness();
+    let other = tempfile::tempdir().unwrap();
+
+    // A second root cannot take the name in a different spelling, and the 409
+    // shows the spelling that is actually stored.
+    let (status, body) = post(
+        &h.router,
+        "/v1/projects",
+        json!({ "root": other.path().to_string_lossy(), "name": "DEMO" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body:#}");
+    let message = body["message"].as_str().unwrap();
+    assert!(message.contains("`demo`"), "{message}");
+    assert!(message.contains("`DEMO`"), "{message}");
+
+    // Scoping by a case variant narrows to the project, and reports the stored
+    // spelling back.
+    let (status, body) = get(&h.router, "/v1/status?project=DeMo").await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    assert_eq!(body["projects"][0]["name"], "demo");
+
+    // …and so does addressing it in a path segment.
+    let (status, body) = delete(&h.router, "/v1/projects/DEMO").await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    assert_eq!(body["project"]["name"], "demo");
+}
+
 /// Names carry spaces and other characters that would otherwise end the path
 /// segment early; the CLI percent-encodes, and the router has to decode.
 #[tokio::test]
