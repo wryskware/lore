@@ -815,8 +815,9 @@ fn log_skipped_links(project: &Project, links: &BTreeSet<Utf8PathBuf>) {
         project = %project.name,
         links = links.len(),
         paths = %named.join(", "),
-        "symbolic links were not followed; nothing beneath them is indexed \
-         (Windows junctions count as links)"
+        "symbolic links are not followed, so neither they nor anything beneath \
+         them is indexed (D-0021; Windows junctions count as links, and no \
+         `.loreignore` rule can re-include one)"
     );
 }
 

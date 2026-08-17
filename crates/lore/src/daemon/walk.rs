@@ -54,19 +54,37 @@
 //! `.loreignore` rescues a deliberately vendored repository, so precedence is
 //! unchanged.
 //!
-//! ## Links are a boundary too, and a reported one
+//! ## Links do not extend the project (D-0021)
 //!
-//! The walk does not follow symbolic links, and on Windows a directory
-//! **junction** is a symbolic link for this purpose — the platform sets the
-//! reparse-point attribute with a name-surrogate tag and Rust answers
-//! `is_symlink()` for it, so nothing here distinguishes the two.
+//! **Filesystem topology does not define project topology.** Symbolic links
+//! are not followed — not into a directory, not through a link to a file
+//! (which would place one content at two logical paths in a store keyed
+//! `(project, path)`), and emphatically not out of the root, so that no link
+//! can turn a project into an index of `~/secrets` or a company mount. On
+//! Windows a directory **junction** is a symbolic link throughout: the
+//! platform sets the reparse-point attribute with a name-surrogate tag and
+//! Rust answers `is_symlink()` for it, so nothing here distinguishes the two
+//! and no caller has to either.
 //!
-//! Like the repository boundary above, this decides *descent* and is not a
-//! fourth rule source. Unlike it, the thing on the other side may be anywhere
-//! at all, which is why not following is the default: a link is an assertion
-//! about where bytes live, and following one lets a project silently absorb a
-//! tree it does not own — most concretely a second project this daemon already
-//! indexes, chunked twice with the embedding cost paid twice.
+//! Like the repository boundary above this decides *descent* and is not a
+//! fourth rule source. **Unlike it, there is no override**, and the asymmetry
+//! is the point rather than an oversight: a `!` re-include on a vendored
+//! repository answers *whose content is this*, and its bytes are already under
+//! the root so the owner may answer "mine". A `!` on a link would instead
+//! extend the project's *extent* to another part of the filesystem. Same
+//! syntax, different act; they do not share a mechanism. There is no
+//! `follow_symlinks` option and there is not going to be one — it would
+//! arrive with cycles, duplicate aliases, out-of-root escapes, ambiguous rule
+//! semantics for content reachable at two paths, and watches to arm on
+//! targets, all at once.
+//!
+//! Creating, deleting or retargeting a link is an ordinary filesystem event
+//! and is processed like one, so indexed state that has gone stale reconciles.
+//! What is not done is traversing the new target.
+//!
+//! The one link that *is* resolved is the project root itself, once, at
+//! registration ([`paths::canonicalize_root`]) — so what is walked, watched
+//! and compared against is always the physical root.
 //!
 //! What was missing was never the traversal, it was the *account*: a workspace
 //! assembled from junctions indexed its loose files and reported nothing, so it
@@ -194,15 +212,12 @@ pub struct Walk {
 /// is then *partial* — callers must not treat it as the complete truth of
 /// what exists (a prune against it would delete everything unwalked).
 ///
-/// Links are **not followed** and are reported instead, in [`Walk::links`].
-/// The walker sets `follow_links(false)`, so a link is yielded as an entry
-/// whose type is neither file nor directory; without the report it would be
-/// dropped on the floor and a project whose whole content sits behind one
-/// would index its loose files and say nothing about the rest. A Windows
-/// directory *junction* is a link for this purpose — the platform sets the
-/// reparse-point attribute with a name-surrogate tag and Rust's
-/// `FileType::is_symlink` answers true for it, so nothing here distinguishes
-/// the two and no caller has to either.
+/// Links are **not followed** and are reported instead, in [`Walk::links`]
+/// (D-0021 — see the module header for why there is no override). The walker
+/// sets `follow_links(false)`, so a link is yielded as an entry whose type is
+/// neither file nor directory; without the report it would be dropped on the
+/// floor and a project whose whole content sits behind one would index its
+/// loose files and say nothing about the rest.
 pub fn walk_files(
     root: &Utf8Path,
     start: &Utf8Path,
@@ -1024,6 +1039,70 @@ mod tests {
     fn a_tree_without_links_reports_none() {
         let fixture = Fixture::new(&[("src/main.rs", "fn main() {}"), ("keep.md", "# notes")]);
         assert_eq!(fixture.links(), Vec::<String>::new());
+    }
+
+    /// **The asymmetry, pinned** (D-0021). The nested-repository boundary two
+    /// sections up is overridable by a `!` re-include in the sovereign file;
+    /// this one is not, and the difference is deliberate rather than an
+    /// oversight waiting to be tidied up.
+    ///
+    /// A `!` on a vendored repository answers *whose content is this* — its
+    /// bytes are already under the root and the owner may answer "mine". A `!`
+    /// on a link would instead **extend the project's extent to another part
+    /// of the filesystem**, which is a different act wearing the same syntax.
+    ///
+    /// This is also, precisely, what a user tried: `Lexomancy-bench`'s
+    /// `.loreignore` carries `!design/`, `!tools/` and `!Lexomancy/` over three
+    /// junctions, written in the expectation that they would pull the corpus
+    /// in. They are inert, and this test is what keeps them inert.
+    #[cfg(windows)]
+    #[test]
+    fn a_loreignore_reinclude_does_not_rescue_a_link() {
+        let (_keep, target) = elsewhere();
+        let fixture = Fixture::new(&[
+            ("loose.md", "# notes"),
+            // Every spelling a hopeful user would reach for.
+            (".loreignore", "!corpus\n!corpus/\n!corpus/**\n"),
+        ]);
+        junction(&fixture.root.join("corpus"), &target);
+
+        assert_eq!(
+            fixture.walk(),
+            [".loreignore", "loose.md"],
+            "a re-include must not reach through a link the way it reaches \
+             into a vendored repository"
+        );
+        assert_eq!(fixture.links(), ["corpus"]);
+    }
+
+    /// A link to a *file* is not indexed through the link either (D-0021).
+    ///
+    /// Not a special case of the directory rule, and the reason is storage
+    /// rather than traversal: the store is keyed `(project, path)`, so
+    /// indexing the target under the link's path would put one content at two
+    /// logical paths and the same bytes would compete with themselves in the
+    /// rankings.
+    ///
+    /// Skipped rather than failed where the privilege is absent: a *file*
+    /// symlink needs `SeCreateSymbolicLinkPrivilege` (developer mode) on
+    /// Windows, unlike a junction, and a test that fails on an ordinary
+    /// account would be reporting the account rather than the code.
+    #[cfg(windows)]
+    #[test]
+    fn a_link_to_a_file_is_not_indexed_through_the_link() {
+        let fixture = Fixture::new(&[("real.md", "# the genuine article")]);
+        let link = fixture.root.join("alias.md");
+        if std::os::windows::fs::symlink_file(fixture.root.join("real.md"), &link).is_err() {
+            eprintln!("skipping: creating a file symlink needs developer mode");
+            return;
+        }
+        assert!(
+            link.is_file(),
+            "it does resolve; not following it is policy"
+        );
+
+        assert_eq!(fixture.walk(), ["real.md"], "indexed once, under one path");
+        assert_eq!(fixture.links(), ["alias.md"]);
     }
 
     // -----------------------------------------------------------------------

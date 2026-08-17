@@ -163,6 +163,45 @@ mod tests {
         );
     }
 
+    /// The one link the daemon *does* resolve (D-0021): a project root may
+    /// itself be a link, and canonicalizing here is what makes the physical
+    /// root the thing that is walked, watched and compared against.
+    ///
+    /// Everything downstream depends on this happening exactly once, at
+    /// registration: watcher events arrive bearing physical paths, so a root
+    /// stored as the *logical* path would fail every containment check and the
+    /// project would silently never index. That the rule stops here — no other
+    /// link is resolved anywhere — is the whole of D-0021.
+    #[cfg(windows)]
+    #[test]
+    fn a_project_root_that_is_a_link_canonicalizes_to_the_physical_root() {
+        let real = tempfile::tempdir().unwrap();
+        let real = canonicalize_root(real.path()).unwrap();
+        std::fs::write(real.join("keep.rs"), "x").unwrap();
+
+        // The link lives in its own parent, so removing it cannot disturb the
+        // target's tempdir guard.
+        let holder = tempfile::tempdir().unwrap();
+        let holder = canonicalize_root(holder.path()).unwrap();
+        let link = holder.join("logical-root");
+        let out = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J", link.as_str(), real.as_str()])
+            .output()
+            .expect("mklink is available");
+        assert!(out.status.success(), "mklink /J failed: {out:?}");
+
+        let registered = canonicalize_root(link.as_std_path()).unwrap();
+        assert_eq!(registered, real, "registration resolves the root");
+        // And the resolved form is what containment answers about — the
+        // logical path would have matched nothing.
+        let event = real.join("keep.rs");
+        assert_eq!(
+            relative_to(&registered, &event).unwrap().as_str(),
+            "keep.rs"
+        );
+        assert_eq!(relative_to(&link, &event), None);
+    }
+
     #[test]
     fn data_dir_containment_covers_self_and_children() {
         let dir = camino::Utf8Path::new(r"C:\data\lore");

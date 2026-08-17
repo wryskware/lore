@@ -609,3 +609,96 @@ fn a_pass_over_a_tree_without_links_reports_none() {
     let summary = full_scan(&fixture.context(), &fixture.project);
     assert_eq!(summary.links_skipped, 0, "{summary:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Links: the incremental path must agree with the full scan (D-0021)
+//
+// The nasty case this seam exists to kill. The watcher is deliberately dumb —
+// it names paths no walk produced and does no IO of its own — so a path
+// *behind* a link reaches the indexer looking like any other path, and
+// `std::fs::metadata` resolves it perfectly happily. If the incremental path
+// indexed it, the next full scan would delete it, and the pair would fight
+// forever.
+// ---------------------------------------------------------------------------
+
+/// Build a real junction, or explain the failure. Directory junctions need no
+/// privilege, which is why assembled workspaces use them and why a test can
+/// rely on one.
+#[cfg(windows)]
+fn junction(link: &camino::Utf8Path, target: &camino::Utf8Path) {
+    let out = std::process::Command::new("cmd")
+        .args(["/c", "mklink", "/J", link.as_str(), target.as_str()])
+        .output()
+        .expect("mklink is available");
+    assert!(out.status.success(), "mklink /J failed: {out:?}");
+}
+
+/// The named case: a watcher batch naming paths behind a link indexes nothing.
+///
+/// Both shapes a debounced batch can produce — the link itself (a directory
+/// event) and a file underneath it — because the watcher cannot tell them
+/// apart and neither may get through.
+#[cfg(windows)]
+#[test]
+fn a_watcher_batch_naming_a_path_behind_a_link_indexes_nothing() {
+    let corpus = tempfile::tempdir().unwrap();
+    let corpus = camino::Utf8Path::from_path(corpus.path()).unwrap();
+    std::fs::write(corpus.join("behind.md"), "# would be a duplicate").unwrap();
+
+    let fixture = Fixture::new("demo");
+    fixture.write("loose.md", "# the only real file");
+    junction(&fixture.root.join("corpus"), corpus);
+    // The fixture is not vacuous: the path really does resolve to content.
+    assert!(fixture.root.join("corpus/behind.md").is_file());
+
+    let summary = index_paths(
+        &fixture.context(),
+        &fixture.project,
+        &paths(&["corpus", "corpus/behind.md"]),
+    );
+
+    assert_eq!(summary.indexed, 0, "{summary:?}");
+    assert_eq!(summary.errors, 0, "refusing is not an error condition");
+    assert!(
+        fixture.indexed_paths().is_empty(),
+        "{:?}",
+        fixture.indexed_paths()
+    );
+
+    // And the full scan agrees, which is the whole property: one evaluator,
+    // two entry points, one verdict.
+    full_scan(&fixture.context(), &fixture.project);
+    assert_eq!(fixture.indexed_paths(), ["loose.md"]);
+}
+
+/// A link appearing where real content used to be reconciles the stale rows
+/// rather than orphaning them.
+///
+/// This is the other half of "process the event, do not traverse the target":
+/// the batch is handled normally, the walker refuses the new link, the paths
+/// are absent from the micro-manifest — and being in its scope, they are
+/// deleted. An index that merely *stopped updating* those rows would keep
+/// serving content that is no longer part of the project.
+#[cfg(windows)]
+#[test]
+fn a_link_dropped_over_indexed_content_prunes_it() {
+    let elsewhere = tempfile::tempdir().unwrap();
+    let elsewhere = camino::Utf8Path::from_path(elsewhere.path()).unwrap();
+    std::fs::write(elsewhere.join("other.md"), "# somebody else's tree").unwrap();
+
+    let fixture = Fixture::new("demo");
+    fixture.write("loose.md", "# stays");
+    fixture.write("corpus/real.md", "# genuinely part of the project");
+    full_scan(&fixture.context(), &fixture.project);
+    assert_eq!(fixture.indexed_paths(), ["corpus/real.md", "loose.md"]);
+
+    // Swap the real directory for a junction of the same name.
+    fixture.remove_dir("corpus");
+    junction(&fixture.root.join("corpus"), elsewhere);
+
+    let summary = index_paths(&fixture.context(), &fixture.project, &paths(&["corpus"]));
+
+    assert_eq!(summary.removed, 1, "{summary:?}");
+    assert_eq!(summary.indexed, 0, "and nothing from the new target");
+    assert_eq!(fixture.indexed_paths(), ["loose.md"]);
+}
