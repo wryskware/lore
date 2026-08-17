@@ -22,10 +22,15 @@
 //!   `UXML`), matching how [`crate::chunk`] derives an extension from a path.
 //! * `grammar` names an asset **relative to the plugin root**; absolute paths
 //!   and `..` are refused so a manifest cannot reach outside its own directory.
-//! * `symbol` defaults to `language_tag` with `-` folded to `_`. A `.wasm`
-//!   grammar is loaded by its exported `tree_sitter_<symbol>` function, which
-//!   is usually the language tag but not always (`c_sharp` vs `csharp`), so it
-//!   is overridable and defaulted rather than derived from the file name.
+//! * `symbol` defaults to the `grammar` file's stem, with any `tree-sitter-` /
+//!   `tree_sitter_` prefix stripped and `-` folded to `_` (`xml.wasm` and
+//!   `tree-sitter-xml.wasm` both give `xml`, loaded as `tree_sitter_xml`). It
+//!   names the *grammar*, and so does the artifact's file name; `language_tag`
+//!   names the *format* and deliberately need not agree — the first real
+//!   plugin tags UXML as `uxml` while parsing it with `tree_sitter_xml`, and
+//!   defaulting from the tag would have made an explicit `symbol` mandatory
+//!   for every such plugin. An explicit `symbol` still wins, for the grammar
+//!   whose export does not match its file name.
 //! * Windows caps are **tighten-only** against the core constants, resolving
 //!   the contract's open question in the direction it was leaning: a plugin may
 //!   make Lore read less of a file, never more.
@@ -158,7 +163,7 @@ fn grammar_strategy(toml: GrammarToml, at: &dyn Fn(&str) -> String) -> Result<St
     }
     let symbol = match toml.symbol {
         Some(symbol) => symbol.trim().to_string(),
-        None => language_tag.replace('-', "_"),
+        None => default_symbol(&grammar),
     };
     if !symbol
         .bytes()
@@ -185,6 +190,20 @@ fn grammar_strategy(toml: GrammarToml, at: &dyn Fn(&str) -> String) -> Result<St
         name_field: toml.name_field.unwrap_or_else(|| "name".to_string()),
         name_kinds: toml.name_kinds,
     })))
+}
+
+/// The `symbol` default: the grammar file's stem names the grammar, which is
+/// what the export is named after. The `tree-sitter-` prefix is stripped
+/// because the loader adds `tree_sitter_` itself and a release asset published
+/// under its repository name (`tree-sitter-xml.wasm`) would otherwise ask for
+/// `tree_sitter_tree_sitter_xml`.
+fn default_symbol(grammar: &Utf8Path) -> String {
+    let stem = grammar.file_stem().unwrap_or_default();
+    let stem = stem
+        .strip_prefix("tree-sitter-")
+        .or_else(|| stem.strip_prefix("tree_sitter_"))
+        .unwrap_or(stem);
+    stem.replace('-', "_")
 }
 
 fn windows_strategy(toml: WindowsToml, at: &dyn Fn(&str) -> String) -> Result<Strategy, String> {
@@ -426,7 +445,7 @@ name_kinds = ["Name"]
         };
         assert_eq!(manifest.chunkers[0].extensions, ["uxml"]);
         assert_eq!(grammar.grammar, "xml.wasm");
-        // `symbol` defaults to the language tag: `tree_sitter_xml`.
+        // `symbol` defaults to the grammar file's stem: `tree_sitter_xml`.
         assert_eq!(grammar.symbol, "xml");
         assert_eq!(grammar.name_field, "name");
         assert_eq!(grammar.name_kinds, ["Name"]);
@@ -563,24 +582,41 @@ language_tag = "yaml"
         assert!(parse_str(&GRAMMAR.replace("\"xml.wasm\"", "\"grammars/xml.wasm\"")).is_ok());
     }
 
-    #[test]
-    fn the_grammar_symbol_defaults_to_the_tag_but_can_be_overridden() {
-        let manifest = parse_str(
-            &GRAMMAR
-                .replace("language_tag = \"xml\"", "language_tag = \"c-sharp\"")
-                .to_string(),
-        )
-        .unwrap();
+    fn grammar_of(src: &str) -> GrammarChunker {
+        let manifest = parse_str(src).unwrap();
         let Strategy::Grammar(grammar) = &manifest.chunkers[0].strategy else {
-            panic!()
+            panic!("expected a grammar strategy")
         };
-        assert_eq!(grammar.symbol, "c_sharp");
+        (**grammar).clone()
+    }
 
-        let manifest = parse_str(&format!("{GRAMMAR}symbol = \"c_sharp\"\n")).unwrap();
-        let Strategy::Grammar(grammar) = &manifest.chunkers[0].strategy else {
-            panic!()
-        };
-        assert_eq!(grammar.symbol, "c_sharp");
-        assert_eq!(grammar.language_tag, "xml");
+    #[test]
+    fn the_grammar_symbol_defaults_to_the_file_stem_but_can_be_overridden() {
+        // The tag names the *format* and the file names the *grammar*, so a
+        // plugin may tag UXML as `uxml` and still load `tree_sitter_xml`
+        // without an override. The tag does not participate in the default.
+        let uxml =
+            grammar_of(&GRAMMAR.replace("language_tag = \"xml\"", "language_tag = \"uxml\""));
+        assert_eq!(uxml.symbol, "xml");
+        assert_eq!(uxml.language_tag, "uxml");
+
+        // A release asset published under its repository name: the loader adds
+        // `tree_sitter_` itself, so the prefix in the stem is stripped rather
+        // than doubled. Directories play no part; `-` folds to `_`.
+        for (file, symbol) in [
+            ("tree-sitter-xml.wasm", "xml"),
+            ("grammars/tree_sitter_xml.wasm", "xml"),
+            ("tree-sitter-c-sharp.wasm", "c_sharp"),
+            ("c-sharp.wasm", "c_sharp"),
+        ] {
+            let grammar = grammar_of(&GRAMMAR.replace("\"xml.wasm\"", &format!("\"{file}\"")));
+            assert_eq!(grammar.symbol, symbol, "{file}");
+        }
+
+        // An explicit symbol still wins — the grammar whose export matches
+        // neither its file name nor its tag — and leaves the tag alone.
+        let explicit = grammar_of(&format!("{GRAMMAR}symbol = \"c_sharp\"\n"));
+        assert_eq!(explicit.symbol, "c_sharp");
+        assert_eq!(explicit.language_tag, "xml");
     }
 }
