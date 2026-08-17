@@ -132,7 +132,7 @@ fn scan_headings(src: &str, from: usize) -> Vec<Heading> {
                 {
                     out.push(Heading {
                         level: level as u8,
-                        title: rest.trim().trim_end_matches('#').trim().to_string(),
+                        title: atx_title(rest),
                         start: pos,
                         body_start: end,
                     });
@@ -143,6 +143,27 @@ fn scan_headings(src: &str, from: usize) -> Vec<Heading> {
         pos = end;
     }
     out
+}
+
+/// The heading text of an ATX heading, given everything after its opening
+/// `#` run.
+///
+/// CommonMark §4.2: a run of trailing `#`s is a *closing sequence* — and so
+/// not part of the text — only when it is preceded by a space or tab, or when
+/// it is the entire content. Trimming unconditionally cost `# Learning C#`
+/// its `#`, which then propagated into `heading_path`, the chunk anchor and
+/// hence the derived id, and into the embedded text.
+fn atx_title(rest: &str) -> String {
+    let content = rest.trim();
+    let opened = content.trim_end_matches('#');
+    if opened.is_empty() {
+        // `## ###` — all closing sequence, no text.
+        return String::new();
+    }
+    match opened.len() < content.len() && opened.ends_with([' ', '\t']) {
+        true => opened.trim_end().to_string(),
+        false => content.to_string(),
+    }
 }
 
 /// Minimal YAML subset: top-level `key: value`, block sequences (`  - item`)
@@ -253,4 +274,49 @@ fn clean(value: &str) -> String {
         .trim_end_matches("]]")
         .trim()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CommonMark §4.2's closing-sequence rule, including the cases that made
+    /// the unconditional trim wrong: a `#` that is part of the *name*.
+    #[test]
+    fn atx_closing_sequences_are_trimmed_only_when_commonmark_says_so() {
+        for (line, want) in [
+            ("# Title", "Title"),
+            // Closing sequences: preceded by a space or tab.
+            ("## Wrap-up ###", "Wrap-up"),
+            ("# foo #", "foo"),
+            ("# foo \t##", "foo"),
+            ("# C# #", "C#"),
+            // Entirely a closing sequence, so the heading has no text.
+            ("### ###", ""),
+            ("#", ""),
+            // Not closing sequences: nothing but text in front of the run.
+            ("# Learning C#", "Learning C#"),
+            ("# C#", "C#"),
+            ("# foo#", "foo#"),
+            ("## F#, C# and friends", "F#, C# and friends"),
+        ] {
+            let src = format!("{line}\n\nbody\n");
+            let headings = scan_headings(&src, 0);
+            assert_eq!(headings.len(), 1, "{line:?} is one heading");
+            assert_eq!(headings[0].title, want, "{line:?}");
+        }
+    }
+
+    /// A corrupted title does not stay in `scan_headings`: it flows into the
+    /// chunk's `heading_path`, which is both the anchor the id derives from
+    /// and part of what gets embedded.
+    #[test]
+    fn a_hash_in_a_heading_name_survives_into_the_heading_path() {
+        let path = Utf8PathBuf::from("notes.md");
+        let chunks = chunk_markdown(&path, "# Learning C#\n\nSome prose.\n", None);
+        let crate::types::ChunkKind::Section { heading_path, .. } = &chunks[0].kind else {
+            panic!("markdown emits sections")
+        };
+        assert_eq!(heading_path, &["Learning C#".to_string()]);
+    }
 }
