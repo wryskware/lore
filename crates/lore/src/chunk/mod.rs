@@ -40,7 +40,14 @@ use crate::types::Chunk;
 /// next changed. This bump converges every file in one CPU-only re-chunk pass;
 /// because the family is deliberately absent from `ChunkKind::anchor`, chunk
 /// ids do not move and nothing is re-embedded.
-pub const CHUNK_FORMAT_VERSION: u32 = 4;
+///
+/// 5: two chunk-text corrections. A leading UTF-8 BOM no longer rides inside
+/// the first chunk of a code or plain-text file, and an ATX heading's trailing
+/// `#`s are trimmed only where CommonMark calls them a closing sequence, so
+/// `# Learning C#` keeps its name. Both change chunk *text* — and the heading
+/// one also changes the anchor — so the affected chunks get new ids and are
+/// re-embedded. Only files that actually carry a BOM or such a heading move.
+pub const CHUNK_FORMAT_VERSION: u32 = 5;
 
 /// A single line longer than this marks a file as machine text (minified
 /// bundles, ML vocab dumps, serialized blobs). Dogfooding on the Lexomancy
