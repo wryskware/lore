@@ -165,6 +165,35 @@ This is a **leaning about direction, not a design and not scheduled.** It is
 recorded so that the next person who wants external content has somewhere
 better to go than re-proposing following.
 
+> [!open]
+> **Whose ignore file governs a mounted tree?** Verified against the walker
+> 2026-08-17, because it is the first thing a mount implementation trips over.
+>
+> Every boundary in `walk_files` is parameterized on the **walk root**, not on
+> any notion of "the registered project": the nested-repository check gates on
+> `relative_to(root, path).is_some()` (strictly below the root, so the root
+> itself is always exempt), the `!` escape hatch is built from
+> `root.join(".loreignore")`, and `current_dir(root)` roots the whole ignore
+> stack there.
+>
+> So a mount walked as its own root *does* inherit the sub-repo rule, and
+> cleanly: the mount root is exempt (mounting a sibling repository works rather
+> than being refused for being a repository), while nested repositories inside
+> it are still refused. **What does not carry over is authorship.** The hatch's
+> stated justification is that `.loreignore` is "the one file whose author is
+> unambiguously the project owner rather than the vendored repository itself" —
+> and under a mount that inverts, because the file read would be the *mounted
+> tree's*. The declaring project's own `.loreignore` would meanwhile have no
+> reach into the subtree it just mounted, so the owner could not scope what
+> they had added.
+>
+> Any `[[sources]]` design must answer this explicitly: either the declaring
+> project's `.loreignore` is evaluated against mounted paths (which needs the
+> rules rebased across the `mount` prefix, since the two trees have different
+> path roots), or mounts are declared as governed by their own files and the
+> asymmetry with the single-root case is stated rather than stumbled into. Do
+> not let it fall out of whichever is easier to implement.
+
 If an intermediate mode is ever wanted, the only acceptable one is
 `follow_symlinks = "within-project"` — canonicalizing targets, requiring them
 to stay under the canonical project root, deduplicating canonical directories,
