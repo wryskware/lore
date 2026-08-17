@@ -108,16 +108,27 @@ impl Manifest {
     }
 }
 
+/// Git's metadata directory: lore's own floor, on both sides of the wire.
+///
+/// The one name no rule stack can argue with (D-0020), and the constant the
+/// walker's hard floor and [`malformed_path`] below both read, so the observer
+/// and the receiver cannot drift into two notions of it.
+pub const GIT_DIR: &str = ".git";
+
 /// Why a string could not be a manifest path at all, if it could not.
 ///
-/// This is a *structural* verdict, not a policy one, and the difference decides
-/// how a receiver answers. A path that is empty, absolute, backslashed or
+/// This is the receiver's **whole** job under D-0020: structural validation,
+/// never content policy. A path that is empty, absolute, backslashed or
 /// traversal-shaped is not a file this protocol has an opinion about — it is a
-/// client that does not implement the contract, and the honest answer is to
-/// refuse the whole listing by name. A perfectly well-formed path that names a
-/// secret is the opposite case: the client works, its configuration is wrong,
-/// and the receiver drops that entry and says which (see the receiver's
-/// hard-exclude backstop, D-0015).
+/// client that does not implement the contract — and neither is one reaching
+/// into [`GIT_DIR`], which is lore's own metadata floor rather than an opinion
+/// about the project. Every one of them refuses the whole listing by name.
+///
+/// A well-formed path that names a *secret* is deliberately **not** here.
+/// D-0020 retired the receiver's content backstop: what a manifest may contain
+/// is the pusher's business (trusted-client model — in shared deployments
+/// isolation comes from the instance boundary, not content policy), and the
+/// accepted trade is that a bad ignore file can ship a credential.
 ///
 /// Nothing here is a security boundary. A receiver must never derive a
 /// filesystem path from a client's string in the first place — the push
@@ -141,6 +152,11 @@ pub fn malformed_path(path: &str) -> Option<&'static str> {
     path.split('/').find_map(|part| match part {
         "" => Some("contains an empty path component"),
         ".." => Some("contains a `..` component"),
+        // Case-insensitively: a Windows volume makes `.GIT` the same directory
+        // as `.git`, and a floor a rename defeats is not a floor.
+        _ if part.eq_ignore_ascii_case(GIT_DIR) => Some(
+            "contains a `.git` component; git metadata is lore's own floor and is never indexed",
+        ),
         _ => None,
     })
 }
@@ -253,23 +269,6 @@ pub struct PushManifestResponse {
     /// listing looks like a catastrophe *before* uploading anything.
     #[serde(default)]
     pub deletes: u64,
-    /// Listed paths the receiver refuses to index, dropped from the accepted
-    /// manifest (D-0015's hard-exclude backstop).
-    ///
-    /// The manifest is still *accepted*: a client listing `.env` is
-    /// misconfigured, not broken, and refusing its whole snapshot would take a
-    /// working index offline over one file. The refused entries simply are not
-    /// in it — which means absence semantics now apply to them, so a copy
-    /// indexed before the backstop existed (or before the file matched) is
-    /// **deleted** by the next commit. That is the backstop actively purging,
-    /// and it is the point: a secret that reached the index once must be able
-    /// to leave it.
-    ///
-    /// Paths only. Which rule refused each one is in the daemon's log — a
-    /// pusher's remedy is the same whichever pattern matched, and naming the
-    /// pattern on the wire would invite clients to branch on it.
-    #[serde(default)]
-    pub refused: Vec<String>,
 }
 
 /// Step 3 of the push flow: one needed path's content.
@@ -383,6 +382,11 @@ mod tests {
             ("a/../../escape", "contains a `..` component"),
             ("src//lib.rs", "contains an empty path component"),
             ("src/", "contains an empty path component"),
+            // Lore's own floor (D-0020), at the root and vendored, in either
+            // case.
+            (".git/config", "contains a `.git` component"),
+            ("vendor/dep/.git/HEAD", "contains a `.git` component"),
+            (".GIT/config", "contains a `.git` component"),
         ] {
             let verdict = malformed_path(path).unwrap_or_else(|| panic!("{path:?} was accepted"));
             assert!(verdict.starts_with(reason), "{path:?}: {verdict}");
@@ -407,6 +411,14 @@ mod tests {
             "./relative.rs",
             "src/..hidden.rs",
             "src/a..b.rs",
+            // Named for git without being git's directory.
+            ".gitignore",
+            "src/.gitkeep",
+            // D-0020's accepted trade, on the wire: a credential is *not* a
+            // structural defect. The pusher's ignore rules decide whether it is
+            // listed; the receiver has no opinion about content.
+            ".env",
+            "certs/server.pem",
         ] {
             assert_eq!(malformed_path(path), None, "{path:?}");
         }

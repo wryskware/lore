@@ -83,7 +83,6 @@ fn populated_project_status() -> ProjectStatus {
         // serialized shape, and a field left `None` is a field a
         // `skip_serializing_if` would hide from the golden list.
         authority_config_error: Some("unknown authority profile `adr`".into()),
-        manifest_basis_error: Some("`git` is not on this daemon's PATH".into()),
         decisions_active: 11,
         decisions_total: 13,
         decision_violations: vec![
@@ -170,9 +169,6 @@ fn every_pre_existing_wire_field_survives_and_the_additions_are_the_specified_on
                 // a lease.
                 "push_lease_epoch",
                 "push_staged",
-                // D-0017: a git work tree whose git would not answer, so the
-                // pass fell back to lore's own ignore rules. Absent normally.
-                "manifest_basis_error",
             ],
         },
         Shape {
@@ -365,11 +361,6 @@ fn a_push_message_missing_its_additive_fields_still_parses() {
         serde_json::from_value(json!({ "needed": ["src/lib.rs"] })).expect("needed-only parses");
     assert_eq!(needed.needed, ["src/lib.rs"]);
     assert_eq!(needed.deletes, 0);
-    assert!(
-        needed.refused.is_empty(),
-        "a daemon that predates the hard-exclude backstop refused nothing, \
-         which is exactly what an absent list has to mean"
-    );
 
     let staged: PushFileResponse =
         serde_json::from_value(json!({ "staged": 3 })).expect("staged-only parses");
