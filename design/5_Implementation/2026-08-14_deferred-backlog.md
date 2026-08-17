@@ -121,3 +121,20 @@ briefs; details in the cited docs.
   Sources: `docs.augmentcode.com/context-services/context-connectors/how-it-works`,
   `augmentcode.com/blog/announcing-context-lineage`,
   `docs.augmentcode.com/context-services/mcp/overview`.
+
+## Bench integrity (2026-08-17)
+
+- **The `lexical` control arm was empty in every recorded run.** All four
+  2026-08-15/16 lexical runs recorded zero results for all 80 queries, so the
+  0.00 floor in the bench summaries was a broken arm, not a BM25 measurement.
+  It reproduces correctly on the current binary (lore-bench hit@10 0.92,
+  terrarium 0.80, lexomancy 0.63), so whatever caused it is fixed or was
+  transient — the cause was never diagnosed and no artifact from those runs
+  records an error. D-0012 does not rest on it (its evidence is the C#-semantic
+  gap *between embedders*), but no stated margin over the floor was ever real.
+  On lore-bench today BM25 alone matches or beats every recorded embedding arm.
+- **Lexomancy has drifted off the shape the recorded runs measured.** 17.9k
+  chunks on 2026-08-17 against the ~81k the throughput notes recorded; the
+  D-0020 ignore stack landed in between. Any comparison across those dates is
+  indicative only, and re-pinning the corpus is a prerequisite for the next
+  controlled matrix run.

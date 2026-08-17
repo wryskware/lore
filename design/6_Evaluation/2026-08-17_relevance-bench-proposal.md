@@ -10,6 +10,35 @@ A proposal, not a decision. Nothing here binds until Wrysk says so.
 Question it answers: *for a given search, how much of what came back was
 actually relevant, and where in the ranking did the right answers land?*
 
+## Status — built 2026-08-17
+
+Wrysk answered the three open questions below (2026-08-17) and the harness
+was built to those answers:
+
+- **LLM judge**, luna free tier through opencode, batched — not hand-labelled.
+- **`bench/embed/` renamed to `bench/retrieval/`**, model matrix preserved
+  and expected to matter again only when a new embedding model lands.
+- **D-0003's "local-only" is not what Wrysk meant** and does not gate this:
+  where the embedding engine runs is uncontroversial, *supporting local
+  always* is the actual constraint. The ledger entry wording is inaccurate to
+  intent and should be amended — pending, unauthorized, not done here.
+
+Shipped: `query.ps1` (search loop, split out of `run.ps1` so any running
+daemon can be scored), `judge.ps1` + `opencode-judge.jsonc` (pooling,
+labelling, content-hash cache), `score.ps1` extended with precision, ranks,
+graded nDCG, worst offenders and the calibration line. The query-set gaps
+below (breadth and negative queries) are **not** built.
+
+**Found while verifying** — the 2026-08-15/16 `lexical` control runs recorded
+zero results for all 80 queries, in every run: the "floor" that summary tables
+reported as 0.00 was an empty arm, not a measurement. The arm reproduces
+correctly on the current binary (lore-bench hit@10 0.92, terrarium 0.80,
+lexomancy 0.63). D-0012 does not rest on it — its evidence is the C#-semantic
+gap between embedders — but no margin over the floor was ever real, and on
+lore-bench today BM25 alone matches or beats every recorded embedding arm.
+Cross-dating is not controlled: different binaries, and lexomancy's chunk
+count has since changed materially under the D-0020 ignore stack.
+
 ## What already exists
 
 Three evaluation layers ship today, and the middle one is the one people
@@ -18,11 +47,11 @@ forget:
 | layer | where | asks |
 | --- | --- | --- |
 | end-task | `bench/` + [[2026-08-17_e2e-round-2-task-set]] | does an agent do the job better with lore on? |
-| retrieval quality | `bench/embed/` | does the known-correct file come back, and how high? |
-| cost/latency | `bench/embed/` score tables, `bench/latency.py` | what does it cost to index and to query? |
+| retrieval quality | `bench/retrieval/` | does the known-correct file come back, and how high? |
+| cost/latency | `bench/retrieval/` score tables, `bench/latency.py` | what does it cost to index and to query? |
 
 So retrieval quality **was** built — it just wears an embedding-model
-comparison's clothes. `bench/embed/queries/*.json` holds 80 hand-verified
+comparison's clothes. `bench/retrieval/queries/*.json` holds 80 hand-verified
 queries across three corpora (lore-bench 25, terrarium-bench 25, lexomancy 30),
 each tagged `semantic` / `lexical` / `symbol` / `design`|`docs` / `multi-file`,
 each carrying the paths that answer it and a `why` note. `score.ps1` reports
@@ -69,7 +98,7 @@ returned**, once, and reuse the labels.
 3. **Cache.** Key each judgment on `(query_id, path, chunk content hash)`.
    Corpora are pinned (`frozen_at` per key file); when a pin moves, only the
    judgments whose content actually changed go stale. Store as
-   `bench/embed/judgments/<corpus>.json`, alongside the keys, in git.
+   `bench/retrieval/judgments/<corpus>.json`, alongside the keys, in git.
 4. **Reuse.** A new arm re-scores for free against the cached pool and only
    pays judging for paths nobody has returned before.
 
@@ -110,10 +139,12 @@ uncalibrated should say so on its face.
 
 Consequences to accept up front:
 
-- **Run artifacts must carry chunk text.** `run.ps1` records `path`,
-  `line_start`, `line_end`, `score` today. The judge needs the snippet — either
-  widen the recorded result or fetch by `chunk_id` through `expand`. This is
-  the only change to the run path.
+- **The judge needs the retrieved text.** Run artifacts record `path`,
+  `line_start`, `line_end`, `score` — not the snippet. *Built instead:*
+  `judge.ps1` reads the span off disk at the corpus root, which leaves the run
+  path untouched, works on runs recorded before judging existed, and yields
+  the file hash the cache key needs from the same read. It buys that with a
+  hard dependency on the corpus sitting at its pin — hence the pin guard.
 - **The judge is a dependency the bench did not have.** Local model (GPU
   contention with the embedding arm — the bench already refuses to run
   concurrently with the e2e matrix) or an API call (bench-only tooling, not
@@ -157,15 +188,26 @@ Split it:
 `run.ps1` keeps the model matrix on top of `query.ps1` and otherwise stays as
 it is.
 
-## Open questions for Wrysk
+## Open questions — answered 2026-08-17
 
-1. **LLM judge, or hand-label a smaller pool?** The proposal assumes the
-   judge. A hand-labelled 20-query subset is the honest alternative — smaller,
-   binding, and stale the moment the corpora move.
-2. **Does "local-only" extend past embeddings to bench tooling?** D-0003
-   constrains *embedding providers*. A judge is neither an embedder nor
-   shipped code, so nothing in canon speaks to it — but the spirit might.
-3. **New folder or extend `bench/embed/`?** Extending keeps one query set and
-   one scorer, at the cost of a folder whose name no longer describes what it
-   holds. Renaming it (`bench/retrieval/`) is the tidier end state and a
-   mechanical change.
+1. **LLM judge, or hand-label a smaller pool?** → **LLM judge**, on the free
+   tier, batched. Cost is the constraint, not principle.
+2. **Does "local-only" extend past embeddings to bench tooling?** → The
+   premise was wrong. D-0003's wording overstates Wrysk's intent: where the
+   embedding engine *runs* was never the constraint; **always supporting
+   local** is. The ledger entry needs amending to say that; a hosted judge in
+   bench-only tooling was never in question.
+3. **New folder or extend `bench/embed/`?** → **Renamed** to
+   `bench/retrieval/`. The model matrix stays working but is not expected to
+   matter again until a new embedding model lands.
+
+## Still open
+
+- **Breadth and negative queries** (§ Query-set gaps) are unbuilt. Precision
+  only becomes fully meaningful once ideal result sets are bigger than one.
+- **Judge cost at full scale.** The pool across all three corpora is ~2,200
+  labels; a 12-item batch is one model call, so a full first pass is ~185
+  calls. Cached afterwards, and only new paths cost anything.
+- **A controlled re-run of the model matrix.** See the floor finding above:
+  every recorded embedder margin predates both the current binary and the
+  D-0020 ignore stack.
