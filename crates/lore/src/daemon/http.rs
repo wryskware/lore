@@ -34,8 +34,10 @@
 // local processes from reading the index. Deferred out of M1 deliberately —
 // it needs a decision about how MCP clients receive the secret.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -43,6 +45,11 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use camino::{Utf8Path, Utf8PathBuf};
 
+use lore_core::snapshot::{
+    PushCommitRequest, PushCommitResponse, PushEpoch, PushFileParams, PushFileResponse,
+    PushLeaseRequest, PushLeaseResponse, PushManifestRequest, PushManifestResponse,
+    PushRenewRequest, PushSessionId,
+};
 use lore_core::{
     DaemonStatus, ExpandRequest, IndexRequest, IndexResponse, ProjectInfo, ProjectList,
     RegisterProjectRequest, RemoveProjectResponse, SearchRequest,
@@ -52,15 +59,27 @@ use crate::config::Config;
 use crate::embed::Embedder;
 use crate::store::{Project, RegisterError};
 
-use super::index::GuardStatus;
+use super::index::{ApplyOptions, IndexContext};
+use super::push::{PushClaim, PushError, PushLeases};
 use super::queue::IndexQueue;
+use super::snapshot::{Scope, Snapshot};
 use super::store_handle::StoreHandle;
 use super::watch::{WatchCommand, WatchSender, WatchStatus};
-use super::{expand, ignorefile, paths, search};
+use super::{expand, ignorefile, index, paths, push, search};
 
 /// Request bodies are small JSON documents; a megabyte is generous for the
 /// largest realistic one (a pasted query) and cheap insurance otherwise.
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// The two push routes that carry bulk get their own, much larger ceiling: a
+/// manifest is ~100 bytes per file (a 300k-file repository is a ~30 MB
+/// message, D-0015) and an upload is one file's bytes.
+///
+/// Generous rather than tuned. It is not a policy on what may be indexed —
+/// oversized files are the chunker's business, and pusher-side ignore rules
+/// decide what is listed at all — it exists so one malformed request cannot
+/// ask this process for unbounded memory.
+pub const MAX_PUSH_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -69,8 +88,13 @@ pub struct AppState {
     pub watch: WatchSender,
     /// Live per-project watcher coverage, written by the watcher pump.
     pub watch_status: WatchStatus,
-    /// Applies the mass-delete guard refused, written by the indexer.
-    pub guard: GuardStatus,
+    /// The indexer's context, shared so a push commit runs the *same* apply
+    /// pipeline the walker's snapshots run through (D-0015) rather than a
+    /// parallel one. It also carries the mass-delete guard's record, which is
+    /// what `status` reports.
+    pub index: IndexContext,
+    /// Per-project push leases, epochs and staging areas.
+    pub push: PushLeases,
     pub config: Arc<Config>,
     /// Live embedding capability and health. Shared with the embed worker,
     /// which is the thing that actually probes the endpoint.
@@ -94,6 +118,21 @@ pub fn router(state: AppState) -> Router {
         .route("/shutdown", post(shutdown))
         .route("/search", post(search_route))
         .route("/expand", post(expand_route))
+        // The push surface (D-0015). Same `/v1`, same loopback listener, same
+        // absence of authentication: a lease is a consistency primitive, and
+        // a deployment that serves more than one trusting party authenticates
+        // *in front of* this daemon (issue #18).
+        .route("/push/lease", post(push_lease))
+        .route("/push/lease/renew", post(push_renew))
+        .route(
+            "/push/manifest",
+            post(push_manifest).layer(DefaultBodyLimit::max(MAX_PUSH_BYTES)),
+        )
+        .route(
+            "/push/file",
+            post(push_file).layer(DefaultBodyLimit::max(MAX_PUSH_BYTES)),
+        )
+        .route("/push/commit", post(push_commit))
         .with_state(state);
 
     Router::new()
@@ -261,7 +300,12 @@ async fn status(
             // A refused apply (D-0015). Same reasoning as the watch state
             // above: an index that has stopped tracking its project is a
             // silent failure unless it is reported.
-            mass_delete_guard: state.guard.of(p.project),
+            mass_delete_guard: state.index.guard.of(p.project),
+            // Push state (D-0015). Absent for a purely local project, which
+            // never takes a lease; present, and *churning*, is what sustained
+            // pusher contention looks like from outside.
+            push_lease_epoch: state.push.state(p.project).map(|push| push.epoch.0),
+            push_staged: state.push.state(p.project).is_some_and(|push| push.staged),
         })
         .collect();
 
@@ -490,7 +534,12 @@ async fn remove_project(
 
     let _ = state.watch.send(WatchCommand::Unwatch(id));
     state.watch_status.forget(id);
-    state.guard.forget(id);
+    state.index.guard.forget(id);
+    // A lease on a project that no longer exists cannot commit anything, so
+    // its staged content goes with it rather than waiting for the reaper.
+    if let Some(dir) = state.push.forget(id) {
+        discard_staging(dir).await;
+    }
 
     tracing::info!(
         project = %project.name,
@@ -716,6 +765,350 @@ async fn expand_route(
         expand::ExpandError::Store(err) => ApiErr::internal("expand", err),
         err => ApiErr::bad_request(err.to_string()),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Push (D-0015)
+// ---------------------------------------------------------------------------
+//
+// Four steps — lease, manifest, upload, commit — over the same loopback
+// listener as everything else. The handlers are thin on purpose: consistency
+// lives in [`super::push`], applying lives in [`super::index`], and neither
+// learns anything here about HTTP.
+//
+// **No authorization anywhere in this section.** Every refusal below answers
+// "is this pusher's view of the project current?", never "may this caller
+// write?". The daemon has no users and no roles; nothing binds beyond
+// 127.0.0.1.
+
+/// Push refusals, by kind.
+///
+/// The consistency failures are 409: the request is well-formed and legal, and
+/// it is the *daemon's current state* — someone else holds the lease — that
+/// refuses it, which is a state the caller can change by acquiring again. The
+/// contract violations are 400, because the caller sent something that was
+/// never going to work. The floor is 429, because the only fix is to wait.
+fn push_err(err: PushError) -> ApiErr {
+    let status = match &err {
+        PushError::NoLease { .. }
+        | PushError::TakenOver { .. }
+        | PushError::UnknownSession { .. }
+        | PushError::EpochAhead { .. }
+        | PushError::CommitInFlight { .. } => StatusCode::CONFLICT,
+        PushError::TooSoon { .. } => StatusCode::TOO_MANY_REQUESTS,
+        PushError::ManifestCorrupt
+        | PushError::NoManifest
+        | PushError::NotInManifest { .. }
+        | PushError::SizeMismatch { .. }
+        | PushError::HashMismatch { .. }
+        | PushError::Incomplete { .. } => StatusCode::BAD_REQUEST,
+        PushError::Staging { .. } => return ApiErr::internal("push staging", err),
+    };
+    ApiErr::new(status, err.to_string())
+}
+
+/// Resolve the project a push names.
+///
+/// Identity is the registry-bound declared name (D-0016). Containment plays no
+/// part: a pusher's paths need not exist on this daemon's filesystem at all,
+/// which is the whole point of the inversion.
+async fn push_project(state: &AppState, wanted: &str) -> Result<Project, ApiErr> {
+    let projects = projects_of(state).await?;
+    super::resolve_project(&projects, wanted)
+        .cloned()
+        .ok_or_else(|| ApiErr::not_found(format!("unknown project `{wanted}`; {NAME_A_PROJECT}")))
+}
+
+/// The identity every push route checks against the live lease.
+fn claim(project: &Project, session: &PushSessionId, epoch: PushEpoch) -> PushClaim {
+    PushClaim {
+        project: project.id,
+        name: project.name.clone(),
+        session: session.clone(),
+        epoch,
+    }
+}
+
+/// Delete a staging area off the runtime; failures are the module's to log.
+async fn discard_staging(dir: Utf8PathBuf) {
+    let _ = tokio::task::spawn_blocking(move || push::discard(&dir)).await;
+}
+
+fn lease_response(state: &AppState, session: PushSessionId, epoch: PushEpoch) -> PushLeaseResponse {
+    PushLeaseResponse {
+        session,
+        epoch,
+        ttl_secs: state.push.ttl().as_secs(),
+        heartbeat_secs: state.config.push.heartbeat().as_secs(),
+        min_push_interval_secs: state.push.min_interval().as_secs(),
+    }
+}
+
+/// `POST /v1/push/lease` — take the project's push lease.
+///
+/// Always succeeds against a live project: conflict policy is takeover
+/// (D-0015, decided), so a second acquirer displaces the holder rather than
+/// waiting for a TTL nobody can choose correctly. The displaced session learns
+/// about it on its next request, by name and with a timestamp.
+///
+/// The epoch is minted by the store, not by this handler, because it has to be
+/// monotonic across daemon restarts as well as across concurrent acquirers.
+async fn push_lease(
+    State(state): State<AppState>,
+    ApiJson(request): ApiJson<PushLeaseRequest>,
+) -> ApiResult<PushLeaseResponse> {
+    let project = push_project(&state, &request.project).await?;
+    let id = project.id;
+    let epoch = state
+        .store
+        .with(move |store| store.bump_push_epoch(id))
+        .await
+        .map_err(|err| ApiErr::internal("push lease", err))?
+        .map_err(|err| ApiErr::internal("push lease", err))?
+        .ok_or_else(|| {
+            ApiErr::not_found(format!(
+                "project `{}` was removed while its lease was being acquired; {NAME_A_PROJECT}",
+                project.name
+            ))
+        })?;
+    let epoch = PushEpoch(epoch);
+
+    let (session, displaced) = state
+        .push
+        .acquire(id, &project.name, epoch)
+        .map_err(push_err)?;
+    // A displaced session's uploads can never be committed, so they are
+    // deleted rather than left to the reaper: D-0015's only cleanup.
+    if let Some(dir) = displaced {
+        discard_staging(dir).await;
+    }
+    tracing::info!(project = %project.name, epoch = %epoch, "push lease acquired");
+    Ok(Json(lease_response(&state, session, epoch)))
+}
+
+/// `POST /v1/push/lease/renew` — heartbeat an idle lease.
+///
+/// Only needed in the gaps: every accepted push request is itself proof of
+/// life, so a pusher working its way through uploads never has to renew
+/// concurrently.
+async fn push_renew(
+    State(state): State<AppState>,
+    ApiJson(request): ApiJson<PushRenewRequest>,
+) -> ApiResult<PushLeaseResponse> {
+    let project = push_project(&state, &request.project).await?;
+    state
+        .push
+        .touch(&claim(&project, &request.session, request.epoch))
+        .map_err(push_err)?;
+    Ok(Json(lease_response(&state, request.session, request.epoch)))
+}
+
+/// `POST /v1/push/manifest` — negotiate what content the daemon needs.
+///
+/// Order is load-bearing. The checksum is verified **first**, before the
+/// listing is allowed to influence anything: a manifest's *absences* delete
+/// files, so a listing that did not survive the wire is not a smaller listing,
+/// it is a deletion instruction of unknown provenance.
+///
+/// The answer also carries the delete count, which is the mass-delete guard's
+/// preview: a pusher learns its listing looks like a catastrophe here, before
+/// it uploads anything. Enforcement stays where it already lives — the apply
+/// pipeline's guard at commit — so there is exactly one notion of "too many",
+/// and the per-invocation override rides along to it on the session.
+async fn push_manifest(
+    State(state): State<AppState>,
+    ApiJson(request): ApiJson<PushManifestRequest>,
+) -> ApiResult<PushManifestResponse> {
+    if !request.manifest.is_intact() {
+        return Err(push_err(PushError::ManifestCorrupt));
+    }
+    let project = push_project(&state, &request.project).await?;
+    let claim = claim(&project, &request.session, request.epoch);
+    state.push.touch(&claim).map_err(push_err)?;
+    state
+        .push
+        .check_interval(project.id, &project.name)
+        .map_err(push_err)?;
+
+    // The diff is one `list_files` — which is what a manifest diff *is* — plus
+    // the stored authority profile, because the stamp a stored hash carries
+    // depends on it (D-0012). Stored rather than freshly read from disk: it is
+    // the fingerprint the last pass wrote, so it answers "what does the store
+    // already have" exactly. A `.lore.toml` edit landing between this
+    // negotiation and the commit makes the commit re-chunk Markdown it did not
+    // ask content for; those files count as pass errors and are *not* deleted
+    // (see `StagedContent::read`), and the next push settles it.
+    let id = project.id;
+    let (stored, profile) = state
+        .store
+        .with(move |store| {
+            let files = store.list_files(id)?;
+            let authority = store.project_authority(id)?;
+            Ok::<_, crate::store::StoreError>((files, authority.active()))
+        })
+        .await
+        .map_err(|err| ApiErr::internal("push manifest", err))?
+        .map_err(|err| ApiErr::internal("push manifest", err))?;
+
+    let known: BTreeMap<&str, &str> = stored
+        .iter()
+        .map(|record| (record.path.as_str(), record.content_hash.as_str()))
+        .collect();
+    let needed: Vec<String> = request
+        .manifest
+        .entries
+        .iter()
+        .filter(|entry| {
+            let stamp = index::content_stamp(Utf8Path::new(&entry.path), &entry.hash, profile);
+            known.get(entry.path.as_str()).copied() != Some(stamp.as_str())
+        })
+        .map(|entry| entry.path.clone())
+        .collect();
+    // Deletion is absence, and a manifest speaks for the whole project.
+    let deletes = stored
+        .iter()
+        .filter(|record| request.manifest.get(record.path.as_str()).is_none())
+        .count() as u64;
+
+    let missing = state
+        .push
+        .record_manifest(&claim, request.manifest, request.allow_mass_delete, needed)
+        .map_err(push_err)?;
+
+    tracing::debug!(
+        project = %project.name,
+        epoch = %request.epoch,
+        needed = missing.len(),
+        deletes,
+        "push manifest negotiated"
+    );
+    Ok(Json(PushManifestResponse {
+        needed: missing,
+        deletes,
+    }))
+}
+
+/// `POST /v1/push/file?project=&session=&epoch=&path=` — stage one needed
+/// path's content, sent as the raw request body.
+///
+/// Every upload is verified against the manifest that negotiated it — size
+/// first because it is free, then the hash. A mismatch stages nothing and is
+/// refused by name, so the path stays needed and the commit refuses until it
+/// is right; content that disagrees with the listing is not the content this
+/// commit was negotiated over.
+async fn push_file(
+    State(state): State<AppState>,
+    Query(params): Query<PushFileParams>,
+    body: Bytes,
+) -> ApiResult<PushFileResponse> {
+    let project = push_project(&state, &params.project).await?;
+    let claim = claim(&project, &params.session, params.epoch);
+    let target = state
+        .push
+        .stage_target(&claim, &params.path)
+        .map_err(push_err)?;
+
+    // Hashing and writing megabytes: off the reactor, and off the lease lock.
+    let path = params.path.clone();
+    let hash = tokio::task::spawn_blocking(move || push::stage_bytes(&target, &path, &body))
+        .await
+        .map_err(|err| ApiErr::internal("push upload", err))?
+        .map_err(push_err)?;
+
+    let progress = state
+        .push
+        .stage_recorded(&claim, &params.path, hash)
+        .map_err(push_err)?;
+    Ok(Json(PushFileResponse {
+        staged: progress.staged,
+        needed: progress.needed,
+    }))
+}
+
+/// `POST /v1/push/commit` — publish everything staged under this session.
+///
+/// The epoch is verified **here**, with the commit, and not merely when the
+/// manifest was negotiated: a session taken over mid-upload must not publish,
+/// and at manifest time the takeover had not happened yet.
+///
+/// What the commit deliberately does *not* do is hold the lease lock across
+/// the apply. A takeover landing during a commit therefore wins the next
+/// commit rather than interleaving with this one — which is exactly what
+/// D-0015 means by degrading to flapping between internally-consistent
+/// snapshots. The transaction semantics of the publication itself are the
+/// pipeline's, unchanged: this is the existing apply/prune with a different
+/// observation source.
+async fn push_commit(
+    State(state): State<AppState>,
+    ApiJson(request): ApiJson<PushCommitRequest>,
+) -> ApiResult<PushCommitResponse> {
+    let project = push_project(&state, &request.project).await?;
+    let claim = claim(&project, &request.session, request.epoch);
+    let plan = state.push.take_commit(&claim).map_err(push_err)?;
+
+    let options = ApplyOptions {
+        allow_mass_delete: plan.allow_mass_delete,
+    };
+    let snapshot = Snapshot {
+        manifest: plan.manifest,
+        // A manifest is the complete listing of the project, which is what
+        // makes its absences deletions.
+        scope: Scope::Project,
+        // A manifest that reached the commit is by construction complete: the
+        // pusher declared it whole and the checksum agreed.
+        complete: true,
+        unreadable: BTreeSet::new(),
+        content: Box::new(plan.content),
+    };
+
+    let ctx = state.index.clone();
+    let target = project.clone();
+    let applied = tokio::task::spawn_blocking(move || {
+        index::apply_snapshot(&ctx, &target, snapshot, options)
+    })
+    .await;
+
+    let summary = match applied {
+        Ok(summary) => summary,
+        Err(err) => {
+            // The apply panicked. Release the commit claim anyway, or this
+            // project could never be committed to again.
+            state.push.commit_finished(&claim, false);
+            return Err(ApiErr::internal("push commit", err));
+        }
+    };
+
+    let published = summary.mass_delete_blocked.is_none() && !summary.cancelled;
+    if let Some(dir) = state.push.commit_finished(&claim, published) {
+        discard_staging(dir).await;
+    }
+
+    if let Some(trip) = summary.mass_delete_blocked {
+        return Err(ApiErr::conflict(format!(
+            "{trip}; nothing was written. The staged content is kept — re-send this manifest \
+             with `allow_mass_delete` and commit again if the deletion is intended"
+        )));
+    }
+    if summary.cancelled {
+        return Err(ApiErr::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the daemon is shutting down; nothing was published and the staged content is kept",
+        ));
+    }
+
+    tracing::info!(
+        project = %project.name,
+        epoch = %request.epoch,
+        generation = summary.generation,
+        indexed = summary.indexed,
+        deleted = summary.removed,
+        "push committed"
+    );
+    Ok(Json(PushCommitResponse {
+        generation: summary.generation,
+        indexed: summary.indexed as u64,
+        deleted: summary.removed as u64,
+    }))
 }
 
 async fn projects_of(state: &AppState) -> Result<Vec<Project>, ApiErr> {

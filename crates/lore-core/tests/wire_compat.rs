@@ -90,6 +90,8 @@ fn populated_project_status() -> ProjectStatus {
             deletes: 900,
             stored: 1000,
         }),
+        push_lease_epoch: Some(7),
+        push_staged: true,
     }
 }
 
@@ -159,6 +161,11 @@ fn every_pre_existing_wire_field_survives_and_the_additions_are_the_specified_on
                 // D-0015: a refused apply, so an index that stopped tracking
                 // its project says why.
                 "mass_delete_guard",
+                // D-0015: who is pushing this project, and whether anything is
+                // staged. Absent for a purely local project, which never takes
+                // a lease.
+                "push_lease_epoch",
+                "push_staged",
             ],
         },
         Shape {

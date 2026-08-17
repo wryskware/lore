@@ -912,6 +912,7 @@ fn render_status(status: &DaemonStatus) -> String {
         push_authority(&mut out, project);
         push_authority_violations(&mut out, project);
         push_mass_delete_guard(&mut out, project);
+        push_lease_state(&mut out, project);
     }
     out
 }
@@ -928,6 +929,28 @@ fn push_mass_delete_guard(out: &mut String, project: &ProjectStatus) {
         "    INDEX BLOCKED: {trip}; re-run with `lore index {name} --allow-mass-delete` \
          if that is intended",
         name = project.name,
+    );
+}
+
+/// Who is pushing this project, and whether anything is staged (D-0015).
+///
+/// Silent for a project nobody has a lease on, which is every purely local
+/// project: local indexing never takes a lease, and a line saying so on every
+/// project would be noise. Loud when a lease exists, because takeover
+/// degrades sustained contention into epoch churn — and churn is only
+/// diagnosable if the epoch is visible.
+fn push_lease_state(out: &mut String, project: &ProjectStatus) {
+    let Some(epoch) = project.push_lease_epoch else {
+        return;
+    };
+    let _ = writeln!(
+        out,
+        "    push: lease held at epoch {epoch}{staged}",
+        staged = if project.push_staged {
+            "  (content staged, not yet committed)"
+        } else {
+            ""
+        },
     );
 }
 

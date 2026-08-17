@@ -163,6 +163,10 @@ pub struct PassSummary {
     /// Set when the mass-delete guard refused this snapshot (D-0015). The
     /// pass then writes nothing at all: a refused apply is refused whole.
     pub mass_delete_blocked: Option<MassDeleteTrip>,
+    /// The generation this pass advanced to. Zero for a pass that never
+    /// completed (cancelled, or the bump itself failed) — which is the same
+    /// thing `finish` logs, and what a push commit reports back to its pusher.
+    pub generation: u64,
 }
 
 impl PassSummary {
@@ -200,6 +204,46 @@ pub fn index_paths(
     apply(ctx, project, snapshot, ApplyOptions::default(), started)
 }
 
+/// Apply a snapshot this daemon did not observe — the push commit path
+/// (D-0015).
+///
+/// The whole seam in one function: a push session's manifest and staging area
+/// arrive as an ordinary [`Snapshot`], and everything below this line is the
+/// same code the walker's snapshot runs through. The scope is the caller's to
+/// set, and for a push it is [`Scope::Project`] — a manifest is the complete
+/// listing, which is what makes its absences deletions.
+pub fn apply_snapshot(
+    ctx: &IndexContext,
+    project: &Project,
+    snapshot: Snapshot,
+    options: ApplyOptions,
+) -> PassSummary {
+    apply(ctx, project, snapshot, options, Instant::now())
+}
+
+/// The stored `files.content_hash` for content that hashed to `hash`.
+///
+/// Not the bare content hash: the chunk format version rides in it so a
+/// chunking-policy bump invalidates every short-circuit, and the active
+/// authority profile rides along for Markdown so a `.lore.toml` change
+/// re-chunks the documents whose *metadata* it changed (D-0012).
+///
+/// Public because the push manifest diff has to ask the same question the
+/// pipeline asks — "does the store already have this content?" — and a second,
+/// almost-identical stamping rule would present as a daemon that re-requests
+/// every file it already has after a format bump, or worse, one that skips
+/// files it should re-chunk.
+pub fn content_stamp(rel: &Utf8Path, hash: &str, profile: Option<Profile>) -> String {
+    let profile_tag = match profile {
+        Some(profile) if crate::chunk::is_markdown(rel) => profile.chunk_tag(),
+        _ => "",
+    };
+    format!(
+        "v{}{profile_tag}-{hash}",
+        crate::chunk::CHUNK_FORMAT_VERSION
+    )
+}
+
 /// Reconcile the store with one snapshot.
 ///
 /// Diff-then-apply rather than prune-by-generation: it needs no extra column,
@@ -228,7 +272,7 @@ fn apply(
     // either — the next pass sees the same difference and finishes the job.
     summary.cancelled = !snapshot.complete || ctx.cancel.is_cancelled();
     if summary.cancelled {
-        finish(ctx, project, kind, started, &summary);
+        finish(ctx, project, kind, started, &mut summary);
         return summary;
     }
 
@@ -237,7 +281,7 @@ fn apply(
         Err(err) => {
             tracing::warn!(project = %project.name, error = %err, "listing files for the snapshot diff failed");
             summary.errors += 1;
-            finish(ctx, project, kind, started, &summary);
+            finish(ctx, project, kind, started, &mut summary);
             return summary;
         }
     };
@@ -268,7 +312,7 @@ fn apply(
         );
         summary.mass_delete_blocked = Some(trip);
         ctx.guard.record(project.id, trip);
-        finish(ctx, project, kind, started, &summary);
+        finish(ctx, project, kind, started, &mut summary);
         return summary;
     }
     ctx.guard.clear(project.id);
@@ -328,7 +372,7 @@ fn apply(
         }
     }
 
-    finish(ctx, project, kind, started, &summary);
+    finish(ctx, project, kind, started, &mut summary);
     summary
 }
 
@@ -558,25 +602,10 @@ fn index_one(
 ) {
     let rel = Utf8Path::new(&entry.path);
 
-    // The format version rides in the stored hash so a chunking-policy bump
-    // invalidates the short-circuit below and unchanged bytes re-chunk. The
-    // active profile rides along for the same reason and by the same mechanism
-    // (D-0012): the same Markdown bytes chunk to different *metadata* under a
-    // different profile, so adding, changing or removing `.lore.toml` has to
-    // invalidate the hash or the old vault fields would survive forever.
-    //
-    // Markdown only. Nothing about a code chunk depends on the profile, so
-    // code keeps its hash — and therefore its vectors — across a profile flip.
-    let profile_tag = match profile {
-        Some(profile) if crate::chunk::is_markdown(rel) => profile.chunk_tag(),
-        _ => "",
-    };
-    let stamp = |hash: &str| {
-        format!(
-            "v{}{profile_tag}-{hash}",
-            crate::chunk::CHUNK_FORMAT_VERSION
-        )
-    };
+    // [`content_stamp`] carries the chunk format version and — for Markdown —
+    // the active authority profile, so a policy bump or a `.lore.toml` change
+    // invalidates the short-circuit below and unchanged bytes re-chunk.
+    let stamp = |hash: &str| content_stamp(rel, hash, profile);
 
     // The manifest hash is what the diff is done against; nothing is fetched
     // for a file whose content the store already has.
@@ -703,7 +732,7 @@ fn finish(
     project: &Project,
     kind: &'static str,
     started: Instant,
-    summary: &PassSummary,
+    summary: &mut PassSummary,
 ) {
     if summary.cancelled {
         tracing::info!(project = %project.name, kind, "index pass cancelled by shutdown");
@@ -717,6 +746,7 @@ fn finish(
             0
         }
     };
+    summary.generation = generation;
     tracing::info!(
         project = %project.name,
         kind,

@@ -41,8 +41,10 @@ fn harness_from(fixture: Fixture) -> Harness {
         // No watcher pump in this file, so every project reports `unknown`;
         // the real per-project states are covered in `daemon_watch.rs`.
         watch_status: watch::WatchStatus::new(),
-        // No index pass in this file, so no project has a refused apply.
-        guard: lore::daemon::index::GuardStatus::new(),
+        // No index pass runs through the router in this file, so no project
+        // has a refused apply; the push routes have their own file.
+        index: fixture.context(),
+        push: fixture.push_leases(),
         config: Arc::new(Config::default()),
         // No embedding endpoint: this file covers the lexical-only daemon.
         // Hybrid ranking and health transitions live in `embed_search.rs`.

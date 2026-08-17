@@ -174,6 +174,20 @@ pub struct ProjectStatus {
     /// of quietly going stale. Absent is the normal case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mass_delete_guard: Option<MassDeleteTrip>,
+    /// Epoch of the push lease currently held for this project (D-0015), or
+    /// absent when nobody holds one — which is the normal state of a purely
+    /// local project, since local indexing never takes a lease.
+    ///
+    /// Reported because takeover degrades sustained contention into *epoch
+    /// churn*, and churn nobody can see is indistinguishable from a working
+    /// pusher.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_lease_epoch: Option<u64>,
+    /// A push session has content staged for this project and has not
+    /// committed it. Nothing staged is visible to search: staged files are
+    /// inert until the commit transaction publishes them.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub push_staged: bool,
 }
 
 /// Whether a project's edits are being indexed live.

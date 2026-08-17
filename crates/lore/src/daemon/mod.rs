@@ -31,6 +31,7 @@ pub mod index;
 pub mod latency;
 pub mod ownership;
 pub mod paths;
+pub mod push;
 pub mod queue;
 pub mod search;
 pub mod snapshot;
@@ -176,11 +177,24 @@ pub async fn run(options: DaemonOptions) -> Result<()> {
 
     let ctx = index::IndexContext::new(store.clone(), data_dir.clone(), cancel.clone());
     let embed_notify = ctx.embed_notify.clone();
-    // Shared with `/v1/status`: an apply the mass-delete guard refused is a
-    // project whose index has stopped tracking its files, which must be
-    // visible rather than merely logged (D-0015).
-    let guard = ctx.guard.clone();
+    // Shared with `/v1/status` and with the push commit route: an apply the
+    // mass-delete guard refused is a project whose index has stopped tracking
+    // its files, which must be visible rather than merely logged, and a push
+    // commit must run this very pipeline rather than a parallel one (D-0015).
+    let index_ctx = ctx.clone();
     tracker.spawn(index::run(ctx, queue.clone()));
+
+    // Push leases (D-0015). Epochs live in the store and survive a restart;
+    // leases and staging areas do not, so anything left under the staging root
+    // by a previous run belongs to a session that can never commit and is
+    // cleared before a single route is served.
+    let leases = push::PushLeases::new(
+        &data_dir,
+        config.push.lease_ttl(),
+        config.push.min_interval(),
+    );
+    leases.reset();
+    tracker.spawn(push::reap(leases.clone(), cancel.clone()));
 
     // Embeddings are optional (D-0007): with no endpoint configured there is
     // simply no worker, and `Embedder` reports Unconfigured forever.
@@ -213,7 +227,8 @@ pub async fn run(options: DaemonOptions) -> Result<()> {
         queue: queue.clone(),
         watch: watch_tx.clone(),
         watch_status,
-        guard,
+        index: index_ctx,
+        push: leases,
         config,
         embeddings,
         latency: latency::LatencyRecorder::default(),

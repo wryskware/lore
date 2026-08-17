@@ -10,6 +10,7 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use lore::daemon::index::IndexContext;
 use lore::daemon::paths::canonicalize_root;
+use lore::daemon::push::PushLeases;
 use lore::daemon::store_handle::StoreHandle;
 use lore::store::Project;
 use tempfile::TempDir;
@@ -86,6 +87,21 @@ impl Fixture {
             self.store.clone(),
             self.data_dir.clone(),
             self.cancel.clone(),
+        )
+    }
+
+    /// Push state for an [`lore::daemon::http::AppState`], with the receiving
+    /// daemon's minimum push interval switched off.
+    ///
+    /// Tests push several manifests within one second, which no real pusher
+    /// does: the floor is a *cadence* policy (D-0015), and leaving it armed
+    /// here would turn every push test into a timing test. `daemon_push.rs`
+    /// builds its own leases wherever the floor is the thing under test.
+    pub fn push_leases(&self) -> PushLeases {
+        PushLeases::new(
+            &self.data_dir,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::ZERO,
         )
     }
 
