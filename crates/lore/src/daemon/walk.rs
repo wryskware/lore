@@ -54,6 +54,26 @@
 //! `.loreignore` rescues a deliberately vendored repository, so precedence is
 //! unchanged.
 //!
+//! ## Links are a boundary too, and a reported one
+//!
+//! The walk does not follow symbolic links, and on Windows a directory
+//! **junction** is a symbolic link for this purpose — the platform sets the
+//! reparse-point attribute with a name-surrogate tag and Rust answers
+//! `is_symlink()` for it, so nothing here distinguishes the two.
+//!
+//! Like the repository boundary above, this decides *descent* and is not a
+//! fourth rule source. Unlike it, the thing on the other side may be anywhere
+//! at all, which is why not following is the default: a link is an assertion
+//! about where bytes live, and following one lets a project silently absorb a
+//! tree it does not own — most concretely a second project this daemon already
+//! indexes, chunked twice with the embedding cost paid twice.
+//!
+//! What was missing was never the traversal, it was the *account*: a workspace
+//! assembled from junctions indexed its loose files and reported nothing, so it
+//! read as a project that simply had almost nothing in it — and no edit to its
+//! `.loreignore` could change that, because ignore rules are never consulted
+//! for a tree the walk does not enter. [`Walk::links`] is that account.
+//!
 //! ## What is outside the stack
 //!
 //! [`lore_core::snapshot::GIT_DIR`] — `.git` — is a hard floor, pruned by name
@@ -147,6 +167,22 @@ pub fn is_repo_root(dir: &Utf8Path) -> bool {
     dir.join(GIT_DIR).exists()
 }
 
+/// What one walk observed.
+///
+/// Two lists rather than one, because "nothing here" and "something here that
+/// lore declined to enter" are different answers and only the second one is a
+/// thing a user can act on. A workspace assembled from directory links reports
+/// a handful of loose files either way; only [`Self::links`] says why.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Walk {
+    /// Indexable files, as project-relative forward-slash paths.
+    pub files: Vec<Utf8PathBuf>,
+    /// Symbolic links the walk did not follow, project-relative. On Windows
+    /// this includes directory **junctions**, which the platform reports as
+    /// links like any other (see [`walk_files`]).
+    pub links: Vec<Utf8PathBuf>,
+}
+
 /// Enumerate indexable files, as project-relative forward-slash paths.
 ///
 /// `start` must be `root` or a directory under it; `max_depth` of `Some(1)`
@@ -157,15 +193,25 @@ pub fn is_repo_root(dir: &Utf8Path) -> bool {
 /// stuck behind a large or slow (UNC, reconnecting) tree. The returned list
 /// is then *partial* — callers must not treat it as the complete truth of
 /// what exists (a prune against it would delete everything unwalked).
+///
+/// Links are **not followed** and are reported instead, in [`Walk::links`].
+/// The walker sets `follow_links(false)`, so a link is yielded as an entry
+/// whose type is neither file nor directory; without the report it would be
+/// dropped on the floor and a project whose whole content sits behind one
+/// would index its loose files and say nothing about the rest. A Windows
+/// directory *junction* is a link for this purpose — the platform sets the
+/// reparse-point attribute with a name-surrogate tag and Rust's
+/// `FileType::is_symlink` answers true for it, so nothing here distinguishes
+/// the two and no caller has to either.
 pub fn walk_files(
     root: &Utf8Path,
     start: &Utf8Path,
     max_depth: Option<usize>,
     data_dir: &Utf8Path,
     cancel: Option<&CancellationToken>,
-) -> Vec<Utf8PathBuf> {
+) -> Walk {
     if paths::is_within(data_dir, start) {
-        return Vec::new();
+        return Walk::default();
     }
 
     // The walk always begins at the project root, even when only a
@@ -314,28 +360,35 @@ pub fn walk_files(
         }
     });
 
-    let mut out = Vec::new();
+    let mut walk = Walk::default();
     for entry in builder.build() {
         if cancel.is_some_and(|c| c.is_cancelled()) {
             break;
         }
         match entry {
             Ok(entry) => {
-                if !entry.file_type().is_some_and(|t| t.is_file()) {
-                    continue;
-                }
+                let kind = entry.file_type();
                 let Some(abs) = Utf8Path::from_path(entry.path()) else {
                     tracing::debug!(path = %entry.path().display(), "skipping non-UTF-8 path");
                     continue;
                 };
-                if let Some(rel) = paths::relative_to(root, abs) {
-                    out.push(rel);
+                let Some(rel) = paths::relative_to(root, abs) else {
+                    continue;
+                };
+                // Checked before `is_file`, because with `follow_links(false)`
+                // a link is neither a file nor a directory: falling through to
+                // the file test would silently discard the one entry a user
+                // needs told about.
+                if kind.is_some_and(|kind| kind.is_symlink()) {
+                    walk.links.push(rel);
+                } else if kind.is_some_and(|kind| kind.is_file()) {
+                    walk.files.push(rel);
                 }
             }
             Err(err) => tracing::debug!(error = %err, "walk error"),
         }
     }
-    out
+    walk
 }
 
 #[cfg(test)]
@@ -386,26 +439,26 @@ mod tests {
         }
 
         fn walk_from(&self, start: &Utf8Path, max_depth: Option<usize>) -> Vec<String> {
-            let mut files: Vec<String> =
-                walk_files(&self.root, start, max_depth, &self.data_dir, None)
-                    .into_iter()
-                    .map(|p| p.to_string())
-                    .collect();
-            files.sort();
-            files
+            sorted(walk_files(&self.root, start, max_depth, &self.data_dir, None).files)
+        }
+
+        /// The other half of the same walk: what it declined to follow.
+        fn links(&self) -> Vec<String> {
+            sorted(walk_files(&self.root, &self.root, None, &self.data_dir, None).links)
         }
 
         /// A walk rooted somewhere other than this fixture's own root — for a
         /// checkout that is registered as a project in its own right. Only the
         /// data directory (and so the user-level rules) is shared.
         fn walk_rooted_at(&self, root: &Utf8Path) -> Vec<String> {
-            let mut files: Vec<String> = walk_files(root, root, None, &self.data_dir, None)
-                .into_iter()
-                .map(|p| p.to_string())
-                .collect();
-            files.sort();
-            files
+            sorted(walk_files(root, root, None, &self.data_dir, None).files)
         }
+    }
+
+    fn sorted(paths: Vec<Utf8PathBuf>) -> Vec<String> {
+        let mut out: Vec<String> = paths.into_iter().map(|p| p.to_string()).collect();
+        out.sort();
+        out
     }
 
     // -----------------------------------------------------------------------
@@ -882,6 +935,98 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Links: not followed, but never silent
+    //
+    // Real links throughout. The whole question is what the *platform* reports
+    // for a reparse point, and a fixture that hand-built the shape would be a
+    // restatement of this module's assumptions rather than a test of them.
+    // -----------------------------------------------------------------------
+
+    /// A directory of content, outside any fixture root, for a link to point at.
+    fn elsewhere() -> (tempfile::TempDir, Utf8PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        std::fs::write(path.join("behind.md"), "content behind the link").unwrap();
+        (dir, path)
+    }
+
+    /// `mklink /J` — a Windows **junction**, which is what an assembled
+    /// workspace actually uses (a symlink needs privilege; a junction does
+    /// not, so this is the shape real trees have).
+    #[cfg(windows)]
+    fn junction(link: &Utf8Path, target: &Utf8Path) {
+        let out = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J", link.as_str(), target.as_str()])
+            .output()
+            .expect("mklink is available");
+        assert!(out.status.success(), "mklink /J failed: {out:?}");
+    }
+
+    /// The defect, exactly: a workspace whose entire corpus is reached through
+    /// directory links indexes its loose files and nothing else.
+    ///
+    /// The concrete case is `Lexomancy-bench` — three junctions over two other
+    /// checkouts, 3 loose files, and an index that reported `files: 3` with no
+    /// hint that anything had been declined. Editing its `.loreignore` could
+    /// not change the outcome, because no ignore rule is ever consulted for a
+    /// tree the walk does not enter.
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_junction_is_not_followed_but_is_reported() {
+        let (_keep, target) = elsewhere();
+        let fixture = Fixture::new(&[("loose.md", "# notes")]);
+        junction(&fixture.root.join("corpus"), &target);
+
+        assert_eq!(fixture.walk(), ["loose.md"], "the link is not followed");
+        assert_eq!(fixture.links(), ["corpus"], "and it is not silent either");
+    }
+
+    /// The platform detail the report rests on: Windows sets the
+    /// reparse-point attribute for a junction with a name-surrogate tag, and
+    /// Rust answers `is_symlink()` for it. Pinned because the whole
+    /// classification above is one `is_symlink` call — were that ever to
+    /// answer `is_dir` instead, junction trees would be walked (and
+    /// duplicated) with no other test noticing.
+    #[cfg(windows)]
+    #[test]
+    fn windows_reports_a_junction_as_a_symlink() {
+        let (_keep, target) = elsewhere();
+        let fixture = Fixture::new(&[]);
+        let link = fixture.root.join("corpus");
+        junction(&link, &target);
+
+        let kind = std::fs::symlink_metadata(&link).unwrap().file_type();
+        assert!(kind.is_symlink(), "a junction is a link to std");
+        assert!(!kind.is_dir(), "and specifically not a directory");
+        // Following it deliberately *does* resolve — the walker's choice not
+        // to is policy, not an inability.
+        assert!(fixture.root.join("corpus/behind.md").is_file());
+    }
+
+    /// An ignore rule still applies to the link itself, so a project that has
+    /// already decided a link is noise does not get told about it every pass.
+    /// (Which tree the link points at is not something the rules can reach —
+    /// that is the part this module cannot fix with a rule.)
+    #[cfg(windows)]
+    #[test]
+    fn an_ignored_link_is_not_reported() {
+        let (_keep, target) = elsewhere();
+        let fixture = Fixture::new(&[("loose.md", "# notes"), (".loreignore", "corpus\n")]);
+        junction(&fixture.root.join("corpus"), &target);
+
+        assert_eq!(fixture.links(), Vec::<String>::new());
+        assert_eq!(fixture.walk(), [".loreignore", "loose.md"]);
+    }
+
+    /// A tree with no links at all reports none — the report is evidence, so
+    /// it has to be quiet when there is nothing to say.
+    #[test]
+    fn a_tree_without_links_reports_none() {
+        let fixture = Fixture::new(&[("src/main.rs", "fn main() {}"), ("keep.md", "# notes")]);
+        assert_eq!(fixture.links(), Vec::<String>::new());
+    }
+
+    // -----------------------------------------------------------------------
     // The hard floor
     // -----------------------------------------------------------------------
 
@@ -928,12 +1073,13 @@ mod tests {
         std::fs::write(data_dir.join("index.sqlite3"), "db").unwrap();
         std::fs::write(root.join("keep.rs"), "x").unwrap();
 
-        let mut files: Vec<String> = walk_files(&root, &root, None, &data_dir, None)
-            .into_iter()
-            .map(|p| p.to_string())
-            .collect();
-        files.sort();
-        assert_eq!(files, ["keep.rs"]);
-        assert!(walk_files(&root, &data_dir, None, &data_dir, None).is_empty());
+        assert_eq!(
+            sorted(walk_files(&root, &root, None, &data_dir, None).files),
+            ["keep.rs"]
+        );
+        assert_eq!(
+            walk_files(&root, &data_dir, None, &data_dir, None),
+            Walk::default()
+        );
     }
 }

@@ -563,3 +563,49 @@ fn a_tripped_guard_is_remembered_until_a_pass_succeeds() {
     );
     assert_eq!(fixture.indexed_paths().len(), 10);
 }
+
+/// A pass accounts for what it declined to walk.
+///
+/// The failure this closes is not a wrong index — it is a silent one. A
+/// workspace whose corpus sits behind directory junctions indexes its loose
+/// files and, in every number the summary reports, is indistinguishable from a
+/// project that genuinely has three files in it. `links_skipped` is the
+/// difference, and it is what makes an unchanged `.loreignore` edit explicable
+/// instead of mysterious.
+#[cfg(windows)]
+#[test]
+fn a_pass_reports_the_links_it_did_not_follow() {
+    let corpus = tempfile::tempdir().unwrap();
+    let corpus = camino::Utf8Path::from_path(corpus.path()).unwrap();
+    std::fs::write(corpus.join("behind.md"), "# not indexed").unwrap();
+
+    let fixture = Fixture::new("demo");
+    fixture.write("loose.md", "# the only real file");
+    let out = std::process::Command::new("cmd")
+        .args([
+            "/c",
+            "mklink",
+            "/J",
+            fixture.root.join("corpus").as_str(),
+            corpus.as_str(),
+        ])
+        .output()
+        .expect("mklink is available");
+    assert!(out.status.success(), "mklink /J failed: {out:?}");
+
+    let summary = full_scan(&fixture.context(), &fixture.project);
+
+    assert_eq!(summary.links_skipped, 1, "{summary:?}");
+    assert_eq!(summary.seen, 1, "only the loose file was ever considered");
+    assert_eq!(fixture.indexed_paths(), ["loose.md"]);
+}
+
+/// And reports none when there are none — a count that is always non-zero is
+/// not a signal.
+#[test]
+fn a_pass_over_a_tree_without_links_reports_none() {
+    let fixture = Fixture::new("demo");
+    populate_standard_tree(&fixture);
+    let summary = full_scan(&fixture.context(), &fixture.project);
+    assert_eq!(summary.links_skipped, 0, "{summary:?}");
+}

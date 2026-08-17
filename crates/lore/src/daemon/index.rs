@@ -139,6 +139,11 @@ pub struct PassSummary {
     pub skipped: usize,
     /// Files dropped from the index (deleted, ignored, or newly binary).
     pub removed: usize,
+    /// Symbolic links (Windows junctions included) the observation declined to
+    /// follow, and therefore everything beneath them that was never looked at.
+    /// Reported because a project whose content sits behind links otherwise
+    /// presents as a project that is simply almost empty.
+    pub links_skipped: usize,
     pub chunks_inserted: usize,
     pub chunks_kept: usize,
     pub chunks_deleted: usize,
@@ -265,6 +270,7 @@ fn apply(
     let profile = refresh_profile(ctx, project, &mut summary);
 
     summary.seen = snapshot.considered();
+    summary.links_skipped = snapshot.links.len();
     // A file the observer could not read is not evidence of anything: it is
     // neither indexed nor deleted, only counted.
     summary.errors += snapshot.unreadable.len();
@@ -275,6 +281,7 @@ fn apply(
         finish(ctx, project, kind, started, &mut summary);
         return summary;
     }
+    log_skipped_links(project, &snapshot.links);
 
     let stored = match ctx.store.blocking(|store| store.list_files(project.id)) {
         Ok(stored) => stored,
@@ -759,6 +766,7 @@ fn finish(
         unchanged = summary.unchanged,
         skipped = summary.skipped,
         removed = summary.removed,
+        links_skipped = summary.links_skipped,
         chunks_inserted = summary.chunks_inserted,
         chunks_kept = summary.chunks_kept,
         chunks_deleted = summary.chunks_deleted,
@@ -780,6 +788,36 @@ fn finish(
     // that merely *kept* chunks can still have left work (vectors discarded
     // by a fingerprint reset), and an unnecessary pulse costs one no-op query.
     ctx.embed_notify.notify_one();
+}
+
+/// Say which links the observation refused to follow.
+///
+/// A warning rather than a debug line, and repeated on every pass rather than
+/// only when the set changes — for the same reason a broken `.lore.toml` is
+/// re-reported every pass. A workspace assembled from directory junctions
+/// (the concrete case: a bench root whose entire corpus is three junctions)
+/// indexes its loose files and looks, in every other line of output, like a
+/// project that simply has almost nothing in it. The count in the summary is
+/// the signal; this is the part that says which paths to look at.
+///
+/// Capped, because the pathological shape here is a tree full of links and a
+/// warning that scrolls the pass summary off the screen helps nobody.
+fn log_skipped_links(project: &Project, links: &BTreeSet<Utf8PathBuf>) {
+    const NAMED: usize = 10;
+    if links.is_empty() {
+        return;
+    }
+    let mut named: Vec<&str> = links.iter().take(NAMED).map(|link| link.as_str()).collect();
+    let overflow = links.len().saturating_sub(NAMED);
+    let overflow = (overflow > 0).then(|| format!("+{overflow} more"));
+    named.extend(overflow.as_deref());
+    tracing::warn!(
+        project = %project.name,
+        links = links.len(),
+        paths = %named.join(", "),
+        "symbolic links were not followed; nothing beneath them is indexed \
+         (Windows junctions count as links)"
+    );
 }
 
 fn log_store_error(project: &Project, rel: &Utf8Path, err: &StoreError) {

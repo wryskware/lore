@@ -1100,6 +1100,9 @@ async fn push_commit(
         // pusher declared it whole and the checksum agreed.
         complete: true,
         unreadable: BTreeSet::new(),
+        // A pusher resolves its own links before it builds a manifest; what
+        // it declined to follow is its business and never reaches the wire.
+        links: BTreeSet::new(),
         content: Box::new(plan.content),
     };
 

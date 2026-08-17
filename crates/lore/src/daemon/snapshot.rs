@@ -88,6 +88,12 @@ pub struct Snapshot {
     /// (there is no hash for them) *and* from deletion: a file that could not
     /// be read is not evidence that it is gone. Counted as pass errors.
     pub unreadable: BTreeSet<Utf8PathBuf>,
+    /// Symbolic links (Windows junctions included) the observer declined to
+    /// follow. Not part of the manifest and not a deletion signal — they are
+    /// the observation's own account of what it chose not to look at, so a
+    /// pass can say so instead of reporting a small `seen` with no
+    /// explanation.
+    pub links: BTreeSet<Utf8PathBuf>,
     pub content: Box<dyn ContentSource>,
 }
 
@@ -139,13 +145,13 @@ pub fn observe_project(
     data_dir: &Utf8Path,
     cancel: &CancellationToken,
 ) -> Snapshot {
-    let files: BTreeSet<Utf8PathBuf> = walk::walk_files(root, root, None, data_dir, Some(cancel))
-        .into_iter()
-        .collect();
+    let walk = walk::walk_files(root, root, None, data_dir, Some(cancel));
+    let files: BTreeSet<Utf8PathBuf> = walk.files.into_iter().collect();
+    let links: BTreeSet<Utf8PathBuf> = walk.links.into_iter().collect();
     // A cancelled walk is partial: applying it would treat every unwalked file
     // as deleted.
     let complete = !cancel.is_cancelled();
-    hash_all(root, files, Scope::Project, complete, cancel)
+    hash_all(root, files, links, Scope::Project, complete, cancel)
 }
 
 /// Observe exactly these project-relative paths — what a watcher batch turns
@@ -179,6 +185,7 @@ pub fn observe_paths(
 ) -> Snapshot {
     let mut scope: BTreeSet<Utf8PathBuf> = BTreeSet::new();
     let mut files: BTreeSet<Utf8PathBuf> = BTreeSet::new();
+    let mut links: BTreeSet<Utf8PathBuf> = BTreeSet::new();
     // Parent directory -> the files under it this batch mentions.
     let mut by_parent: BTreeMap<Utf8PathBuf, Vec<&Utf8Path>> = BTreeMap::new();
 
@@ -195,7 +202,9 @@ pub fn observe_paths(
         match std::fs::metadata(&abs) {
             Err(_) => {}
             Ok(meta) if meta.is_dir() => {
-                files.extend(walk::walk_files(root, &abs, None, data_dir, Some(cancel)));
+                let walk = walk::walk_files(root, &abs, None, data_dir, Some(cancel));
+                files.extend(walk.files);
+                links.extend(walk.links);
             }
             Ok(_) => {
                 let parent = rel.parent().unwrap_or(Utf8Path::new("")).to_owned();
@@ -210,10 +219,9 @@ pub fn observe_paths(
         } else {
             root.join(&parent)
         };
-        let allowed: BTreeSet<Utf8PathBuf> =
-            walk::walk_files(root, &start, Some(1), data_dir, Some(cancel))
-                .into_iter()
-                .collect();
+        let walk = walk::walk_files(root, &start, Some(1), data_dir, Some(cancel));
+        let allowed: BTreeSet<Utf8PathBuf> = walk.files.into_iter().collect();
+        links.extend(walk.links);
         files.extend(
             named
                 .into_iter()
@@ -226,7 +234,7 @@ pub fn observe_paths(
     // missing (its parent listing came back partial); deleting on partial
     // evidence deletes real index rows.
     let complete = !cancel.is_cancelled();
-    hash_all(root, files, Scope::Paths(scope), complete, cancel)
+    hash_all(root, files, links, Scope::Paths(scope), complete, cancel)
 }
 
 /// Read and hash every observed file into a manifest.
@@ -240,6 +248,7 @@ pub fn observe_paths(
 fn hash_all(
     root: &Utf8Path,
     files: impl IntoIterator<Item = Utf8PathBuf>,
+    links: BTreeSet<Utf8PathBuf>,
     scope: Scope,
     complete: bool,
     cancel: &CancellationToken,
@@ -274,6 +283,7 @@ fn hash_all(
         scope,
         complete,
         unreadable,
+        links,
         content: Box::new(DiskContent::new(root)),
     }
 }

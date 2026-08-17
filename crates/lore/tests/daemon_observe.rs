@@ -266,3 +266,59 @@ fn with_no_rules_anywhere_the_manifest_is_the_whole_project() {
         [".env", "src/main.rs", "target/debug/build.rs"]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Links the observer declined to follow
+// ---------------------------------------------------------------------------
+
+/// A link is not followed, and the snapshot says so — in *both* observation
+/// shapes, because a watcher batch that named the link has to reach the same
+/// verdict the full scan does.
+///
+/// Windows-only because the shape that motivated this is a directory
+/// **junction** (`Lexomancy-bench`: three junctions over other checkouts, three
+/// loose files, and a `files: 3` index with nothing saying why). A junction
+/// needs no privilege to create, which is why assembled workspaces use one and
+/// why the fixture can build a real one here.
+#[cfg(windows)]
+#[test]
+fn a_junctioned_corpus_is_absent_from_the_manifest_and_named_in_the_snapshot() {
+    let corpus = tempfile::tempdir().unwrap();
+    let corpus = Utf8Path::from_path(corpus.path()).unwrap();
+    std::fs::write(corpus.join("behind.md"), "# the actual content").unwrap();
+
+    let project = Project::new(&[("loose.md", "# the only real file")]);
+    let out = std::process::Command::new("cmd")
+        .args([
+            "/c",
+            "mklink",
+            "/J",
+            project.root.join("corpus").as_str(),
+            corpus.as_str(),
+        ])
+        .output()
+        .expect("mklink is available");
+    assert!(out.status.success(), "mklink /J failed: {out:?}");
+    // The content really is reachable through the link; not walking it is a
+    // choice, and the test would be vacuous if the fixture were broken.
+    assert!(project.root.join("corpus/behind.md").is_file());
+
+    let full = project.observe();
+    assert_eq!(listed(&full), ["loose.md"]);
+    assert_eq!(
+        full.links.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
+        ["corpus"],
+        "the manifest omits it, so something else has to account for it"
+    );
+
+    // The watcher's shape, over the link itself and a path inside it.
+    let batch = project.observe_batch(&["corpus", "corpus/behind.md"]);
+    assert!(listed(&batch).is_empty(), "{:?}", listed(&batch));
+}
+
+/// The report is evidence, so it stays quiet when there is nothing to report.
+#[test]
+fn a_project_without_links_reports_none() {
+    let project = Project::new(&[("src/main.rs", "fn main() {}")]);
+    assert!(project.observe().links.is_empty());
+}
