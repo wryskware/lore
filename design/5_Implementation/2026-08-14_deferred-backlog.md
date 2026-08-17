@@ -24,10 +24,16 @@ briefs; details in the cited docs.
   code/plain-text chunkers leak it into the first chunk.
 - **ATX trailing-`#` trimming.** `scan_headings` trims unconditionally, so
   `# Learning C#` loses its `#` in heading paths/anchors.
-- **`path_glob` search filter.** 4.1 was amended (S1#8) to document the
-  implemented literal prefix; a real glob (`Assets/**/Tests/*.cs`, globset,
-  SQL prefix pushdown, Windows case-folding parity in both arms) is still
-  wanted for Unity workflows.
+- **`path_glob` search filter — deferred until a need arises (low
+  priority).** 4.1 was amended (S1#8) to document the implemented literal
+  prefix; a real glob (`Assets/**/Tests/*.cs`, globset, SQL prefix pushdown,
+  Windows case-folding parity in both arms) was wanted for Unity workflows.
+  Wrysk's call, 2026-08-16: don't build it now. The original cross-project
+  noise motivation is largely gone under mandatory project scoping (D-0016),
+  agents doing natural-language retrieval rarely reach for a path filter, and
+  issues #22/#2 name a more useful filtering axis — partitioning by document
+  type (design/docs vs code vs issues) as DB-level tags. Revisit if a real
+  workflow demands paths specifically.
 
 ## Dogfood findings (2026-08-15, first daemon session)
 
