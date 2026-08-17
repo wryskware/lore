@@ -60,7 +60,7 @@ numbered sub-questions, no "be sure to check X".
 | D6 | lexomancy T5 shield normalisation was under-specified; Revision A freed the denominator. | Kept free, tightened: the prompt now states the deterministic and degenerate-case requirements that were previously key-only. |
 | D7 | Bench projects indexed with `authority: none`, so the lore repo's own authority/modality task ran against a neutrally-indexed project. | Round 2 runs `lore-bench` under the `lore-v1` profile. See § Run protocol, and `bench/README.md` § Round-2 setup step 3b. |
 | D8 | `metrics.json` recorded no prompt identity, so a results directory could not be attributed to a prompt version. | `run.ps1` now records `task_set` and `prompt_sha256`. |
-| D9 | **The Lexomancy vault pin is not enforced.** The bench workspace's `design` junction resolves to the live vault working tree, currently 3 commits ahead of `d5e0d53310`. Round 1 ran against an unpinned vault while claiming a pin. | Recorded, **not fixed** — fixing it needs a decision from Wrysk. See § Lexomancy, corpus caveat, and § Open questions item 3. |
+| D9 | **The Lexomancy vault pin is not enforced.** The bench workspace's `design` junction resolves to the live vault working tree, 3 commits ahead of `d5e0d53310`. Round 1 ran against an unpinned vault while claiming a pin. | **Resolved 2026-08-17 by restating the pin, not by enforcing it.** Wrysk: the post-pin commits are trivial and "would have already been present just not tracked", and "nothing has been touched there since we ran the last bench" — so the working tree is content-identical to what round 1 ran against and the drift is bookkeeping. Corroborated independently: every vault directory these keys cite is byte-identical pin↔HEAD, with one irrelevant post-pin addition. The vault pin is therefore **the working tree as of run day, SHA recorded in the results notes**; at time of writing that is `7604c27ed2f9a6d1764b44acbb348607d872b019`. Re-record it on run day rather than trusting this value. |
 | D10 | Round-1 keys carried wrong paths and wrong facts that would have marked correct answers wrong: `2_Encounters/` (really `2_BattleMechanics/`), `5_Prototypes/` (really `5_Implementation/`), "1.6_ForgingSystem and 6.1_Lexinomicon claim axiom capacity" (they claim residue cost, nothing about capacity), "D-0016 reserves per-unit taunt state" (it mentions taunt; it reserves the seam), lexomancy T1's terminus at `PayloadExecutor` (which never touches `BattleUnit`), terrarium T1's physarum-only terminus. | All corrected below, each with the correction called out where a grader might otherwise carry the old belief forward. |
 
 ## Pins — unchanged
@@ -681,6 +681,12 @@ export pipeline — contradicted in the same file at `CLAUDE.md:44-54`.
 `docs/roadmap.md:3-4` claims to be "the current sequencing authority for feature
 work" — sequencing, not architecture — and `CLAUDE.md:64-72` never routes to it
 at all, so an agent obeying CLAUDE.md misses the newest document.
+
+Note that the placeholder claims exist **only at the pin**: upstream commits
+`822c0fd` and `7f4e55a` rewrote the README and `8506c7d` ("docs: CLAUDE.md stops
+calling this a placeholder repo") removed the other. These traps vanish if the
+terrarium pin ever moves — one of the reasons § Recommendation on the pins
+argues against moving it.
 
 **Scale.** 1 = both conjuncts: the runtime no longer consumes it *and* analysis
 still emits it, plus Revision 4 identified as superseding Revision 3 within
@@ -1382,13 +1388,47 @@ machine, and it buys nothing the setup-time scrub does not already buy. The
 scrub is idempotent, asserted by `run.ps1` before every cell, and protected
 from the T5 reset.
 
-**Cost if Wrysk decides to re-pin anyway** (to current `main`, say, rather than
-a scrub commit): re-derive every lore key — T1's seven hops, T3's ten stages,
-T5's `CHUNK_FORMAT_VERSION` (already `5` on `main`, which changes T5's criterion
-4 into "bump 5 → 6") — roughly the work of the lore section of this document,
-call it half a day, plus a full re-embed of `lore-bench`. Terrarium and
-Lexomancy keys are unaffected by a lore re-pin. Moving *those* pins would cost
-their sections in full. **This is Wrysk's call, not this document's.**
+**Decided 2026-08-17: stay at all three.** Wrysk granted authority to move any
+pin ("i also dont really care if you update the other pins either"). The
+authorization was not taken up, because checking the newer trees turned up two
+findings that each independently argue against moving:
+
+**lore-bench — moving it destroys T5 and multiplies the leak.**
+
+1. **The ATX bug is already fixed on `main`.** `chunk/markdown.rs` now carries
+   an `atx_title` helper whose doc comment narrates the exact CommonMark rule
+   T5 grades against, and `CHUNK_FORMAT_VERSION` is already `5`. At any newer
+   pin **lore T5 does not exist as a task**, and the corpus contains a worked
+   example of precisely the reasoning a replacement task would test. A new
+   bounded-implementation task would have to be invented from the deferred
+   backlog and its key derived from scratch. (This corrects an earlier draft of
+   this section, which said re-pinning merely changes T5's criterion 4 into
+   "bump 5 → 6". That understated the cost.)
+2. **The leak gets six times worse.** `main` carries `design/6_Evaluation/`
+   with the round-1 plan, the answer-key doc containing all fifteen prompts and
+   the grading protocol, the luna results, the report and Revision A — plus the
+   round-2 steering drafts and this document. Today's one-file scrub becomes a
+   six-file scrub against a directory that grows every time evaluation work
+   happens, with a silent failure mode: someone adds an eval doc, nobody
+   updates the scrub list, and the next round runs against its own key. One
+   stale file guarded by a preflight assertion is strictly the safer shape.
+
+**terrarium-bench — highest cost, negative value.** Eight commits since
+`3b1eacd56f`. Three are docs, and two of those actively remove trap material
+T2 relies on (`822c0fd`, `7f4e55a` rewrite the README; `8506c7d` is
+*"docs: CLAUDE.md stops calling this a placeholder repo"*). The other five add
+seed-favourites UI and key bindings — new `web/src` code — so T3's ~40
+line-level citations, the largest single block of derived work here, would need
+redoing in full, along with T1, T2, T4 and T5. Nothing in those commits makes a
+better task.
+
+**Lexomancy — pin restated rather than enforced.** See D9 and § Open questions
+item 3.
+
+**If a future round re-pins anyway**, the cost is re-deriving that repo's whole
+section — for lore, T1's seven hops and T3's ten stages plus a replacement for
+T5, roughly half a day, plus a full re-embed of `lore-bench`. Repos are
+independent: a lore re-pin does not touch the terrarium or Lexomancy keys.
 
 ## What was deliberately not done
 
@@ -1419,15 +1459,16 @@ their sections in full. **This is Wrysk's call, not this document's.**
    a two-arm comparison. An on-arm-only steering round can use the same
    prompts, but the keys' "could the off arm plausibly succeed" reasoning does
    not apply to it.
-3. **The Lexomancy vault pin (D9) — Wrysk's call.** The `design` junction
-   resolves to the live working tree, so `d5e0d53310` is a claim, not a
-   mechanism. Two honest options: (a) create a git worktree of the vault at the
-   pin and point the junction at it, which costs a worktree and a junction
-   rebuild and makes the stated pin true; or (b) drop the pretence and pin the
-   vault to "working tree as of run day", recording the SHA in the results
-   notes. Every vault directory this document cites was verified identical
-   between `d5e0d53310` and current HEAD, so **round 2's keys are valid either
-   way** — this is about the protocol being honest, not about the keys.
+3. ~~**The Lexomancy vault pin (D9) — Wrysk's call.**~~ **Answered 2026-08-17:
+   option (b).** The vault pin is "working tree as of run day", SHA recorded in
+   the results notes, rather than a junction rebuilt onto a git worktree at
+   `d5e0d53310`. Wrysk's evidence: the post-pin commits are trivial and were
+   already present on disk untracked, and nothing has been touched in the vault
+   since round 1 ran — so the working tree *is* what round 1 measured, and
+   enforcing the older SHA would buy accuracy that is already there. This was
+   never a threat to the keys (every cited directory verified byte-identical
+   pin↔HEAD); it was the protocol claiming a mechanism it did not have, and
+   the fix is to state what is actually true. See D9 for the run-day SHA.
 4. **`design/2_BattleMechanics/2.5_impl/00_Overview.md` §11 was not read.**
    `DECISIONS.md:503` calls it the verbatim rulings record for D-0016, and
    lexomancy T4 grades against D-0016's summary of it. Read it before freezing;
