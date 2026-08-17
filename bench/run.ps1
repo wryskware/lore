@@ -94,7 +94,22 @@ $loreMcpExe = 'C:\Users\perag\bench-e2e\bin\lore-mcp.exe'
 # mid-round silently changes what the project indexes.
 $daemonArtifacts = @('.lore.toml', '.loreignore')
 
-$prompts = Get-Content (Join-Path $benchRoot 'prompts.json') -Raw | ConvertFrom-Json
+# Corpus scrub. These paths exist at the pin and LEAK THE ANSWER KEY into the
+# corpus under test: the round-1 plan doc carries the task list and the graded
+# answers for all three repos. setup-worktrees.ps1 deletes them; this script
+# refuses to run a cell while one is present, and the T5 reset below must not
+# resurrect them (`git checkout -- .` restores a deleted tracked file), so they
+# are excluded from the staged diff and from the restoring checkout the same way
+# the daemon artifacts are. See design/6_Evaluation/2026-08-17_e2e-round-2-task-set.md
+# § "Corpus scrub".
+$scrubbed = @{
+    lore      = @('design/9_Scratch/2026-08-15_e2e-round-1-plan.md')
+    terrarium = @()
+    lexomancy = @()
+}
+
+$promptsPath = Join-Path $benchRoot 'prompts.json'
+$prompts = Get-Content $promptsPath -Raw | ConvertFrom-Json
 
 function Get-CmChanged([string]$cmDir) {
     Push-Location $cmDir
@@ -108,6 +123,7 @@ function Invoke-Cell([string]$model, [string]$repo, [string]$arm, [string]$task)
     $s = $r.slots[$slot]
     $prompt = $prompts.$repo.$task
     if (-not $prompt) { throw "no prompt for $repo/$task" }
+    $scrub = @($scrubbed[$repo])
 
     # Preflight. A missing tree means setup-worktrees.ps1 has not been run (or
     # not for this slot); failing here beats running the cell against nothing.
@@ -120,6 +136,12 @@ function Invoke-Cell([string]$model, [string]$repo, [string]$arm, [string]$task)
     if (-not (Test-Path -LiteralPath $loreMcpExe)) {
         throw "pinned lore-mcp binary missing: $loreMcpExe. Run bench\setup-worktrees.ps1 -PinBinary."
     }
+    # Answer-key material must not be inside the corpus under test.
+    foreach ($rel in $scrub) {
+        if (Test-Path -LiteralPath (Join-Path $s.dir $rel)) {
+            throw "$repo/$arm : '$rel' is present in $($s.dir) and leaks the answer key into the corpus. Run bench\setup-worktrees.ps1 -Apply -Scrub."
+        }
+    }
 
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $cell = "$stamp-$model-$repo-$arm-$task"
@@ -130,13 +152,16 @@ function Invoke-Cell([string]$model, [string]$repo, [string]$arm, [string]$task)
     $preCm = if ($r.vcs -eq 'cm') { Get-CmChanged $s.cmDir } else { $null }
 
     $env:OPENCODE_CONFIG = Join-Path $benchRoot "opencode-$arm.jsonc"
-    $args = @('run', '--dir', $s.dir, '-m', $m.id, '--format', 'json', '--title', $cell, '--auto')
-    if ($m.variant) { $args += @('--variant', $m.variant) }
-    $args += $prompt
+    # Not `$args`: that is an automatic variable, and shadowing it inside a
+    # function is the kind of quiet weirdness this harness has already been
+    # bitten by once.
+    $ocArgs = @('run', '--dir', $s.dir, '-m', $m.id, '--format', 'json', '--title', $cell, '--auto')
+    if ($m.variant) { $ocArgs += @('--variant', $m.variant) }
+    $ocArgs += $prompt
 
     Write-Host "[$cell] running..." -ForegroundColor Cyan
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    & opencode @args 1> (Join-Path $outDir 'events.jsonl') 2> (Join-Path $outDir 'stderr.log')
+    & opencode @ocArgs 1> (Join-Path $outDir 'events.jsonl') 2> (Join-Path $outDir 'stderr.log')
     $exit = $LASTEXITCODE
     $sw.Stop()
     Remove-Item Env:OPENCODE_CONFIG -ErrorAction SilentlyContinue
@@ -174,7 +199,12 @@ function Invoke-Cell([string]$model, [string]$repo, [string]$arm, [string]$task)
             # staging/diff via pathspecs and from the clean via -e, so the
             # reset cannot delete the project's .loreignore out from under the
             # daemon mid-round.
-            $exclude = @($daemonArtifacts | ForEach-Object { ":(exclude)$_" })
+            # Scrubbed paths join the daemon artifacts here for a different
+            # reason: they are DELETED tracked files, so without the exclusion
+            # the diff would carry a spurious deletion hunk AND the restoring
+            # checkout below would put the answer key back into the corpus for
+            # every later cell in this tree.
+            $exclude = @(($daemonArtifacts + $scrub) | ForEach-Object { ":(exclude)$_" })
             git -C $s.dir add -N -- . @exclude 2>$null
             # git writes the file itself — piping through Set-Content rewrites
             # line endings and breaks `git apply`. Quoted as ONE argument:
@@ -182,7 +212,7 @@ function Invoke-Cell([string]$model, [string]$repo, [string]$arm, [string]$task)
             # empty --output= and captures nothing (lost the 4 qwen T5 diffs
             # on 2026-08-16 before this fix).
             git -C $s.dir diff "--output=$(Join-Path $outDir 'diff.patch')" -- . @exclude
-            git -C $s.dir checkout -- . 2>$null
+            git -C $s.dir checkout -- . @exclude 2>$null
             $keep = @($daemonArtifacts | ForEach-Object { '-e'; $_ })
             git -C $s.dir clean -fd @keep 2>$null
         } else {
@@ -235,6 +265,13 @@ function Invoke-Cell([string]$model, [string]$repo, [string]$arm, [string]$task)
     $metrics = [ordered]@{
         cell = $cell; model = $m.id; repo = $repo; arm = $arm; task = $task
         slot = $slot; dir = $s.dir; project = $s.project
+        # Which task set this cell was asked. Prompts are no longer frozen
+        # across rounds, so a results dir that cannot name its prompt cannot be
+        # attributed to a key. The hash is the real identity; the id is for eyes.
+        task_set = $prompts._task_set
+        prompt_sha256 = (Get-FileHash -InputStream (
+                [IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes($prompt))
+            ) -Algorithm SHA256).Hash
         lore_mcp = [ordered]@{
             path     = $loreMcpExe
             sha256   = (Get-FileHash -LiteralPath $loreMcpExe -Algorithm SHA256).Hash

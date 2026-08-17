@@ -8,6 +8,8 @@
 #   .\setup-worktrees.ps1                    # DRY RUN — prints the plan, changes nothing
 #   .\setup-worktrees.ps1 -Apply             # create + register slot 'b'
 #   .\setup-worktrees.ps1 -Apply -PinBinary  # also pin lore-mcp.exe for the round
+#   .\setup-worktrees.ps1 -Apply -Scrub      # delete answer-key material from BOTH slots
+#   .\setup-worktrees.ps1 -Apply -Authority  # write the [authority] profile (round 2)
 #   .\setup-worktrees.ps1 -WaitDrained       # poll `lore status` until every
 #                                            # bench project is 100% embedded
 #
@@ -22,6 +24,11 @@ param(
     [switch]$Apply,
     [switch]$PinBinary,
     [switch]$WaitDrained,
+    # Round 2: delete answer-key material out of the corpus under test, and
+    # give the lore tree the authority profile the real repo runs under.
+    # Both act on BOTH slots, including the round-1 slot 'a'.
+    [switch]$Scrub,
+    [switch]$Authority,
     [ValidateSet('lore', 'terrarium', 'lexomancy')] [string[]]$Repos = @('lore', 'terrarium', 'lexomancy'),
     # Source for the pinned lore-mcp binary. Build it yourself first; this only
     # copies, so the round's binary cannot drift when the live checkout is
@@ -78,6 +85,95 @@ if (-not $Apply -and -not $WaitDrained) {
     Write-Host 'DRY RUN — nothing will be changed. Re-run with -Apply.' -ForegroundColor Yellow
 }
 
+# --- 0. Round-2 corpus hygiene ------------------------------------------
+# Both slot 'a' (the round-1 tree) and slot 'b'.
+$slotDirs = @{
+    lore      = @('C:\Users\perag\bench-e2e\lore-bench', 'C:\Users\perag\bench-e2e\lore-bench-b')
+    terrarium = @('C:\Users\perag\bench-e2e\terrarium-bench', 'C:\Users\perag\bench-e2e\terrarium-bench-b')
+    lexomancy = @('C:\Users\perag\Unity\Lexomancy-bench', 'C:\Users\perag\Unity\Lexomancy-bench-b')
+}
+
+# Paths that exist at the pin and LEAK THE ANSWER KEY: the round-1 plan doc
+# carries the task list and the graded answers for all three repos. Keep in
+# sync with $scrubbed in run.ps1, which refuses to run a cell while one exists.
+$scrubPaths = @{
+    lore      = @('design/9_Scratch/2026-08-15_e2e-round-1-plan.md')
+    terrarium = @()
+    lexomancy = @()
+}
+
+# Which authority profile each bench project should index under. At the pins
+# none of these repos had a committed .lore.toml, so round 1 indexed them all
+# with `authority: none`. Round 2 restores the lore repo's real configuration
+# (its own vault is the thing its T2/T3 tasks interrogate). Terrarium is left
+# neutral on purpose: it has no `design_status` convention and no ledger, so a
+# profile there would declare a policy the corpus does not follow. Lexomancy is
+# retrieved from the main `Lexomancy` root, which already runs lore-v1 (rank).
+$authorityProfile = @{
+    lore      = @{ profile = 'lore-v1'; behavior = 'rank' }
+    terrarium = $null
+    lexomancy = $null
+}
+
+if ($Scrub) {
+    Write-Host 'Scrubbing answer-key material from the bench trees' -ForegroundColor Cyan
+    foreach ($repo in $Repos) {
+        foreach ($rel in @($scrubPaths[$repo])) {
+            foreach ($dir in $slotDirs[$repo]) {
+                if (-not (Test-Path -LiteralPath $dir)) { continue }
+                $full = Join-Path $dir $rel
+                if (-not (Test-Path -LiteralPath $full)) {
+                    Skip "$full already absent"
+                    continue
+                }
+                Step "remove $full"
+                if ($Apply) {
+                    Remove-Item -LiteralPath $full -Force
+                    Did "scrubbed $full"
+                }
+            }
+        }
+    }
+}
+
+if ($Authority) {
+    Write-Host 'Applying authority profiles' -ForegroundColor Cyan
+    foreach ($repo in $Repos) {
+        $prof = $authorityProfile[$repo]
+        if (-not $prof) {
+            Skip "$repo : no profile on purpose (see the comment in this script)"
+            continue
+        }
+        foreach ($dir in $slotDirs[$repo]) {
+            if (-not (Test-Path -LiteralPath $dir)) { continue }
+            $tomlPath = Join-Path $dir '.lore.toml'
+            if (-not (Test-Path -LiteralPath $tomlPath)) {
+                Todo "$tomlPath does not exist yet — register the project first, then re-run."
+                continue
+            }
+            $body = Get-Content -LiteralPath $tomlPath -Raw
+            if ($body -match '(?m)^\s*\[authority\]') {
+                Skip "$tomlPath already declares [authority]"
+                continue
+            }
+            Step "append [authority] profile=$($prof.profile) behavior=$($prof.behavior) to $tomlPath"
+            if ($Apply) {
+                $append = @(
+                    '',
+                    '# Round 2: index under the profile this repo really uses, so the',
+                    '# authority/modality tasks run against annotated + ranked results.',
+                    '[authority]',
+                    "profile = `"$($prof.profile)`"",
+                    "behavior = `"$($prof.behavior)`""
+                ) -join "`n"
+                Add-Content -LiteralPath $tomlPath -Value $append -Encoding utf8
+                Did "wrote [authority] into $tomlPath"
+                Todo 'A profile flip re-chunks Markdown (it does not re-embed). Re-run with -WaitDrained.'
+            }
+        }
+    }
+}
+
 # --- 1. Pin the lore-mcp binary ------------------------------------------
 # The arm configs point at $McpPinned, not at the live target\debug copy, so a
 # rebuild of the working checkout (D-0015 is landing) cannot re-pin a round
@@ -118,20 +214,20 @@ foreach ($p in $plan) {
         #     `lore add` falls back to the directory basename, which happens to
         #     work here, but declaring it makes the identity explicit and
         #     survives a rename of the directory.
-        #   * NO [authority] table. At the frozen pins neither bench repo had a
-        #     committed .lore.toml, so round 1 indexed both with
-        #     `authority: none`. Adding a profile here would quietly change the
-        #     retrieval conditions and make round 2 incomparable to round 1.
+        #   * [project] only here. The [authority] table is a separate,
+        #     explicit step (-Authority), because it is a deliberate round-2
+        #     variable and it applies to slot 'a' too — see the top of this
+        #     script for which repos get a profile and why.
         $tomlPath = Join-Path $p.Dir '.lore.toml'
-        Step "write $tomlPath  ([project] only — no [authority], see round-1 conditions)"
+        Step "write $tomlPath  ([project] only — [authority] comes from -Authority)"
         if (Test-Path -LiteralPath $tomlPath) {
             Skip "$tomlPath already exists — leaving it alone"
         }
         elseif ($Apply) {
             $body = @(
-                '# Bench slot b. [project] only, on purpose: the frozen pin had no',
-                '# .lore.toml, so round 1 indexed this repo with authority: none.',
-                '# Adding an [authority] profile here would change the experiment.',
+                '# Bench slot b. [project] only: the frozen pin had no .lore.toml,',
+                '# and the [authority] table is written by -Authority so it stays a',
+                '# deliberate, symmetric decision across both slots.',
                 '[project]',
                 "name = `"$($p.Project)`""
             ) -join "`n"
