@@ -50,7 +50,7 @@ use lore_core::{
 
 use crate::config::Config;
 use crate::embed::Embedder;
-use crate::store::Project;
+use crate::store::{Project, RegisterError};
 
 use super::queue::IndexQueue;
 use super::store_handle::StoreHandle;
@@ -338,39 +338,31 @@ async fn register_project(
             .to_string(),
     };
 
-    // Display names are how humans (and the CLI, and older wire clients) name
-    // a project, so two projects sharing one is not a cosmetic problem — it
-    // makes `expand(project, chunk_id)` resolve the wrong source or 404
-    // (S1#3). Reject at the door rather than silently accepting an ambiguous
-    // registry; the caller has a one-flag fix.
+    // The declared name is the project's identity (D-0016), so the store
+    // refuses to bind one that another root already holds — see
+    // [`Store::register_project`] for why the check lives there and not here.
     //
     // 409 rather than 400: the request is well-formed and the name is legal —
     // it is the *registry's current state* that refuses it, and that is a
     // state the caller can change. Re-adding the same root under the same name
-    // is not a collision with itself; it is the idempotent rename path below.
-    let existing = projects_of(&state).await?;
-    if crate::registry::names_taken_by_others(&existing, &root).contains(&name) {
-        let other = existing
-            .iter()
-            .find(|project| project.name == name)
-            .map(|project| project.root.to_string())
-            .unwrap_or_default();
-        return Err(ApiErr::conflict(format!(
-            "a project named `{name}` is already registered at {other}, so {root} cannot \
-             also claim it; choose another name with `--name <name>`, or edit that repo's \
-             .lore.toml to rename it"
-        )));
-    }
-
+    // is not a collision with itself; it is the idempotent rename path.
     let registered = {
-        let root = root.clone();
-        let name = name.clone();
+        let (owned_root, owned_name) = (root.clone(), name.clone());
         state
             .store
-            .with(move |store| store.register_project(&root, &name))
+            .with(move |store| store.register_project(&owned_root, &owned_name))
             .await
             .map_err(|err| ApiErr::internal("register", err))?
-            .map_err(|err| ApiErr::internal("register", err))?
+            .map_err(|err| match err {
+                RegisterError::NameTaken { name, held_by } => ApiErr::conflict(format!(
+                    "a project named `{name}` is already registered at {held_by}, so {root} \
+                     cannot also claim it: a project's identity is the name it is registered \
+                     under, and one name binds to one root. Register this one under a \
+                     different name with `lore add <path> --name <name>` (or edit that repo's \
+                     .lore.toml), or free the name with `lore remove {name}`"
+                )),
+                RegisterError::Store(err) => ApiErr::internal("register", err),
+            })?
     };
 
     // The manifest is authoritative, so it is republished from the store the

@@ -177,7 +177,9 @@ fn co_register(host: &Fixture, guest: &Fixture, name: &str) -> Project {
     let wanted = guest.root.clone();
     host.store
         .blocking(move |store| {
-            store.register_project(&root, &display)?;
+            store
+                .register_project(&root, &display)
+                .expect("the second project's name is free");
             store.list_projects()
         })
         .expect("register the second project")

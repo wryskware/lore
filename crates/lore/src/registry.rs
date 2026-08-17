@@ -42,7 +42,7 @@
 //! renaming a project does not change it. Display names are additionally kept
 //! unique at registration so the human-facing resolver stays deterministic.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher, RandomState};
 
 use anyhow::{Context, Result};
@@ -451,15 +451,29 @@ fn root_key(root: &Utf8Path) -> String {
     }
 }
 
-/// Display names that are already in use by a *different* root — the check
-/// registration runs so name resolution stays deterministic (S1#3).
-pub fn names_taken_by_others(projects: &[Project], root: &Utf8Path) -> BTreeSet<String> {
+/// The root of the project already bound to `name`, if it is a *different*
+/// root than `root`.
+///
+/// This is the lookup behind registration's duplicate-name refusal. D-0016
+/// makes a project's identity its registry-bound declared name, so a name is
+/// held by exactly one root and a second claimant is refused rather than
+/// disambiguated; re-registering the same root under the same name is not a
+/// collision with itself, which is what the root comparison excludes.
+///
+/// The conflicting root — not merely the fact of a conflict — is what the
+/// caller needs, because naming it is what makes the refusal actionable
+/// (S1#3: two projects sharing a display name is how a search hit becomes an
+/// `expand` 404).
+pub fn name_holder<'a>(
+    projects: &'a [Project],
+    root: &Utf8Path,
+    name: &str,
+) -> Option<&'a Utf8Path> {
     let mine = root_key(root);
     projects
         .iter()
-        .filter(|project| root_key(&project.root) != mine)
-        .map(|project| project.name.clone())
-        .collect()
+        .find(|project| project.name == name && root_key(&project.root) != mine)
+        .map(|project| project.root.as_path())
 }
 
 #[cfg(test)]

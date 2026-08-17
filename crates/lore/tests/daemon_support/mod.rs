@@ -59,7 +59,9 @@ impl Fixture {
             let name = name.to_string();
             store
                 .blocking(move |store| {
-                    store.register_project(&root, &name)?;
+                    store
+                        .register_project(&root, &name)
+                        .expect("the name is free in a fresh store");
                     store.list_projects()
                 })
                 .expect("register project")

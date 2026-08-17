@@ -597,8 +597,11 @@ async fn registering_a_duplicate_display_name_is_refused_with_a_remedy() {
     assert_eq!(status, StatusCode::CONFLICT, "{body:#}");
     let message = body["message"].as_str().unwrap();
     assert!(message.contains("already registered"), "{message}");
+    // Both remedies, because they are different decisions: rename this
+    // project, or give up the name the other one holds.
     assert!(message.contains("--name"), "{message}");
     assert!(message.contains(".lore.toml"), "{message}");
+    assert!(message.contains("lore remove demo"), "{message}");
     // Both roots are named, so the user can tell which project they collided
     // with without going looking for it.
     let claimant = lore::daemon::paths::canonicalize_root(&root).unwrap();
