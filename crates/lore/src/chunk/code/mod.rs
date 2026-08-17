@@ -330,6 +330,16 @@ fn emit_container(spec: &Spec<'_>, src: &str, item: &Item<'_>, emitter: &mut Emi
 /// siblings were consumed that way. A comment that attaches to nothing — a
 /// file header followed by a blank line, a trailing note — stays behind as
 /// its own content so no bytes are silently dropped.
+///
+/// The blank-line guard reads the source *between* two siblings, which is
+/// where the separation lives in every built-in grammar. Some grammars reify
+/// that separation instead: XML emits the whitespace between a comment and the
+/// element it documents as its own `CharData` node, so a manifest must list
+/// that kind under `attachments` for comments to attach at all — and then the
+/// inter-node gaps are all empty and the guard could never fire. Hence
+/// [`gap_before`]: an attachment node whose own text is pure whitespace *is*
+/// the gap, and is read as one. A comment's text is never read this way; an
+/// internal blank line must not detach a comment from what follows it.
 fn attach_leading(spec: &Spec<'_>, src: &str, children: &[Node<'_>]) -> (Vec<usize>, Vec<bool>) {
     let mut starts: Vec<usize> = children.iter().map(Node::start_byte).collect();
     let mut absorbed = vec![false; children.len()];
@@ -343,7 +353,7 @@ fn attach_leading(spec: &Spec<'_>, src: &str, children: &[Node<'_>]) -> (Vec<usi
             if !spec.attachments.contains(&prev.kind()) {
                 break;
             }
-            let gap = &src[prev.end_byte()..children[j].start_byte()];
+            let gap = gap_before(src, prev, children[j]);
             if !gap.trim().is_empty() || gap.matches('\n').count() > 1 {
                 break;
             }
@@ -353,6 +363,26 @@ fn attach_leading(spec: &Spec<'_>, src: &str, children: &[Node<'_>]) -> (Vec<usi
         }
     }
     (starts, absorbed)
+}
+
+/// The text separating the attachment `prev` from the node `next` that follows
+/// it, for the blank-line guard in [`attach_leading`].
+///
+/// Normally that is the source between the two nodes. When `prev` is itself
+/// pure whitespace it is not an attachment carrying content at all — it is the
+/// separation, handed to us as a node — so its own text counts as part of the
+/// gap. No built-in grammar's attachment kinds (`comment`, `line_comment`,
+/// `block_comment`, `attribute_item`, `inner_attribute_item`, `attribute_list`,
+/// `decorator`) can match a pure-whitespace node: each of them requires a
+/// non-whitespace lead token, so built-in output is unchanged.
+fn gap_before<'s>(src: &'s str, prev: Node<'_>, next: Node<'_>) -> &'s str {
+    let text = &src[prev.byte_range()];
+    let from = if text.trim().is_empty() {
+        prev.start_byte()
+    } else {
+        prev.end_byte()
+    };
+    &src[from..next.start_byte()]
 }
 
 fn unwrap<'t>(spec: &Spec<'_>, node: Node<'t>) -> Node<'t> {

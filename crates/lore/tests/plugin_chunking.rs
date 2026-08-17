@@ -140,6 +140,86 @@ fn a_declared_grammar_mapping_produces_meaningful_symbol_paths() {
     assert!(out.iter().all(|c| c.language.as_deref() == Some("xml")));
 }
 
+/// A UXML document whose two interesting comments sit either side of the
+/// blank-line rule: one directly above the element it documents, one a section
+/// banner with a blank line between it and what follows. Every element is over
+/// core's tiny-chunk threshold and the document as a whole over its
+/// small-container one, so each element lands in a chunk of its own and the
+/// assertions can read spans rather than merge results.
+#[cfg(feature = "wasm-grammars")]
+fn uxml_with_comment_spacing() -> String {
+    let button = |name: &str| {
+        format!(
+            "    <ui:Button name=\"{name}\" text=\"Run {name}\" tooltip=\"Runs the {name} step \
+             of the pipeline, which is described at length here so that this element clears \
+             core's tiny-chunk threshold on its own and is never merged with a sibling.\" />\n"
+        )
+    };
+    let mut out = String::from(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+         <ui:UXML xmlns:ui=\"UnityEngine.UIElements\">\n\
+         \x20   <!-- ATTACHED: documents the button on the very next line -->\n",
+    );
+    out.push_str(&button("near"));
+    out.push_str("\n    <!-- DETACHED: a section banner, blank line below -->\n\n");
+    out.push_str(&button("far"));
+    for i in 0..3 {
+        out.push_str(&button(&format!("pad{i}")));
+    }
+    out.push_str("</ui:UXML>\n");
+    out
+}
+
+#[cfg(feature = "wasm-grammars")]
+#[test]
+fn a_whitespace_attaching_grammar_still_honours_the_blank_line_rule() {
+    // With `CharData` attachable — which XML requires, or no comment ever
+    // attaches — every sibling is contiguous and the gap *between* nodes is
+    // always empty. The separation lives inside the whitespace node instead,
+    // and the blank-line rule has to read it there.
+    let registry = fixture_registry();
+    let src = uxml_with_comment_spacing();
+    let out = chunks(&registry, "Assets/UI/Spacing.uxml", &src);
+    assert_spans_exact(&out, &src);
+
+    let holding = |needle: &str| -> &Chunk {
+        let mut found = out.iter().filter(|c| c.text.contains(needle));
+        let first = found.next().unwrap_or_else(|| {
+            panic!(
+                "no chunk holds {needle:?}: {:?}",
+                out.iter().map(|c| &c.kind).collect::<Vec<_>>()
+            )
+        });
+        assert!(found.next().is_none(), "{needle:?} is in two chunks");
+        first
+    };
+
+    // One newline and an indent is not a blank line: the comment rides with
+    // the element, and the chunk *starts* at the comment.
+    let near = holding("name=\"near\"");
+    assert!(
+        near.text.starts_with("<!-- ATTACHED:"),
+        "the leading comment did not attach: {:?}",
+        near.text
+    );
+
+    // A blank line detaches, even though the blank line is a node rather than
+    // a gap. The banner is filler — kept, so no bytes are dropped — and the
+    // element it precedes does not claim it.
+    let far = holding("name=\"far\"");
+    assert!(
+        far.text.starts_with("<ui:Button"),
+        "a comment three lines up attached anyway: {:?}",
+        far.text
+    );
+    let banner = holding("DETACHED:");
+    assert!(
+        matches!(&banner.kind, ChunkKind::Code { symbol_kind, .. } if symbol_kind == "statements"),
+        "{:?}",
+        banner.kind
+    );
+}
+
 #[cfg(feature = "wasm-grammars")]
 #[test]
 fn plugin_chunks_never_carry_vault_metadata() {

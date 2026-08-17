@@ -12,7 +12,10 @@ grammar = "xml.wasm"
 language_tag = "xml"
 containers = ["element"]
 bodies = ["content"]
-attachments = ["Comment"]
+# `CharData` alongside `Comment`, exactly as the real Unity plugin declares it:
+# the XML grammar emits the whitespace between a comment and the element it
+# documents as its own node, so `["Comment"]` alone would never attach anything.
+attachments = ["Comment", "CharData"]
 # XML puts an element's name in `element > STag > Name`, which is neither a
 # field nor a direct child, so the field lookup misses and `name_kinds` picks
 # it up one level down.
