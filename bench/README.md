@@ -63,11 +63,15 @@ Slot a is the round-1 setup, untouched. The arm→slot map is fixed in
 Two things about Lexomancy are deliberate, not oversights:
 
 - Both slots retrieve from the **main `Lexomancy` project**. The walker does
-  not follow junctions (backlogged since round 1), so a bench root indexes only
-  its own two loose files. The main root is frozen at the pin and read-only
-  during runs, so both arms sharing it is safe — but it also means Lexomancy
-  never had live-index semantics, in round 1 or now. Carried forward as a known
-  limitation; fixing it is a daemon-side change.
+  not follow junctions — **by decision** (D-0021: symlinks do not implicitly
+  extend a project, there is no `follow_symlinks` option, and a `!` re-include
+  does not rescue a link), so a bench root indexes only its own loose files
+  and always will. The main root is frozen at the pin and read-only during
+  runs, so both arms sharing it is safe — but it also means Lexomancy never had
+  live-index semantics, in round 1 or now. This is the arrangement, not a
+  limitation awaiting a daemon-side fix. The `!design/`, `!tools/` and
+  `!Lexomancy/` lines in `Lexomancy-bench/.loreignore` are inert and should be
+  deleted; they read as intent that can never take effect.
 - Slot b therefore exists purely for **file isolation** during T5, and needs a
   second cm workspace (`Lexomancy-alt-b`). Until that exists, run Lexomancy T5
   one arm at a time. Slot b is still *registered* (as `Lexomancy-bench-b`,

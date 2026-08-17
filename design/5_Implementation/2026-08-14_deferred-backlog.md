@@ -63,18 +63,16 @@ briefs; details in the cited docs.
   current binary before investigating.
 - ~~Ledger parser retired partially-superseded decisions~~ — fixed same day
   (bare-ID-list rule, Wrysk's call; see D-0010 and `authority.rs`).
-- **The walker does not follow junctions/symlinks.** A workspace assembled
-  from directory junctions (Lexomancy-bench) indexed only its 2 regular
-  files; all three junctioned trees were skipped silently. Real-world
-  layouts do this. Needs `follow_links` plus loop protection, and a think
-  about what the watcher can honestly promise across junction targets on
-  Windows (ReadDirectoryChangesW does not see through them).
-  *Update 2026-08-17:* the **silently** half is fixed — a walk now reports
-  the links it declined, a pass counts them (`links_skipped`) and warns with
-  the paths. Traversal itself is still open and is now argued in
-  [[../1_Architecture/2026-08-17_link-traversal-decision-brief]], which
-  proposes `!`-re-include opt-in plus periodic rescan (rather than secondary
-  watches) for coverage. Awaiting a decision.
+- ~~The walker does not follow junctions/symlinks~~ — **closed by decision,
+  not by implementation** (D-0021, 2026-08-17). Symlinks do not implicitly
+  extend a project; not following is the rule rather than a gap, there is no
+  `follow_symlinks` option and there will not be one, and a `!` re-include
+  does not rescue a link. The half that *was* a defect — that the skip was
+  silent — is fixed: a walk reports the links it declined, a pass counts them
+  (`links_skipped`) and warns with the paths. The watcher-coverage worry this
+  item recorded dissolved with the decision: nothing is followed, so there is
+  no out-of-root subtree to watch. See
+  [[../1_Architecture/2026-08-17_link-traversal-decision-brief]].
 - **No `lore remove`.** A mistakenly registered project cannot be
   unregistered from the CLI; the row lingers in status output
   (Lexomancy-bench, 2 files, is the standing example).
