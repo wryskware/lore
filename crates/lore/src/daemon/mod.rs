@@ -33,6 +33,7 @@ pub mod ownership;
 pub mod paths;
 pub mod queue;
 pub mod search;
+pub mod snapshot;
 pub mod store_handle;
 pub mod walk;
 pub mod watch;
@@ -175,6 +176,10 @@ pub async fn run(options: DaemonOptions) -> Result<()> {
 
     let ctx = index::IndexContext::new(store.clone(), data_dir.clone(), cancel.clone());
     let embed_notify = ctx.embed_notify.clone();
+    // Shared with `/v1/status`: an apply the mass-delete guard refused is a
+    // project whose index has stopped tracking its files, which must be
+    // visible rather than merely logged (D-0015).
+    let guard = ctx.guard.clone();
     tracker.spawn(index::run(ctx, queue.clone()));
 
     // Embeddings are optional (D-0007): with no endpoint configured there is
@@ -192,8 +197,10 @@ pub async fn run(options: DaemonOptions) -> Result<()> {
         let data_dir = data_dir.clone();
         let cancel = cancel.clone();
         let status = watch_status.clone();
+        let debounce = config.watcher.debounce();
         tracker.spawn(async move {
-            if let Err(err) = watch::run(watch_rx, queue, data_dir, status, cancel).await {
+            if let Err(err) = watch::run(watch_rx, queue, data_dir, status, debounce, cancel).await
+            {
                 tracing::error!(error = %err, "watcher could not start; no live reindexing");
             }
         });
@@ -206,6 +213,7 @@ pub async fn run(options: DaemonOptions) -> Result<()> {
         queue: queue.clone(),
         watch: watch_tx.clone(),
         watch_status,
+        guard,
         config,
         embeddings,
         latency: latency::LatencyRecorder::default(),

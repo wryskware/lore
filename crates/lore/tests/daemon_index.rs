@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 
 use camino::Utf8PathBuf;
 use daemon_support::{Fixture, STANDARD_TREE_INDEXED, populate_standard_tree};
-use lore::daemon::index::{full_scan, index_paths};
+use lore::daemon::index::{ApplyOptions, full_scan, full_scan_with, index_paths};
 use lore::store::SearchFilter;
 
 fn paths(items: &[&str]) -> BTreeSet<Utf8PathBuf> {
@@ -454,4 +454,48 @@ fn an_incremental_pass_indexes_neither_hidden_nor_ignored_paths() {
         "they were never indexed, so there is nothing to remove: {ignored:?}"
     );
     assert_eq!(fixture.indexed_paths(), STANDARD_TREE_INDEXED);
+}
+
+// ---------------------------------------------------------------------------
+// The mass-delete guard (D-0015)
+// ---------------------------------------------------------------------------
+
+/// The guard, and the only way past it. Both halves in one test on purpose: a
+/// refusal nobody can override is as broken as an override nobody needs.
+#[test]
+fn a_snapshot_that_would_delete_most_of_a_project_is_refused_until_overridden() {
+    let fixture = Fixture::new("demo");
+    for i in 0..200 {
+        fixture.write(&format!("src/f{i}.rs"), rust_fn("f", i));
+    }
+    full_scan(&fixture.context(), &fixture.project);
+    assert_eq!(fixture.indexed_paths().len(), 200);
+
+    // Over half, and over a hundred: both conditions, as D-0015 states them.
+    for i in 0..150 {
+        fixture.remove(&format!("src/f{i}.rs"));
+    }
+    let refused = full_scan(&fixture.context(), &fixture.project);
+    assert_eq!(
+        refused
+            .mass_delete_blocked
+            .map(|trip| (trip.deletes, trip.stored)),
+        Some((150, 200)),
+        "{refused:?}"
+    );
+    assert_eq!(
+        fixture.indexed_paths().len(),
+        200,
+        "a refused apply writes nothing at all: {refused:?}"
+    );
+
+    let forced = full_scan_with(
+        &fixture.context(),
+        &fixture.project,
+        ApplyOptions {
+            allow_mass_delete: true,
+        },
+    );
+    assert!(forced.mass_delete_blocked.is_none(), "{forced:?}");
+    assert_eq!(fixture.indexed_paths().len(), 50);
 }

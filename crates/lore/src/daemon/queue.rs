@@ -39,6 +39,10 @@ pub struct ProjectWork {
     pub full: bool,
     /// Project-relative paths to re-examine.
     pub paths: BTreeSet<Utf8PathBuf>,
+    /// Apply the rescan even if it trips the mass-delete guard (D-0015).
+    /// Only an explicit `lore index --allow-mass-delete` sets it, and only for
+    /// the pass it queued: it is per invocation, never a stored setting.
+    pub allow_mass_delete: bool,
 }
 
 #[derive(Debug, Default)]
@@ -70,11 +74,26 @@ impl IndexQueue {
 
     /// Queue a whole-project rescan, superseding any pending paths.
     pub fn request_full(&self, project: ProjectId) {
+        self.queue_full(project, false);
+    }
+
+    /// The same rescan, carrying an explicit human's mass-delete override
+    /// (D-0015). Separate from [`Self::request_full`] so that no caller can
+    /// pass the override by forgetting a `false`.
+    pub fn request_full_allowing_mass_delete(&self, project: ProjectId) {
+        self.queue_full(project, true);
+    }
+
+    fn queue_full(&self, project: ProjectId, allow_mass_delete: bool) {
         {
             let mut pending = self.lock();
             let work = pending.work.entry(project).or_default();
             work.full = true;
             work.paths.clear();
+            // Coalescing an override with an ordinary rescan keeps it: the
+            // human asked for it, and the queue must not swallow the request
+            // just because the watcher happened to ask first.
+            work.allow_mass_delete |= allow_mass_delete;
         }
         self.inner.notify.notify_one();
     }

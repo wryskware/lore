@@ -150,7 +150,14 @@ impl Env {
         let data_dir = self.data_dir.clone();
         let status = self.status.clone();
         let cancel = self.cancel.clone();
-        tokio::spawn(async move { watch::run(rx, queue, data_dir, status, cancel).await });
+        // A test-sized debounce, not the production default: these tests
+        // assert what the pump *does* with a batch, and waiting out the real
+        // quiet period (config: `[watcher] debounce_secs`) would only be
+        // waiting.
+        let debounce = Duration::from_millis(100);
+        tokio::spawn(
+            async move { watch::run(rx, queue, data_dir, status, debounce, cancel).await },
+        );
         tx.send(WatchCommand::Watch(self.project.clone()))
             .expect("watcher accepted the command");
         let id = self.project.id;
@@ -656,6 +663,7 @@ async fn v1_status_reports_per_project_watcher_state() {
         queue: seam.queue.clone(),
         watch: seam.commands.clone(),
         watch_status: seam.status.clone(),
+        guard: index::GuardStatus::new(),
         config: Arc::new(Config::default()),
         embeddings: Embedder::disabled(),
         latency: lore::daemon::latency::LatencyRecorder::default(),

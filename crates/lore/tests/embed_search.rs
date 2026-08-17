@@ -44,6 +44,7 @@ fn harness(embedder: Embedder) -> Harness {
         queue: IndexQueue::new(),
         watch: watch_tx,
         watch_status: watch::WatchStatus::new(),
+        guard: lore::daemon::index::GuardStatus::new(),
         config: Arc::new(Config::default()),
         embeddings: embedder.clone(),
         latency: lore::daemon::latency::LatencyRecorder::default(),

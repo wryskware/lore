@@ -52,6 +52,7 @@ use crate::config::Config;
 use crate::embed::Embedder;
 use crate::store::Project;
 
+use super::index::GuardStatus;
 use super::queue::IndexQueue;
 use super::store_handle::StoreHandle;
 use super::watch::{WatchCommand, WatchSender, WatchStatus};
@@ -68,6 +69,8 @@ pub struct AppState {
     pub watch: WatchSender,
     /// Live per-project watcher coverage, written by the watcher pump.
     pub watch_status: WatchStatus,
+    /// Applies the mass-delete guard refused, written by the indexer.
+    pub guard: GuardStatus,
     pub config: Arc<Config>,
     /// Live embedding capability and health. Shared with the embed worker,
     /// which is the thing that actually probes the endpoint.
@@ -255,6 +258,10 @@ async fn status(
             // Same reasoning as `embeddings` below: a watch that is not
             // armed degrades the daemon silently unless it is reported.
             watch: state.watch_status.of(p.project),
+            // A refused apply (D-0015). Same reasoning as the watch state
+            // above: an index that has stopped tracking its project is a
+            // silent failure unless it is reported.
+            mass_delete_guard: state.guard.of(p.project),
         })
         .collect();
 
@@ -491,6 +498,7 @@ async fn remove_project(
 
     let _ = state.watch.send(WatchCommand::Unwatch(id));
     state.watch_status.forget(id);
+    state.guard.forget(id);
 
     tracing::info!(
         project = %project.name,
@@ -569,7 +577,11 @@ async fn index(
     };
 
     for project in &targets {
-        state.queue.request_full(project.id);
+        if request.allow_mass_delete {
+            state.queue.request_full_allowing_mass_delete(project.id);
+        } else {
+            state.queue.request_full(project.id);
+        }
     }
     Ok(Json(IndexResponse {
         queued: targets.into_iter().map(info).collect(),

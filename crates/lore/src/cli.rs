@@ -438,9 +438,23 @@ pub async fn stop() -> Result<()> {
 }
 
 /// `lore index [project]` — queue a full rescan.
-pub async fn index(project: Option<String>) -> Result<()> {
+///
+/// `allow_mass_delete` overrides the guard that refuses a pass which would
+/// drop most of a project's files (D-0015). It rides on this one request and
+/// nowhere else: there is deliberately no configuration key for it, so the
+/// only way to delete an index's worth of files is for a human to say so
+/// again.
+pub async fn index(project: Option<String>, allow_mass_delete: bool) -> Result<()> {
     let client = Client::connect()?;
-    let body = client.post("index", &IndexRequest { project }).await?;
+    let body = client
+        .post(
+            "index",
+            &IndexRequest {
+                project,
+                allow_mass_delete,
+            },
+        )
+        .await?;
     let response: IndexResponse = parse(&body)?;
     if response.queued.is_empty() {
         println!("nothing to index: no projects registered (run `lore add <path>`)");
@@ -896,8 +910,24 @@ fn render_status(status: &DaemonStatus) -> String {
         );
         push_authority(&mut out, project);
         push_authority_violations(&mut out, project);
+        push_mass_delete_guard(&mut out, project);
     }
     out
+}
+
+/// An apply the mass-delete guard refused (D-0015). Loud, and naming the one
+/// command that overrides it: until someone does, this project's index is
+/// frozen against a filesystem it no longer matches.
+fn push_mass_delete_guard(out: &mut String, project: &ProjectStatus) {
+    let Some(trip) = project.mass_delete_guard else {
+        return;
+    };
+    let _ = writeln!(
+        out,
+        "    INDEX BLOCKED: {trip}; re-run with `lore index {name} --allow-mass-delete` \
+         if that is intended",
+        name = project.name,
+    );
 }
 
 /// Chunks the embed worker gave up on, and only when there are any — the same

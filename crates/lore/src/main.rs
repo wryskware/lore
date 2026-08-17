@@ -60,7 +60,13 @@ enum Command {
         force: bool,
     },
     /// Trigger (re)indexing of a registered project.
-    Index { project: Option<String> },
+    Index {
+        project: Option<String>,
+        /// Index even if the pass would drop most of the project's indexed
+        /// files. Applies to this invocation only — there is no setting.
+        #[arg(long)]
+        allow_mass_delete: bool,
+    },
     /// Show daemon and index status.
     Status {
         /// Print the daemon's raw JSON response instead of the table.
@@ -90,7 +96,10 @@ fn main() -> anyhow::Result<()> {
             dry_run,
             force,
         } => cli::setup(host, dry_run, force),
-        Command::Index { project } => cli::run(cli::index(project)),
+        Command::Index {
+            project,
+            allow_mass_delete,
+        } => cli::run(cli::index(project, allow_mass_delete)),
         Command::Status { json, project } => cli::run(cli::status(json, project)),
         Command::Search(search) => cli::run(cli::search(search)),
     }

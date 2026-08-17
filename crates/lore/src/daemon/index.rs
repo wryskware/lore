@@ -1,11 +1,17 @@
-//! Indexing: disk → chunks → store.
+//! Indexing: snapshot → chunks → store.
+//!
+//! The pipeline consumes a [`Snapshot`] — a manifest plus a content source —
+//! and reconciles the store with it: index what changed, delete what the
+//! manifest omits. It does **not** observe anything itself, which is D-0015's
+//! inversion: the walker produces the snapshot ([`super::snapshot`]) today and
+//! a push session will produce the identical thing tomorrow, and this module
+//! cannot tell the difference.
 //!
 //! Two entry points, one file-level routine:
 //!
-//! - [`full_scan`] walks a project and reconciles the store with disk
-//!   (index changed files, prune vanished ones).
-//! - [`index_paths`] does the same for a specific set of paths, which is what
-//!   a watcher batch turns into.
+//! - [`full_scan`] applies a whole-project snapshot (the push unit).
+//! - [`index_paths`] applies a snapshot scoped to the paths a watcher batch
+//!   named.
 //!
 //! Both are **synchronous** and take a [`StoreHandle`], because the store is
 //! synchronous and file IO is blocking. The async layer ([`run`]) is a thin
@@ -15,27 +21,29 @@
 //!
 //! Change detection is content hashing (blake3), not mtime: mtime lies across
 //! branch switches, restores from backup and Unity's asset pipeline, and a
-//! false "unchanged" is a permanently stale index. A file whose hash is
-//! unchanged costs one read plus one hash and touches no store state — in
-//! particular it does not rewrite `indexed_at`, so re-scans are genuinely
-//! free rather than merely fast.
+//! false "unchanged" is a permanently stale index. A file whose manifest hash
+//! matches the stored one is never even read by the pipeline and touches no
+//! store state — in particular it does not rewrite `indexed_at`, so re-scans
+//! are genuinely free rather than merely fast.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
+use lore_core::snapshot::{ManifestEntry, MassDeleteTrip, mass_delete_trip};
+
 use crate::authority::{DecisionIndex, Decisions, Demotion, is_decision_source, is_ledger_path};
 use crate::chunk::{FileChunks, chunk_file};
 use crate::repo_config::{Profile, RepoAuthority};
-use crate::store::{FileWrite, Project, Recompute, StoreError};
+use crate::store::{FileWrite, Project, ProjectId, Recompute, StoreError};
 
 use super::queue::{IndexQueue, ProjectWork};
+use super::snapshot::{self, ContentSource, Scope, Snapshot};
 use super::store_handle::StoreHandle;
-use super::walk;
 
 /// Everything an index pass needs besides the work itself.
 #[derive(Clone)]
@@ -50,6 +58,8 @@ pub struct IndexContext {
     /// depends on anyone listening — a lexical-only daemon simply has no
     /// subscriber.
     pub embed_notify: Arc<Notify>,
+    /// Where a refused apply is recorded for `lore status`.
+    pub guard: GuardStatus,
 }
 
 impl IndexContext {
@@ -59,7 +69,60 @@ impl IndexContext {
             data_dir,
             cancel,
             embed_notify: Arc::new(Notify::new()),
+            guard: GuardStatus::new(),
         }
+    }
+}
+
+/// Per-pass decisions a caller may override.
+///
+/// Deliberately not a config struct: the only member is the mass-delete
+/// override, which D-0015 requires to be per invocation and never a stored
+/// setting. It travels as an argument for exactly that reason.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ApplyOptions {
+    /// Apply this snapshot even if it trips the mass-delete guard.
+    pub allow_mass_delete: bool,
+}
+
+/// Per-project record of an apply the mass-delete guard refused, shared
+/// read-only with `/v1/status`.
+///
+/// In memory only, like the embed worker's abandoned count: it describes what
+/// this daemon refused to do, not what the index is. The next apply that
+/// proceeds clears it, so the report never outlives the condition.
+#[derive(Clone, Debug, Default)]
+pub struct GuardStatus {
+    trips: Arc<Mutex<BTreeMap<ProjectId, MassDeleteTrip>>>,
+}
+
+impl GuardStatus {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn of(&self, project: ProjectId) -> Option<MassDeleteTrip> {
+        self.lock().get(&project).copied()
+    }
+
+    fn record(&self, project: ProjectId, trip: MassDeleteTrip) {
+        self.lock().insert(project, trip);
+    }
+
+    fn clear(&self, project: ProjectId) {
+        self.lock().remove(&project);
+    }
+
+    /// Drop a deregistered project's record, so a forgotten project's refusal
+    /// cannot attach itself to whatever row later inherits its id.
+    pub fn forget(&self, project: ProjectId) {
+        self.lock().remove(&project);
+    }
+
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<ProjectId, MassDeleteTrip>> {
+        self.trips
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -97,6 +160,9 @@ pub struct PassSummary {
     pub config_error: bool,
     /// True when the pass stopped early because shutdown was requested.
     pub cancelled: bool,
+    /// Set when the mass-delete guard refused this snapshot (D-0015). The
+    /// pass then writes nothing at all: a refused apply is refused whole.
+    pub mass_delete_blocked: Option<MassDeleteTrip>,
 }
 
 impl PassSummary {
@@ -108,171 +174,161 @@ impl PassSummary {
     }
 }
 
-/// Full reconciliation of one project against disk.
-///
-/// Prune-by-diff (`list_files` minus what the walk saw) rather than
-/// prune-by-generation: it needs no extra column, and it is correct even if
-/// the daemon was killed mid-pass — the next pass sees the same difference.
+/// Full reconciliation of one project against its own filesystem.
 pub fn full_scan(ctx: &IndexContext, project: &Project) -> PassSummary {
-    let started = Instant::now();
-    let mut summary = PassSummary::default();
-
-    // Before the walk, not after: the file this may create is what the walk
-    // immediately obeys. Never fatal — a root that cannot be written to falls
-    // back to the walker's built-in exclusions instead of aborting the scan.
-    super::ignorefile::ensure(&project.root);
-
-    let profile = refresh_profile(ctx, project, &mut summary);
-
-    let files = walk::walk_files(
-        &project.root,
-        &project.root,
-        None,
-        &ctx.data_dir,
-        Some(&ctx.cancel),
-    );
-    let seen: BTreeSet<Utf8PathBuf> = files.into_iter().collect();
-    summary.seen = seen.len();
-    // A cancelled walk is partial: pruning against it would treat every
-    // unwalked file as deleted. Record the cancellation before anything
-    // consults `seen`.
-    summary.cancelled = ctx.cancel.is_cancelled();
-
-    for rel in &seen {
-        if summary.cancelled || ctx.cancel.is_cancelled() {
-            summary.cancelled = true;
-            break;
-        }
-        index_one(ctx, project, rel, profile, &mut summary);
-    }
-
-    if !summary.cancelled {
-        prune_missing(ctx, project, &seen, &mut summary);
-        // Unconditional on a full scan: this is also the migration/startup
-        // backfill path, where the stored effective tiers may be the V2
-        // migration's declared-tier approximation and the active-decision set
-        // may never have been parsed at all.
-        refresh_authority(ctx, project, profile, true, &mut summary);
-    }
-
-    finish(ctx, project, "full_scan", started, &summary);
-    summary
+    full_scan_with(ctx, project, ApplyOptions::default())
 }
 
-/// Index exactly these project-relative paths.
-///
-/// A queued path may be a file, a directory (a whole tree was dropped in), or
-/// gone entirely — the watcher cannot reliably tell, and by the time the
-/// batch is processed the truth may have changed again. So the disk is
-/// consulted here, once, and each case handled:
-///
-/// - **gone**: remove it, and prune anything indexed underneath it (that is
-///   how a deleted *directory* prunes its files: the removal event names only
-///   the directory).
-/// - **directory**: walk it and index what it contains.
-/// - **file**: confirm it still passes the ignore rules by listing its parent
-///   directory through the same walker the full scan uses. A file that no
-///   longer passes (a new `.gitignore` rule, a rename into an excluded tree)
-///   is removed rather than left behind as an orphan.
+/// [`full_scan`] with the per-invocation overrides an explicit `lore index`
+/// may carry.
+pub fn full_scan_with(ctx: &IndexContext, project: &Project, options: ApplyOptions) -> PassSummary {
+    let started = Instant::now();
+    let snapshot = snapshot::observe_project(&project.root, &ctx.data_dir, &ctx.cancel);
+    apply(ctx, project, snapshot, options, started)
+}
+
+/// Index exactly these project-relative paths — what a watcher batch turns
+/// into. The scoped snapshot ([`snapshot::observe_paths`]) decides what the
+/// batch actually means; this is only the plumbing.
 pub fn index_paths(
     ctx: &IndexContext,
     project: &Project,
     requested: &BTreeSet<Utf8PathBuf>,
 ) -> PassSummary {
     let started = Instant::now();
+    let snapshot = snapshot::observe_paths(&project.root, &ctx.data_dir, requested, &ctx.cancel);
+    apply(ctx, project, snapshot, ApplyOptions::default(), started)
+}
+
+/// Reconcile the store with one snapshot.
+///
+/// Diff-then-apply rather than prune-by-generation: it needs no extra column,
+/// and it is correct even if the daemon was killed mid-pass — the next pass
+/// sees the same difference. The whole diff comes from one `list_files`, which
+/// is what a manifest diff *is*.
+fn apply(
+    ctx: &IndexContext,
+    project: &Project,
+    snapshot: Snapshot,
+    options: ApplyOptions,
+    started: Instant,
+) -> PassSummary {
     let mut summary = PassSummary::default();
+    let kind = match snapshot.scope {
+        Scope::Project => "full_scan",
+        Scope::Paths(_) => "incremental",
+    };
     let profile = refresh_profile(ctx, project, &mut summary);
 
-    let mut missing: Vec<&Utf8Path> = Vec::new();
-    let mut to_index: BTreeSet<Utf8PathBuf> = BTreeSet::new();
-    // Parent directory -> the files under it this batch mentions.
-    let mut by_parent: BTreeMap<Utf8PathBuf, Vec<&Utf8Path>> = BTreeMap::new();
-
-    for rel in requested {
-        if walk::is_excluded_rel(rel) {
-            continue;
-        }
-        let abs = project.root.join(rel);
-        match std::fs::metadata(&abs) {
-            Err(_) => missing.push(rel),
-            Ok(meta) if meta.is_dir() => {
-                to_index.extend(walk::walk_files(
-                    &project.root,
-                    &abs,
-                    None,
-                    &ctx.data_dir,
-                    Some(&ctx.cancel),
-                ));
-            }
-            Ok(_) => {
-                let parent = rel.parent().unwrap_or(Utf8Path::new("")).to_owned();
-                by_parent.entry(parent).or_default().push(rel);
-            }
-        }
+    summary.seen = snapshot.considered();
+    // A file the observer could not read is not evidence of anything: it is
+    // neither indexed nor deleted, only counted.
+    summary.errors += snapshot.unreadable.len();
+    // An incomplete observation must not delete, and must not half-index
+    // either — the next pass sees the same difference and finishes the job.
+    summary.cancelled = !snapshot.complete || ctx.cancel.is_cancelled();
+    if summary.cancelled {
+        finish(ctx, project, kind, started, &summary);
+        return summary;
     }
 
-    let mut to_remove: BTreeSet<Utf8PathBuf> = missing.iter().map(|p| (*p).to_owned()).collect();
+    let stored = match ctx.store.blocking(|store| store.list_files(project.id)) {
+        Ok(stored) => stored,
+        Err(err) => {
+            tracing::warn!(project = %project.name, error = %err, "listing files for the snapshot diff failed");
+            summary.errors += 1;
+            finish(ctx, project, kind, started, &summary);
+            return summary;
+        }
+    };
 
-    for (parent, files) in by_parent {
-        let start = if parent.as_str().is_empty() {
-            project.root.clone()
-        } else {
-            project.root.join(&parent)
-        };
-        let allowed: BTreeSet<Utf8PathBuf> = walk::walk_files(
-            &project.root,
-            &start,
-            Some(1),
-            &ctx.data_dir,
-            Some(&ctx.cancel),
-        )
-        .into_iter()
+    // Deletion is absence from the manifest — inside the snapshot's scope, and
+    // never for a file the observer merely failed to read.
+    let deletions: Vec<Utf8PathBuf> = stored
+        .iter()
+        .filter(|record| {
+            snapshot.manifest.get(record.path.as_str()).is_none()
+                && snapshot.covers(&record.path)
+                && !snapshot.unreadable.contains(&record.path)
+        })
+        .map(|record| record.path.clone())
         .collect();
-        for rel in files {
-            if allowed.contains(rel) {
-                to_index.insert(rel.to_owned());
-            } else {
-                to_remove.insert(rel.to_owned());
-            }
-        }
+
+    if !options.allow_mass_delete
+        && let Some(trip) = mass_delete_trip(deletions.len() as u64, stored.len() as u64)
+    {
+        // Loud, refused whole, and remembered: an index that stops tracking
+        // its project has to say so rather than quietly shrink.
+        tracing::error!(
+            project = %project.name,
+            deletes = trip.deletes,
+            stored = trip.stored,
+            "mass-delete guard tripped; this pass was refused and nothing was written \
+             (re-run `lore index --allow-mass-delete` if the deletion is intended)"
+        );
+        summary.mass_delete_blocked = Some(trip);
+        ctx.guard.record(project.id, trip);
+        finish(ctx, project, kind, started, &summary);
+        return summary;
     }
+    ctx.guard.clear(project.id);
 
-    summary.seen = to_index.len() + to_remove.len();
-    // A cancelled walk above may have classified a still-allowed file as
-    // removable (its parent listing came back partial); removing on partial
-    // evidence deletes real index rows, so stop before the removals run.
-    summary.cancelled = ctx.cancel.is_cancelled();
-
-    for rel in &to_index {
-        if summary.cancelled || ctx.cancel.is_cancelled() {
+    let known: BTreeMap<&str, &str> = stored
+        .iter()
+        .map(|record| (record.path.as_str(), record.content_hash.as_str()))
+        .collect();
+    for entry in &snapshot.manifest.entries {
+        if ctx.cancel.is_cancelled() {
             summary.cancelled = true;
             break;
         }
-        index_one(ctx, project, rel, profile, &mut summary);
+        index_one(
+            ctx,
+            project,
+            entry,
+            known.get(entry.path.as_str()).copied(),
+            snapshot.content.as_ref(),
+            profile,
+            &mut summary,
+        );
     }
 
     if !summary.cancelled {
-        remove_paths_and_subtrees(ctx, project, &to_remove, &mut summary);
-        // Only when this batch touched a decision source — a mono ledger or a
-        // per-file record (D-0013). Every *other* file already got its
-        // effective tier stamped on write; re-deriving the whole project
-        // because one source file changed would be pure waste.
-        let decisions_touched = to_index
-            .iter()
-            .chain(to_remove.iter())
-            .any(|rel| is_decision_source(rel));
-        // A profile change invalidates every tier in the project, not just
-        // this batch's. The recompute below fixes the tiers; the *chunks* of
-        // files outside this batch are still stale, which is why the watcher
-        // answers a `.lore.toml` edit with a full scan rather than a batch.
-        // This branch is the safety net for any other route into an
-        // incremental pass with a moved profile.
-        if decisions_touched || summary.profile_changed {
-            refresh_authority(ctx, project, profile, summary.profile_changed, &mut summary);
+        remove_all(ctx, project, &deletions, &mut summary);
+        match snapshot.scope {
+            // Unconditional on a full scan: this is also the migration/startup
+            // backfill path, where the stored effective tiers may be the V2
+            // migration's declared-tier approximation and the active-decision
+            // set may never have been parsed at all.
+            Scope::Project => refresh_authority(ctx, project, profile, true, &mut summary),
+            // Otherwise only when this batch touched a decision source — a
+            // mono ledger or a per-file record (D-0013). Every *other* file
+            // already got its effective tier stamped on write; re-deriving the
+            // whole project because one source file changed would be pure
+            // waste.
+            //
+            // A profile change invalidates every tier in the project, not just
+            // this batch's. The recompute below fixes the tiers; the *chunks*
+            // of files outside this batch are still stale, which is why the
+            // watcher answers a `.lore.toml` edit with a full scan rather than
+            // a batch. This branch is the safety net for any other route into
+            // an incremental pass with a moved profile.
+            Scope::Paths(_) => {
+                let decisions_touched = snapshot
+                    .manifest
+                    .entries
+                    .iter()
+                    .map(|entry| Utf8Path::new(&entry.path))
+                    .chain(deletions.iter().map(Utf8PathBuf::as_path))
+                    .any(is_decision_source);
+                if decisions_touched || summary.profile_changed {
+                    refresh_authority(ctx, project, profile, summary.profile_changed, &mut summary);
+                }
+            }
         }
     }
 
-    finish(ctx, project, "incremental", started, &summary);
+    finish(ctx, project, kind, started, &summary);
     summary
 }
 
@@ -489,29 +545,18 @@ fn record_recompute(
     }
 }
 
-/// Read, hash, chunk and store one file. All error paths are logged and
-/// counted, never fatal: one unreadable file must not abort a scan.
+/// Fetch, chunk and store one manifest entry. All error paths are logged and
+/// counted, never fatal: one unreadable file must not abort a pass.
 fn index_one(
     ctx: &IndexContext,
     project: &Project,
-    rel: &Utf8Path,
+    entry: &ManifestEntry,
+    stored_hash: Option<&str>,
+    content_source: &dyn ContentSource,
     profile: Option<Profile>,
     summary: &mut PassSummary,
 ) {
-    let abs = project.root.join(rel);
-    let content = match std::fs::read(&abs) {
-        Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            // Raced with a delete between walk and read.
-            remove_one(ctx, project, rel, summary);
-            return;
-        }
-        Err(err) => {
-            tracing::warn!(project = %project.name, path = %rel, error = %err, "unreadable file");
-            summary.errors += 1;
-            return;
-        }
-    };
+    let rel = Utf8Path::new(&entry.path);
 
     // The format version rides in the stored hash so a chunking-policy bump
     // invalidates the short-circuit below and unchanged bytes re-chunk. The
@@ -526,24 +571,39 @@ fn index_one(
         Some(profile) if crate::chunk::is_markdown(rel) => profile.chunk_tag(),
         _ => "",
     };
-    let hash = format!(
-        "v{}{profile_tag}-{}",
-        crate::chunk::CHUNK_FORMAT_VERSION,
-        blake3::hash(&content).to_hex()
-    );
-    let known = ctx.store.blocking(|store| store.file_hash(project.id, rel));
-    match known {
-        Ok(Some(previous)) if previous == hash => {
-            summary.unchanged += 1;
+    let stamp = |hash: &str| {
+        format!(
+            "v{}{profile_tag}-{hash}",
+            crate::chunk::CHUNK_FORMAT_VERSION
+        )
+    };
+
+    // The manifest hash is what the diff is done against; nothing is fetched
+    // for a file whose content the store already has.
+    if stored_hash == Some(stamp(&entry.hash).as_str()) {
+        summary.unchanged += 1;
+        return;
+    }
+
+    let content = match content_source.read(rel) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // Gone between the manifest and the fetch.
+            remove_one(ctx, project, rel, summary);
             return;
         }
-        Ok(_) => {}
         Err(err) => {
-            log_store_error(project, rel, &err);
+            tracing::warn!(project = %project.name, path = %rel, error = %err, "unreadable file");
             summary.errors += 1;
             return;
         }
-    }
+    };
+
+    // Hashed again from the bytes that are about to be chunked, not copied
+    // from the manifest: the stored hash must always describe what the chunks
+    // were made of, whatever the observer declared or however far the file has
+    // moved on since.
+    let hash = stamp(&blake3::hash(&content).to_hex());
 
     match chunk_file(rel, &content, profile) {
         FileChunks::Chunked(chunks) => {
@@ -611,70 +671,24 @@ fn remove_one(ctx: &IndexContext, project: &Project, rel: &Utf8Path, summary: &m
     }
 }
 
-/// Remove each path, plus everything indexed beneath it (directory deletes).
-fn remove_paths_and_subtrees(
+/// Drop every file the snapshot's manifest omitted — deleted on disk, no
+/// longer passing the ignore rules, or under a directory that vanished. All
+/// three present identically: the observation covered them and did not list
+/// them.
+fn remove_all(
     ctx: &IndexContext,
     project: &Project,
-    paths: &BTreeSet<Utf8PathBuf>,
+    deletions: &[Utf8PathBuf],
     summary: &mut PassSummary,
 ) {
-    if paths.is_empty() {
-        return;
-    }
     // Removals are idempotent, so stopping mid-list is safe: the next pass
     // sees the same difference and finishes the job.
-    for rel in paths {
+    for rel in deletions {
         if ctx.cancel.is_cancelled() {
             summary.cancelled = true;
             return;
         }
         remove_one(ctx, project, rel, summary);
-    }
-
-    let indexed = match ctx.store.blocking(|store| store.list_files(project.id)) {
-        Ok(indexed) => indexed,
-        Err(err) => {
-            tracing::warn!(project = %project.name, error = %err, "listing files for prune failed");
-            summary.errors += 1;
-            return;
-        }
-    };
-    let prefixes: Vec<String> = paths.iter().map(|p| format!("{p}/")).collect();
-    for record in indexed {
-        if ctx.cancel.is_cancelled() {
-            summary.cancelled = true;
-            return;
-        }
-        if prefixes.iter().any(|p| record.path.as_str().starts_with(p)) {
-            remove_one(ctx, project, &record.path, summary);
-        }
-    }
-}
-
-/// Drop index entries for files that are no longer on disk (or no longer
-/// pass the ignore rules — both present as "the walk did not see it").
-fn prune_missing(
-    ctx: &IndexContext,
-    project: &Project,
-    seen: &BTreeSet<Utf8PathBuf>,
-    summary: &mut PassSummary,
-) {
-    let indexed = match ctx.store.blocking(|store| store.list_files(project.id)) {
-        Ok(indexed) => indexed,
-        Err(err) => {
-            tracing::warn!(project = %project.name, error = %err, "listing files for prune failed");
-            summary.errors += 1;
-            return;
-        }
-    };
-    for record in indexed {
-        if ctx.cancel.is_cancelled() {
-            summary.cancelled = true;
-            return;
-        }
-        if !seen.contains(&record.path) {
-            remove_one(ctx, project, &record.path, summary);
-        }
     }
 }
 
@@ -720,6 +734,7 @@ fn finish(
         decision_violations = summary.decision_violations,
         profile_changed = summary.profile_changed,
         config_error = summary.config_error,
+        mass_delete_blocked = summary.mass_delete_blocked.is_some(),
         errors = summary.errors,
         duration_ms = started.elapsed().as_millis() as u64,
         "index pass complete"
@@ -788,7 +803,13 @@ pub async fn run(ctx: IndexContext, queue: IndexQueue) {
 
 fn run_work(ctx: &IndexContext, project: &Project, work: ProjectWork) -> PassSummary {
     if work.full {
-        full_scan(ctx, project)
+        full_scan_with(
+            ctx,
+            project,
+            ApplyOptions {
+                allow_mass_delete: work.allow_mass_delete,
+            },
+        )
     } else {
         index_paths(ctx, project, &work.paths)
     }
