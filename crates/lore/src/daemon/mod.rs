@@ -23,11 +23,9 @@
 //! 5. seed watches and full scans — after the API is up, so `lore status`
 //!    answers immediately on a cold, large project instead of timing out.
 
-pub mod basis;
 pub mod expand;
 pub mod handshake;
 pub mod http;
-pub mod ignorefile;
 pub mod index;
 pub mod latency;
 pub mod ownership;

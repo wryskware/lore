@@ -1,0 +1,96 @@
+# Lore's user-level ignore rules — a starting point, installed by
+# `lore setup loreignore` and never rewritten afterwards. This file is yours.
+#
+# Lore evaluates exactly three rule sources, lowest to highest (D-0020):
+#
+#   1. this file, which applies to every project you index;
+#   2. each repository's own .gitignore, honoured as a courtesy;
+#   3. each project's own .loreignore, which is sovereign.
+#
+# So a repo's .gitignore overrides a line here, and a project's .loreignore
+# overrides both — `!.env` in a committed .loreignore really does index that
+# file. Nothing below is compiled into lore: delete a line and lore stops
+# applying it everywhere.
+#
+# Syntax is gitignore's. Patterns are unanchored, so `Library/` matches at any
+# depth in any project; a leading `/` anchors to a project's root; a trailing
+# `/` matches directories only; `!` re-includes; and later lines win.
+
+# ---------------------------------------------------------------------------
+# Dot-files and dot-directories
+# ---------------------------------------------------------------------------
+# Mostly tool state rather than authored content. This one rule is the widest
+# thing in the file — it also covers .venv/, .idea/, .vs/ and .obsidian/ — so
+# it is the one most worth re-including from: a project that keeps its CI
+# workflows worth searching writes `!.github/` in its own .loreignore.
+.*
+
+# ---------------------------------------------------------------------------
+# Credentials
+# ---------------------------------------------------------------------------
+# A floor, not a promise: patterns only, knowingly incomplete, and no entropy
+# scanning (it is false-positive-prone and trains the reflex of switching the
+# guard off). A private key that becomes a search result is a private key an
+# agent can quote into a transcript, which is what these lines are for. The
+# substantive protection is an encrypted store, not this list.
+#
+# Process environment files. `.env.local` and `.env.production` are the same
+# file with a suffix, and that is where deployed secrets actually live.
+.env
+.env.*
+# OpenSSH private keys, as `ssh-keygen` names them. The `.pub` half is public,
+# but excluding it too costs nothing anybody wanted indexed.
+id_rsa*
+id_ecdsa*
+id_ed25519*
+id_dsa*
+# PEM containers and generic key files. Broad on purpose: `*.key` also catches
+# Keynote documents and some engine asset formats, and `*.pem` catches public
+# certificate chains — the file name does not distinguish them, and a missed
+# key is unrecoverable while a missed document is one `!` line away.
+*.pem
+*.key
+# Credential directories, at any depth: a vendored `home/.ssh/` holds as real a
+# private key as a root-level one. (`**/` because a pattern containing a slash
+# would otherwise be anchored to the project root.)
+.ssh/
+.aws/
+.gnupg/
+**/.config/gcloud/
+
+# ---------------------------------------------------------------------------
+# Build output and vendored trees
+# ---------------------------------------------------------------------------
+# Machine-written, or written by somebody else — either way it drowns real hits
+# and costs embedding time. `[Xx]` classes because Unity and MSBuild both vary
+# the case of their own output directories, and matching is case-sensitive.
+#
+# Watch the two that can hide authored work: some ecosystems commit scripts to
+# `bin/` (`bin/rails`, an npm package's `bin/`) and some commit a built `dist/`.
+# A project in that position re-includes them (`![Bb]in/`).
+
+# Rust
+[Tt]arget/
+
+# Node
+node_modules/
+dist/
+
+# Python
+__pycache__/
+venv/
+*.pyc
+
+# .NET / MSBuild
+[Bb]in/
+[Oo]bj/
+
+# Unity
+[Ll]ibrary/
+[Tt]emp/
+[Ll]ogs/
+[Bb]uild/
+[Bb]uilds/
+[Uu]serSettings/
+[Mm]emoryCaptures/
+*.meta

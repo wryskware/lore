@@ -28,7 +28,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
-use lore::daemon::ignorefile;
 use lore::repo_config::{self, DeclaredName};
 use lore::setup;
 use lore_core::discovery;
@@ -273,52 +272,29 @@ pub async fn remove(project: String) -> Result<()> {
     Ok(())
 }
 
-/// `lore init [path]` — write the project's `.loreignore`.
+/// `lore setup [target]` — install Lore's host-side assets, or report on them.
 ///
-/// The one subcommand that needs no daemon: the file belongs to the project,
-/// not to the index, and it is useful to look at (and edit) before anything
-/// has been registered. Synchronous for the same reason — there is nothing to
-/// await.
-pub fn init(path: Option<String>) -> Result<()> {
-    let root = absolute_utf8(path.as_deref().unwrap_or("."))?;
-    if !root.is_dir() {
-        bail!("not a directory: {root}");
-    }
-
-    match ignorefile::write_new(&root) {
-        Ok(ecosystems) => {
-            println!("wrote {}", ignorefile::path(&root));
-            if ecosystems.is_empty() {
-                println!("  no ecosystem detected; the file is a header and nothing else");
-            } else {
-                println!("  detected: {}", ignorefile::labels(&ecosystems));
-            }
-            println!("  edit it to change what lore indexes; lore will not rewrite it");
-            Ok(())
-        }
-        // Not an accident to recover from: refusing is the promise the header
-        // of a generated file makes, so the fix is the user's to make.
-        Err(ignorefile::WriteError::Exists(path)) => bail!(
-            "{path} already exists, and lore never rewrites it.\nDelete it and run `lore init` again to regenerate."
-        ),
-        Err(err) => Err(anyhow::Error::new(err)),
-    }
-}
-
-/// `lore setup [host]` — install Lore's agent-side assets, or report on them.
-///
-/// Daemon-free for the same reason `init` is: these files belong to the user's
-/// agent host, not to the index, and being able to install them before anything
-/// is registered is the point — the skill they carry is what a user needs at
-/// the moment they add their first project.
+/// The one command that needs no daemon: these files belong to the user's agent
+/// host and to this machine, not to the index, and being able to install them
+/// before anything is registered is the point — the skill they carry is what a
+/// user needs at the moment they add their first project.
 ///
 /// Bare `lore setup` never writes. Discovery that mutates is a trap: the
 /// command a user runs to find out what a command does must be the safe one.
-pub fn setup(host: Option<String>, dry_run: bool, force: bool) -> Result<()> {
-    let Some(host) = host else {
+///
+/// A target is an agent host (`claude-code`) or [`setup::USER_IGNORE_TARGET`],
+/// which is not a host at all: it installs the user-level `loreignore` starting
+/// point beside the daemon's own `config.toml`. Both live here because both
+/// answer "what does lore need on this machine to be useful", and neither is
+/// ever written without being asked for.
+pub fn setup(target: Option<String>, dry_run: bool, force: bool) -> Result<()> {
+    let Some(target) = target else {
         return setup_report();
     };
-    let host = setup::Host::parse(&host)?;
+    if target == setup::USER_IGNORE_TARGET {
+        return setup_user_ignore(dry_run, force);
+    }
+    let host = setup::Host::parse(&target)?;
     let dir = host.skills_dir()?;
     let items = setup::plan(&dir);
 
@@ -339,20 +315,7 @@ pub fn setup(host: Option<String>, dry_run: bool, force: bool) -> Result<()> {
     }
 
     for item in &items {
-        if dry_run {
-            println!("  would write {:<14}{}", item.name, item.path);
-            continue;
-        }
-        match setup::apply(item, force)? {
-            setup::Outcome::Installed => println!("  installed {} -> {}", item.name, item.path),
-            setup::Outcome::Updated => println!("  updated   {} -> {}", item.name, item.path),
-            setup::Outcome::Overwrote => println!("  replaced  {} -> {}", item.name, item.path),
-            setup::Outcome::Unchanged => println!("  {:<14}already up to date", item.name),
-            setup::Outcome::Kept => println!(
-                "  kept      {} (edited since install; --force replaces it)",
-                item.name
-            ),
-        }
+        write_asset(item, dry_run, force)?;
     }
     if !dry_run {
         println!("\nstart a new agent session to pick them up");
@@ -360,8 +323,43 @@ pub fn setup(host: Option<String>, dry_run: bool, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// `lore setup loreignore` — install the user-level ignore rules.
+///
+/// Separate from the host branch because the destination is lore's own data
+/// directory rather than an agent's, and because there is exactly one item: the
+/// "nothing to do" reporting a list of skills needs would only be noise here.
+fn setup_user_ignore(dry_run: bool, force: bool) -> Result<()> {
+    let item = setup::plan_user_ignore(&lore_core::discovery::data_dir()?);
+    write_asset(&item, dry_run, force)?;
+    if !dry_run && item.state != setup::State::UpToDate {
+        println!(
+            "  it applies to every project you index, and any repo's .gitignore \
+             or project's .loreignore overrides it"
+        );
+    }
+    Ok(())
+}
+
+fn write_asset(item: &setup::Item, dry_run: bool, force: bool) -> Result<()> {
+    if dry_run {
+        println!("  would write {:<14}{}", item.name, item.path);
+        return Ok(());
+    }
+    match setup::apply(item, force)? {
+        setup::Outcome::Installed => println!("  installed {} -> {}", item.name, item.path),
+        setup::Outcome::Updated => println!("  updated   {} -> {}", item.name, item.path),
+        setup::Outcome::Overwrote => println!("  replaced  {} -> {}", item.name, item.path),
+        setup::Outcome::Unchanged => println!("  {:<14}already up to date", item.name),
+        setup::Outcome::Kept => println!(
+            "  kept      {} (edited since install; --force replaces it)",
+            item.name
+        ),
+    }
+    Ok(())
+}
+
 /// The read-only half: every host Lore ships for, whether it is on this
-/// machine, and what state each asset is in.
+/// machine, what state each asset is in, and the machine-wide ignore rules.
 fn setup_report() -> Result<()> {
     for host in setup::Host::ALL {
         if !host.detected() {
@@ -379,7 +377,20 @@ fn setup_report() -> Result<()> {
             );
         }
     }
-    println!("\nrun `lore setup <host>` to install; nothing above was written",);
+    // Reported even when absent, because absent is the default state and the
+    // user-level rules are the one thing here a user might not know exists.
+    let user = setup::plan_user_ignore(&lore_core::discovery::data_dir()?);
+    println!("machine       {}", user.path);
+    println!(
+        "  {:<14}{:<18}{}",
+        user.name,
+        user.state.label(),
+        user.summary
+    );
+    println!(
+        "\nrun `lore setup <host|{}>` to install; nothing above was written",
+        setup::USER_IGNORE_TARGET
+    );
     Ok(())
 }
 
@@ -912,7 +923,6 @@ fn render_status(status: &DaemonStatus) -> String {
         push_authority(&mut out, project);
         push_authority_violations(&mut out, project);
         push_mass_delete_guard(&mut out, project);
-        push_manifest_basis(&mut out, project);
         push_lease_state(&mut out, project);
     }
     out
@@ -930,24 +940,6 @@ fn push_mass_delete_guard(out: &mut String, project: &ProjectStatus) {
         "    INDEX BLOCKED: {trip}; re-run with `lore index {name} --allow-mass-delete` \
          if that is intended",
         name = project.name,
-    );
-}
-
-/// A git work tree whose git would not answer (D-0017). Silent in the normal
-/// case — for git and non-git projects alike — because a line on every project
-/// saying nothing is wrong is a line nobody reads.
-///
-/// Not "INDEX BLOCKED": nothing is blocked and nothing was deleted. What
-/// changed is that the fallback basis lets gitignored files into the index
-/// again, which is why the line says what to expect rather than what to fix.
-fn push_manifest_basis(out: &mut String, project: &ProjectStatus) {
-    let Some(error) = &project.manifest_basis_error else {
-        return;
-    };
-    let _ = writeln!(
-        out,
-        "    MANIFEST BASIS: {error}; this project indexed on lore's own ignore rules, so \
-         gitignored files may be indexed until git can answer again"
     );
 }
 

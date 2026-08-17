@@ -5,29 +5,40 @@ description: Tune a repository's .loreignore so Lore indexes authored content an
 
 # Tuning a project's `.loreignore`
 
-`lore init` (and the daemon, on first scan) writes a `.loreignore` from **marker
-detection only**: it sees `Cargo.toml` and writes `target/`, sees a Unity
-project and writes `Library/`. That baseline is correct and it is nowhere near
-sufficient. Everything repo-specific — vendored third-party trees, model
-weights, corpora, serialized scene files, scratch directories, plaintext
-credentials — is invisible to marker detection and has to be found by looking.
+**Lore generates nothing and ships no ignore rules of its own.** It evaluates
+exactly three sources, lowest precedence to highest:
 
-Your job is that second pass. Measure the repo, judge what you find, append to
-the file, report what you did.
+1. the user's machine-wide rules, `<lore-data-dir>/loreignore` — installed only
+   if they ran `lore setup loreignore`, and often absent;
+2. the repo's own `.gitignore`, honoured as a courtesy;
+3. the project's `.loreignore` — **sovereign**. It inherits everything below it
+   by staying silent, and a `!` line in it overrides anything below it,
+   including a credential rule.
+
+So a project with no `.loreignore` is indexed according to its `.gitignore` and
+whatever the user installed machine-wide — and if neither says anything, it is
+indexed **whole**, dot-files, build output, `node_modules/` and all. That is the
+gap you exist to close. Everything repo-specific — vendored third-party trees,
+model weights, corpora, serialized scene files, scratch directories, plaintext
+credentials — has to be found by looking.
+
+Measure the repo, judge what you find, write the file, report what you did.
 
 ## 1. Ground yourself
 
-Read the existing `.loreignore` at the project root. If there isn't one, run
-`lore init` first and re-read.
+Read the `.loreignore` at the project root if there is one; there will often be
+no such file, and that is normal rather than a problem to fix before starting.
+Everything you add goes at the end, under your own commented heading. Do not
+rewrite or reflow what a human already put there.
 
-The generated header block at the top is Lore's ecosystem baseline. **Do not
-edit or reorder it.** Everything you add goes at the end, under your own
-commented heading.
+Then read `.gitignore`, because Lore honours it: anything it excludes is already
+excluded, so do not restate it. What you are hunting for is the stuff that *is*
+committed (or is untracked-but-present) and still should not be indexed.
 
-Also read `.gitignore`. Lore already honours VCS ignore rules, so anything
-`.gitignore` excludes is already excluded — do not restate it. What you are
-hunting for is the stuff that *is* committed (or is untracked-but-present) and
-still should not be indexed.
+If the machine-wide file exists, read it too — it is the reason `target/` or
+`.env` may already be handled. Do not edit it from here: it belongs to the user's
+machine, not to this repo, and a rule that only exists on one machine is a rule
+this repo's other contributors do not get.
 
 ## 2. Measure — never guess from the directory listing
 
@@ -66,9 +77,13 @@ For each heavy or numerous thing you found, ask which of these it is:
 - **Vendored / third-party code.** Package caches, bundled SDKs, plugin drops,
   `Assets/Packages/`, `vendor/`, checked-in `node_modules` siblings. Nobody
   authored it here, and it drowns real hits.
-- **Generated project and build files** the baseline missed — `*.csproj`,
-  `*.sln`, lockfiles-as-noise, `test-results.xml`, coverage output, transpiled
-  mirrors of source that is already indexed.
+- **Build output and dependency trees**, if nothing above you already excluded
+  them: `target/`, `node_modules/`, `dist/`, `bin/`, `obj/`, Unity's `Library/`
+  and `Temp/`, `__pycache__/`, `venv/`. Check first — do not restate what
+  `.gitignore` covers.
+- **Generated project and build files** — `*.csproj`, `*.sln`,
+  lockfiles-as-noise, `test-results.xml`, coverage output, transpiled mirrors of
+  source that is already indexed.
 - **Serialized engine/tool formats.** Unity `*.unity`/`*.prefab`/`*.asset`,
   scene graphs, `.blend`, editor state. These are YAML or binary describing
   structure, not prose or code. If a subset genuinely carries authored intent
@@ -82,15 +97,20 @@ For each heavy or numerous thing you found, ask which of these it is:
 - **Scratch and superseded work.** `tools/` graveyards, one-off scripts,
   abandoned experiments, `old/`, `_archive/`. Prefer scoping *down* to what is
   alive rather than enumerating what is dead — see §4.
-- **Environment and editor state with non-standard names.** The baseline covers
-  `venv/` and `.venv/`; it does not cover `.linux-venv/`, `env311/`,
-  `.obsidian/`, `.idea/` and friends. Look for what this repo actually named
+- **Environment and editor state with non-standard names** — `.linux-venv/`,
+  `env311/`, `.obsidian/`, `.idea/`. Look for what this repo actually named
   them.
 - **Secrets.** `*api_key*`, `*.pem`, `*.pfx`, `.env`, `credentials.json`,
   token files. **Report every one you find, loudly and by path, in addition to
   excluding it.** A credential sitting in a repo is a problem whether or not
   Lore indexes it, and quietly adding a pattern hides that from the user. Never
   paste the secret's contents into your report.
+
+  Two things to know here. Lore has no credential rule of its own — if the user
+  installed the machine-wide file it carries some patterns, and if they did not,
+  nothing is excluding a `.env` at all. And a `!` line in *this* file overrides
+  those patterns, so never re-include a path that looks like a credential
+  without saying so explicitly in your report.
 
 ## 4. What not to exclude, and how to be reversible
 
@@ -121,8 +141,9 @@ Order matters: later lines win. Remember the syntax — patterns are unanchored
 
 ## 5. Write it
 
-Append one block at the end of `.loreignore`. Comment **why**, and date it, so
-the next person can tell your judgment from Lore's generated baseline:
+Append one block at the end of `.loreignore`, creating the file if there is none.
+Comment **why**, and date it, so the next person can tell your judgment from
+whatever was already there:
 
 ```gitignore
 # Hand-tuned 2026-08-16: vendored Unity packages, ONNX weights and the word

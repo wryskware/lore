@@ -9,10 +9,11 @@
 //! only — a nested `.lore.toml` in a subdirectory is not configuration, it is
 //! a file like any other.
 //!
-//! Three independent tables live here, and none of them implies another:
-//! `[authority]` (D-0012), `[project]` (the committed name, D-0016) and
-//! `[ingest]` — today one key, [`allow_secret_paths`], which is the sole
-//! override D-0015 permits over the credential hard-excludes.
+//! Two independent tables live here, and neither implies the other:
+//! `[authority]` (D-0012) and `[project]` (the committed name, D-0016). There is
+//! deliberately no ingestion table: D-0020 made every ignore rule an ordinary
+//! overridable line in a `.loreignore`, which retired the `[ingest]
+//! allow_secret_paths` escape hatch along with the hard-excludes it defeated.
 //!
 //! # Strictness
 //!
@@ -31,9 +32,7 @@
 //! put it in front of the user. D-0012's requirement is that the failure is
 //! loud, not that it is fatal.
 
-use std::collections::BTreeSet;
-
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
 
 /// File name at the registered repo root. Nested copies are ignored.
@@ -227,7 +226,6 @@ impl RepoAuthority {
 struct RepoConfigFile {
     authority: Option<AuthorityTable>,
     project: Option<ProjectTable>,
-    ingest: Option<IngestTable>,
 }
 
 /// The repository's committed project name, written by `lore add`.
@@ -244,13 +242,6 @@ struct ProjectTable {
     /// read. `lore add` then falls through to the root's basename.
     #[serde(default)]
     name: Option<String>,
-}
-
-/// The repository's ingestion policy. Today one key, and a narrow one.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-struct IngestTable {
-    allow_secret_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -312,86 +303,6 @@ pub fn parse_declared_name(text: &str) -> Result<DeclaredName, String> {
             _ => DeclaredName::Unnamed,
         },
     })
-}
-
-// ---------------------------------------------------------------------------
-// [ingest].allow_secret_paths — the credential hard-excludes' one escape hatch
-// ---------------------------------------------------------------------------
-
-/// Read `<root>/.lore.toml`'s `[ingest] allow_secret_paths`.
-///
-/// ```toml
-/// [ingest]
-/// allow_secret_paths = ["tests/fixtures/sample.pem", "docs/example.env"]
-/// ```
-///
-/// This is the **only** thing that can defeat
-/// [`crate::daemon::walk::CREDENTIAL_EXCLUDES`] (D-0015: credential
-/// hard-excludes are "not overridable by `.loreignore`; only explicit named
-/// configuration"). Three properties make it safe to have at all:
-///
-/// - **Exact project-relative paths, never patterns.** A glob escape hatch is
-///   as broad as the rule it defeats — `allow_secret_paths = ["*.pem"]` would
-///   be indistinguishable from deleting the pattern, and would go on admitting
-///   files nobody had seen when they wrote the line. Enumerating costs the one
-///   thing an escape hatch should cost: knowing what you are letting through.
-/// - **Committed, at the registered root.** It travels with the repository and
-///   shows up in review, unlike a `.loreignore` `!` line among fifty
-///   build-output rules.
-/// - **An admission, not a re-inclusion.** A named path is added to the
-///   manifest if it exists at all — it does not have to survive `hidden(true)`,
-///   `.gitignore` or the git-aware basis first, because every credential
-///   pattern worth naming here describes a file those rules also drop, and a
-///   key that only worked half the time would be worse than none.
-///
-/// Never fails. Entries that could not be a project-relative path (absolute,
-/// or containing `..`) are dropped rather than trusted, and a `.lore.toml` that
-/// does not parse yields an empty list — which is the safe direction, and is
-/// already reported loudly by [`RepoAuthority::error`] rather than silently.
-pub fn allow_secret_paths(root: &Utf8Path) -> BTreeSet<Utf8PathBuf> {
-    match std::fs::read_to_string(root.join(REPO_CONFIG_FILE)) {
-        Ok(text) => parse_allow_secret_paths(&text),
-        Err(_) => BTreeSet::new(),
-    }
-}
-
-/// The parse half of [`allow_secret_paths`], over the file's text.
-pub fn parse_allow_secret_paths(text: &str) -> BTreeSet<Utf8PathBuf> {
-    let Ok(file) = toml::from_str::<RepoConfigFile>(text) else {
-        return BTreeSet::new();
-    };
-    file.ingest
-        .unwrap_or_default()
-        .allow_secret_paths
-        .iter()
-        .filter_map(|entry| normalize_allowed(entry))
-        .collect()
-}
-
-/// Normalize one declared path to the forward-slash project-relative form a
-/// manifest uses, or reject it.
-///
-/// Backslashes are accepted on the way in — a Windows user copying a path out
-/// of Explorer should not be met with a key that silently does nothing — and
-/// normalized on the way out, because a manifest path is forward-slash by
-/// contract.
-fn normalize_allowed(entry: &str) -> Option<Utf8PathBuf> {
-    let entry = entry.trim().replace('\\', "/");
-    let path = Utf8Path::new(&entry);
-    if entry.is_empty() || path.is_absolute() || entry.starts_with('/') {
-        return None;
-    }
-    // `..` would let the key name a file outside the repository that declared
-    // it, which is the one thing a repo-committed key must not be able to do.
-    let clean: Vec<&str> = path
-        .components()
-        .map(|c| c.as_str())
-        .filter(|part| *part != ".")
-        .collect();
-    if clean.is_empty() || clean.contains(&"..") {
-        return None;
-    }
-    Some(clean.join("/").into())
 }
 
 #[cfg(test)]
@@ -561,77 +472,22 @@ mod tests {
         assert!(err.contains("Fix the file"), "{err}");
     }
 
-    fn allowed(text: &str) -> Vec<String> {
-        parse_allow_secret_paths(text)
-            .into_iter()
-            .map(|p| p.to_string())
-            .collect()
-    }
-
-    /// The escape hatch admits exactly what it names, and an `[ingest]` table
-    /// changes nothing about authority — the two are independent, as
-    /// `[project]` already is.
+    /// The strictness a misspelled `[ingest]` key used to be checked for, on its
+    /// new premise: D-0020 retired the table outright, so `[ingest]` is itself an
+    /// unknown table now — and an unknown table has to be loud rather than read
+    /// as "this repo opted out of something".
     #[test]
-    fn allow_secret_paths_names_exact_paths_and_leaves_authority_alone() {
-        let text = "[ingest]\nallow_secret_paths = [\"tests/fixtures/sample.pem\", \"docs/example.env\"]\n";
-        assert_eq!(
-            allowed(text),
-            ["docs/example.env", "tests/fixtures/sample.pem"]
-        );
-        assert_eq!(RepoAuthority::parse(text), RepoAuthority::default());
-
-        // Absent table, absent key, and empty list all mean "nothing".
-        for text in ["", "[ingest]\n", "[ingest]\nallow_secret_paths = []\n"] {
-            assert!(allowed(text).is_empty(), "{text:?}");
-        }
-    }
-
-    /// Windows-shaped input is normalized rather than silently ignored; a path
-    /// that could escape the repository is dropped rather than trusted.
-    #[test]
-    fn declared_paths_are_normalized_and_escapes_are_dropped() {
-        assert_eq!(
-            allowed("[ingest]\nallow_secret_paths = [\"certs\\\\dev.pem\", \"./a/b.key\"]\n"),
-            ["a/b.key", "certs/dev.pem"]
-        );
-        for entry in [
-            "../outside.pem",
-            "a/../../outside.pem",
-            "/etc/ssl/key.pem",
-            "C:/keys/id_rsa",
-            "",
-            "   ",
+    fn the_retired_ingest_table_is_a_visible_config_error() {
+        for text in [
+            "[ingest]\n",
+            "[ingest]\nallow_secret_paths = [\"a.pem\"]\n",
+            "[ingestion]\n",
         ] {
-            let text = format!("[ingest]\nallow_secret_paths = [\"{entry}\"]\n");
-            assert!(allowed(&text).is_empty(), "{entry:?} must not be admitted");
+            assert!(
+                RepoAuthority::parse(text).error.is_some(),
+                "{text:?} must not pass silently"
+            );
         }
-    }
-
-    /// Same strictness as the rest of the file: a misspelled key inside
-    /// `[ingest]` must not present as "the allowlist mysteriously did nothing".
-    #[test]
-    fn a_misspelled_ingest_key_is_a_visible_config_error() {
-        let text = "[ingest]\nallow_secret_path = [\"a.pem\"]\n";
-        assert!(RepoAuthority::parse(text).error.is_some());
-        assert!(allowed(text).is_empty());
-        assert!(RepoAuthority::parse("[ingestion]\n").error.is_some());
-    }
-
-    #[test]
-    fn allow_secret_paths_reads_the_root_file_and_tolerates_its_absence() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
-        assert!(allow_secret_paths(&root).is_empty());
-
-        std::fs::write(
-            root.join(REPO_CONFIG_FILE),
-            "[ingest]\nallow_secret_paths = [\"config/dev.env\"]\n",
-        )
-        .unwrap();
-        assert_eq!(
-            allow_secret_paths(&root),
-            BTreeSet::from([Utf8PathBuf::from("config/dev.env")])
-        );
     }
 
     #[test]

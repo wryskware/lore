@@ -610,31 +610,39 @@ fn route(events: Vec<DebouncedEvent>, watches: &Watches, queue: &IndexQueue, dat
             // two legitimate projects, and first-match leaves one of them
             // deterministically stale.
             for (project, rel) in watches.containing(abs) {
-                if walk::is_excluded_rel(&rel) {
-                    // Exceptions: dot-files that are not content but *policy*,
-                    // and whose edit changes the meaning of files that are.
-                    //
-                    // - the ignore rules changed, so what is indexable changed
-                    //   with them — only a rescan can tell how. Both files,
-                    //   because `.loreignore` is the one a user is actually
-                    //   invited to edit;
-                    // - `.lore.toml` changed, so whether this repo has
-                    //   authority semantics at all may have changed (D-0012),
-                    //   and the project's Markdown has to be re-chunked under
-                    //   the new profile. Only at the root: a nested copy is
-                    //   not configuration.
-                    let name = rel.file_name();
-                    let ignore_rules =
-                        name == Some(".gitignore") || name == Some(walk::LORE_IGNORE_FILE);
-                    let repo_config = rel.as_str() == crate::repo_config::REPO_CONFIG_FILE;
-                    if ignore_rules || repo_config {
-                        tracing::info!(
-                            project = %project.name,
-                            file = %rel,
-                            "repository policy changed; scheduling rescan"
-                        );
-                        queue.request_full(project.id);
-                    }
+                // Policy first, before anything below can drop the event: these
+                // files are not content, and an edit to one changes the meaning
+                // of the files that are.
+                //
+                // - the ignore rules changed, so what is indexable changed with
+                //   them — only a rescan can tell how. Both files, because
+                //   `.loreignore` is the one a user is actually invited to edit;
+                // - `.lore.toml` changed, so whether this repo has authority
+                //   semantics at all may have changed (D-0012), and the
+                //   project's Markdown has to be re-chunked under the new
+                //   profile. Only at the root: a nested copy is not
+                //   configuration.
+                let name = rel.file_name();
+                let ignore_rules =
+                    name == Some(".gitignore") || name == Some(walk::LORE_IGNORE_FILE);
+                let repo_config = rel.as_str() == crate::repo_config::REPO_CONFIG_FILE;
+                if ignore_rules || repo_config {
+                    tracing::info!(
+                        project = %project.name,
+                        file = %rel,
+                        "repository policy changed; scheduling rescan"
+                    );
+                    queue.request_full(project.id);
+                    continue;
+                }
+                // The hard floor is all that is rejected on the name alone —
+                // and git writes to it constantly (an index lock, a ref update,
+                // a reflog append), so it is worth rejecting cheaply. Every
+                // other exclusion is an overridable rule (D-0020), so a
+                // dot-file shortcut here would drop the events for a `.env`
+                // some `.loreignore` deliberately re-included, and the file
+                // would go stale in the index until the next full scan.
+                if walk::is_git_metadata(&rel) {
                     continue;
                 }
                 queue.request_paths(project.id, [rel]);

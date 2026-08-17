@@ -54,6 +54,16 @@ impl Fixture {
         let root = canonicalize_root(project_dir.path()).expect("canonical root");
         let data = canonicalize_root(data_dir.path()).expect("canonical data dir");
 
+        // The dot-file rule, at the rung a real machine keeps it: since D-0020
+        // lore ships no ignore rules of its own, so without this line every
+        // fixture's `.lore.toml`, `.gitignore` and dot-directory is ordinary
+        // indexable content. It is stated here rather than in each project so
+        // that it reads as what it is — a machine-wide preference, the lowest of
+        // the three sources — and so a test that wants the out-of-box behaviour
+        // (see `daemon_observe.rs`) simply builds its own fixture.
+        std::fs::write(data.join(lore::daemon::walk::USER_IGNORE_FILE), ".*\n")
+            .expect("write user-level ignore rules");
+
         let store = StoreHandle::open(data.join("lore.db")).expect("open store");
         let project = {
             let root = root.clone();
@@ -160,12 +170,13 @@ impl Fixture {
 /// with both a directory and a glob rule, plus every category of thing that
 /// must never be indexed.
 ///
-/// The `.loreignore` is written explicitly, exactly as `lore init` (or the
-/// first scan) would have produced it for this tree. Without it the walker's
-/// in-memory fallback would be doing the work instead, and this fixture would
-/// silently stop covering the file that is meant to be the real mechanism.
+/// The `.loreignore` is written by hand, which is the only way one exists at
+/// all since D-0020 — nothing is generated, and lore ships no ignore rules of
+/// its own. So this fixture states every rule it depends on, `.*` included:
+/// without that line the dot-files below (and any `.lore.toml` a test commits)
+/// are ordinary indexable content, because nothing in lore says otherwise.
 pub fn populate_standard_tree(fixture: &Fixture) {
-    fixture.write(".loreignore", "target/\nnode_modules/\nLibrary/\n");
+    fixture.write(".loreignore", ".*\ntarget/\nnode_modules/\nLibrary/\n");
     fixture.write(
         "src/lib.rs",
         "pub fn alpha() -> u32 {\n    41\n}\n\npub fn beta() -> u32 {\n    alpha() + 1\n}\n",

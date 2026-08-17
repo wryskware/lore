@@ -39,19 +39,14 @@ enum Command {
         /// Project name or key, as `lore status` reports it.
         project: String,
     },
-    /// Write a project's `.loreignore` from the ecosystems it looks like.
-    ///
-    /// Never overwrites an existing one, and needs no running daemon.
-    Init {
-        /// Project directory. Defaults to the current directory.
-        path: Option<String>,
-    },
-    /// Install Lore's agent-side assets into a coding agent host.
+    /// Install Lore's host-side assets: an agent host's skills, or this
+    /// machine's user-level ignore rules.
     ///
     /// Bare `lore setup` reports what is installed and writes nothing.
     Setup {
-        /// Host to install into, as `lore setup` names it (`claude-code`).
-        host: Option<String>,
+        /// What to install, as `lore setup` names it: an agent host
+        /// (`claude-code`), or `loreignore` for the machine-wide ignore rules.
+        target: Option<String>,
         /// Print what would change without writing it.
         #[arg(long)]
         dry_run: bool,
@@ -90,12 +85,11 @@ fn main() -> anyhow::Result<()> {
         Command::Stop => cli::run(cli::stop()),
         Command::Add { path, name } => cli::run(cli::add(path, name)),
         Command::Remove { project } => cli::run(cli::remove(project)),
-        Command::Init { path } => cli::init(path),
         Command::Setup {
-            host,
+            target,
             dry_run,
             force,
-        } => cli::setup(host, dry_run, force),
+        } => cli::setup(target, dry_run, force),
         Command::Index {
             project,
             allow_mass_delete,

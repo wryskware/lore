@@ -46,7 +46,7 @@ use axum::{Json, Router};
 use camino::{Utf8Path, Utf8PathBuf};
 
 use lore_core::snapshot::{
-    Manifest, PushCommitRequest, PushCommitResponse, PushEpoch, PushFileParams, PushFileResponse,
+    PushCommitRequest, PushCommitResponse, PushEpoch, PushFileParams, PushFileResponse,
     PushLeaseRequest, PushLeaseResponse, PushManifestRequest, PushManifestResponse,
     PushRenewRequest, PushSessionId, malformed_path,
 };
@@ -65,7 +65,7 @@ use super::queue::IndexQueue;
 use super::snapshot::{Scope, Snapshot};
 use super::store_handle::StoreHandle;
 use super::watch::{WatchCommand, WatchSender, WatchStatus};
-use super::{expand, ignorefile, index, paths, push, search, walk};
+use super::{expand, index, paths, push, search};
 
 /// Request bodies are small JSON documents; a megabyte is generous for the
 /// largest realistic one (a pasted query) and cheap insurance otherwise.
@@ -287,10 +287,6 @@ async fn status(
                 .profile
                 .map(|_| p.authority.behavior.as_str().to_string()),
             authority_config_error: p.authority.error,
-            // A degraded manifest basis (D-0017). Reported for the same reason
-            // the config error above is: the project still indexes, under
-            // different rules than it asked for.
-            manifest_basis_error: state.index.basis.of(p.project),
             decisions_active: p.decisions_active,
             decisions_total: p.decisions_total,
             decision_violations: p
@@ -468,15 +464,9 @@ async fn register_project(
         "project registered"
     );
 
-    // The exclusion policy is written the moment the project is enrolled, so
-    // it exists before the first scan and before the user goes looking for
-    // it. `spawn_blocking` because detection reads directories, and the first
-    // scan would only redo this work anyway.
-    {
-        let root = project.root.clone();
-        let _ = tokio::task::spawn_blocking(move || ignorefile::ensure(&root)).await;
-    }
-
+    // Nothing is written into the project. D-0020 retired `.loreignore`
+    // generation: a project's ignore rules exist only where a human wrote them,
+    // and registration's whole footprint on the repo is `.lore.toml`'s name.
     let _ = state.watch.send(WatchCommand::Watch(project.clone()));
     state.queue.request_full(project.id);
 
@@ -552,7 +542,6 @@ async fn remove_project(
     let _ = state.watch.send(WatchCommand::Unwatch(id));
     state.watch_status.forget(id);
     state.index.guard.forget(id);
-    state.index.basis.forget(id);
     // A lease on a project that no longer exists cannot commit anything, so
     // its staged content goes with it rather than waiting for the reaper.
     if let Some(dir) = state.push.forget(id) {
@@ -997,7 +986,10 @@ async fn push_manifest(
         .map_err(|err| ApiErr::internal("push manifest", err))?
         .map_err(|err| ApiErr::internal("push manifest", err))?;
 
-    let (manifest, refused) = refuse_hard_excludes(&project.name, request.manifest);
+    // No content screening: D-0020 makes the receiver structural-only, and the
+    // structural verdict was already reached above. What the listing otherwise
+    // contains is the pusher's business.
+    let manifest = request.manifest;
 
     let known: BTreeMap<&str, &str> = stored
         .iter()
@@ -1030,53 +1022,12 @@ async fn push_manifest(
         epoch = %request.epoch,
         needed = missing.len(),
         deletes,
-        refused = refused.len(),
         "push manifest negotiated"
     );
     Ok(Json(PushManifestResponse {
         needed: missing,
         deletes,
-        refused,
     }))
-}
-
-/// Split a listing into what this daemon will index and what it refuses.
-///
-/// The refusal is [`walk::refusal`] — the same function the local observer
-/// screens with, so "never indexed" has one definition whether the paths came
-/// off this machine's disk or off a wire. The pusher-side escape hatch
-/// (`[ingest] allow_secret_paths`) deliberately does **not** apply here: it
-/// lives in a repository this daemon may never have seen, and a backstop a
-/// remote client can talk its way past is not a backstop.
-///
-/// Rebuilds the manifest only when something was actually refused —
-/// [`Manifest::new`] re-sorts and re-checksums, which is real work on a
-/// 300k-entry listing and pure waste in the overwhelmingly common case.
-fn refuse_hard_excludes(project: &str, manifest: Manifest) -> (Manifest, Vec<String>) {
-    let refused: Vec<String> = manifest
-        .entries
-        .iter()
-        .filter_map(|entry| {
-            let pattern = walk::refusal(Utf8Path::new(&entry.path))?;
-            tracing::warn!(
-                project,
-                path = %entry.path,
-                pattern,
-                "refusing a manifest entry this daemon never indexes; it is dropped from the \
-                 accepted listing, and any stored copy is deleted by the commit"
-            );
-            Some(entry.path.clone())
-        })
-        .collect();
-    if refused.is_empty() {
-        return (manifest, refused);
-    }
-    let kept = manifest
-        .entries
-        .into_iter()
-        .filter(|entry| walk::refusal(Utf8Path::new(&entry.path)).is_none())
-        .collect();
-    (Manifest::new(kept), refused)
 }
 
 /// `POST /v1/push/file?project=&session=&epoch=&path=` — stage one needed
@@ -1149,9 +1100,6 @@ async fn push_commit(
         // pusher declared it whole and the checksum agreed.
         complete: true,
         unreadable: BTreeSet::new(),
-        // The pusher took the basis; this daemon never saw the filesystem and
-        // has no degradation of its own to report.
-        basis_error: None,
         content: Box::new(plan.content),
     };
 

@@ -186,11 +186,13 @@ async fn registering_a_project_lists_it_watches_it_and_queues_a_scan() {
     assert_eq!(queued, id);
     assert!(work.full);
 
-    // …and its exclusion policy is on disk before the scan runs, so the user
-    // can see and edit it without waiting for anything.
+    // …and registration wrote nothing into the project. D-0020 retired
+    // `.loreignore` generation: a project's ignore rules exist only where a
+    // human wrote them, so enrolling a repo must not leave a file behind that
+    // the user then has to review, commit, or wonder about.
     assert!(
-        other.path().join(".loreignore").is_file(),
-        "registration should have generated a .loreignore"
+        !other.path().join(".loreignore").exists(),
+        "registration must not generate a .loreignore"
     );
 }
 

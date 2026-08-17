@@ -1208,21 +1208,24 @@ async fn deregistering_a_project_drops_the_push_state_bound_to_it() {
     );
 }
 
-/// The receiver's backstop: a pusher decides what to send, but the paths this
-/// daemon hard-excludes are not the pusher's to re-include.
+/// What the receiver still refuses, and what it deliberately no longer does.
 ///
-/// D-0015, "Ignore rules and secrets": "`.loreignore` evaluation runs
-/// **pusher-side** [...] The receiving daemon keeps hard-exclude backstop
-/// scanning; it does not re-run full ignore evaluation (trusted-client model)."
-/// `.git` is the one name [`lore::daemon::walk::HARD_EXCLUDES`] already lists;
-/// the credential patterns from the same section are covered below.
+/// D-0020 made the receiver **structural only**: it validates the shape of a
+/// path, never its content. Two halves, in one test, because the line between
+/// them is the decision:
 ///
-/// The backstop **accepts** the manifest and refuses the entry: a client
-/// listing a secret is misconfigured, not broken, and refusing its whole
-/// snapshot would take a working index offline over one file. The entry is
-/// dropped from the accepted listing, named in `refused`, and never asked for.
+/// - `.git/` is refused, structurally and wholesale. It is not an opinion about
+///   the project — it is lore's own metadata floor, checked from the same
+///   `GIT_DIR` constant the walker's hard floor uses.
+/// - `.env` is **accepted**. That is the trusted-client model D-0015 always
+///   described and D-0020 finished: what a manifest may otherwise contain is
+///   the pusher's business, decided by the pusher's own ignore rules. The
+///   accepted trade, stated in D-0020: a bad ignore file can ship a credential,
+///   hygiene here is best-effort user responsibility, and an encrypted store is
+///   the substantive data-protection measure. In shared deployments, isolation
+///   comes from the instance boundary rather than from content policy.
 #[tokio::test]
-async fn a_manifest_cannot_push_a_path_the_receiver_hard_excludes() {
+async fn the_receiver_refuses_git_metadata_structurally_and_accepts_content_it_dislikes() {
     let harness = harness();
     let router = &harness.router;
     let (session, epoch) = lease(router).await;
@@ -1230,77 +1233,41 @@ async fn a_manifest_cannot_push_a_path_the_receiver_hard_excludes() {
     let secret = "[remote \"origin\"]\n    url = git@example.com:private.git\n";
     let sneaky = Manifest::new(vec![entry(".git/config", secret)]);
     let (status, body) = negotiate(router, &session, epoch, &sneaky).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["needed"], json!([]), "the daemon never asks for it");
-    assert_eq!(body["refused"], json!([".git/config"]), "and says why not");
-    commit(router, &session, epoch).await;
-
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let refusal = message(&body);
     assert!(
-        harness.fixture.indexed_paths().is_empty(),
-        "a hard-excluded path must not enter the index because a client listed it"
+        refusal.contains(".git/config") && refusal.contains("`.git` component"),
+        "the refusal names the path and the floor: {refusal}"
     );
-}
 
-/// The credential half of the same backstop (D-0015, "Ignore rules and
-/// secrets"), over paths this daemon never walked and whose repository it may
-/// never have seen — which is why the pusher-side `[ingest]
-/// allow_secret_paths` escape hatch deliberately does not reach here.
-///
-/// The legitimate file travelling in the same manifest is unaffected: the
-/// refusal is per entry, not per push.
-#[tokio::test]
-async fn credential_paths_are_refused_entry_by_entry_and_the_rest_is_accepted() {
-    let harness = harness();
-    let router = &harness.router;
+    // Nothing was negotiated, so nothing can be committed and nothing is
+    // indexed — a client sending that shape is not implementing the contract.
+    let (status, body) = commit(router, &session, epoch).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(harness.fixture.indexed_paths().is_empty());
+
+    // The other half: a credential is an ordinary path here. It is asked for,
+    // uploaded and indexed like anything else.
     let (session, epoch) = lease(router).await;
-
-    let secret = "TOKEN=hunter2\n";
-    let manifest = Manifest::new(vec![
-        entry(".env", secret),
-        entry("deploy/.env.production", secret),
-        entry("certs/server.pem", secret),
-        entry("keys/id_ed25519", secret),
-        entry("tls/session.key", secret),
-        entry("home/.ssh/config", secret),
-        entry("home/.aws/credentials", secret),
-        entry(PUSHED_PATH, PUSHED),
-    ]);
-
+    let env = "TOKEN=hunter2\n";
+    let manifest = Manifest::new(vec![entry(".env", env), entry(PUSHED_PATH, PUSHED)]);
     let (status, body) = negotiate(router, &session, epoch, &manifest).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["needed"], json!([PUSHED_PATH]), "{body}");
     assert_eq!(
-        body["refused"],
-        json!([
-            ".env",
-            "certs/server.pem",
-            "deploy/.env.production",
-            "home/.aws/credentials",
-            "home/.ssh/config",
-            "keys/id_ed25519",
-            "tls/session.key",
-        ]),
-        "{body}"
+        body["needed"],
+        json!([".env", PUSHED_PATH]),
+        "the receiver has no opinion about content: {body}"
     );
-
-    // A refused path is not in the accepted manifest, so uploading it is the
-    // same error as uploading a path nobody listed.
-    let (status, body) = upload(router, &session, epoch, ".env", secret.as_bytes()).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert!(
-        message(&body).contains("is not in this session's manifest"),
-        "{body}"
-    );
-
+    upload(router, &session, epoch, ".env", env.as_bytes()).await;
     upload(router, &session, epoch, PUSHED_PATH, PUSHED.as_bytes()).await;
-    let (status, body) = commit(router, &session, epoch).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(harness.fixture.indexed_paths(), [PUSHED_PATH]);
+    assert_eq!(commit(router, &session, epoch).await.0, StatusCode::OK);
+    assert_eq!(harness.fixture.indexed_paths(), [".env", PUSHED_PATH]);
 }
 
-/// The other kind of bad entry, answered the other way. A path that could not
-/// be a manifest path at all means the *client* is broken, so nothing it
-/// listed can be trusted — least of all the absences, which delete files.
+/// The other kind of bad entry, answered the same way — and now the only kind
+/// there is. A path that could not be a manifest path at all means the *client*
+/// is broken, so nothing it listed can be trusted — least of all the absences,
+/// which delete files.
 ///
 /// Refused whole, by name, before the project is even resolved. Nothing is
 /// staged and nothing is negotiated, so a subsequent commit has no manifest.
@@ -1338,75 +1305,6 @@ async fn a_structurally_impossible_path_refuses_the_whole_manifest() {
         "{body}"
     );
     assert!(harness.fixture.indexed_paths().is_empty());
-}
-
-/// The backstop is not only a filter — it is a *purge*.
-///
-/// A secret indexed before it matched (an older daemon, a pattern added later,
-/// a file renamed into the list) is absent from the accepted manifest, and
-/// absence is how this protocol spells deletion. So the next commit removes it.
-/// That is the whole reason the refusal drops entries rather than rejecting the
-/// push: a secret that reached the index once has to be able to leave it.
-#[tokio::test]
-async fn a_stored_copy_of_a_refused_path_is_purged_by_the_next_commit() {
-    let harness = harness();
-    let router = &harness.router;
-
-    // Get the secret into the index the only way it could have got there —
-    // through the local pipeline, before the pattern existed. Writing it to
-    // the fixture root and scanning would now refuse it observer-side too, so
-    // it is pushed under a name the backstop does not know and then re-listed
-    // under one it does.
-    let secret = "-----BEGIN OPENSSH PRIVATE KEY-----\n";
-    let (session, epoch) = lease(router).await;
-    let seeded = Manifest::new(vec![
-        entry("certs/legacy_key", secret),
-        entry(PUSHED_PATH, PUSHED),
-    ]);
-    let (status, body) = negotiate(router, &session, epoch, &seeded).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        body["refused"],
-        json!([]),
-        "not a refused shape yet: {body}"
-    );
-    upload(
-        router,
-        &session,
-        epoch,
-        "certs/legacy_key",
-        secret.as_bytes(),
-    )
-    .await;
-    upload(router, &session, epoch, PUSHED_PATH, PUSHED.as_bytes()).await;
-    assert_eq!(commit(router, &session, epoch).await.0, StatusCode::OK);
-    assert_eq!(
-        harness.fixture.indexed_paths(),
-        ["certs/legacy_key", PUSHED_PATH]
-    );
-
-    // Now the same file under a name the credential list refuses. The pusher
-    // still lists it — it is a real file on its disk — and the receiver drops
-    // it, which deletes the stored copy along with the rename.
-    let (session, epoch) = lease(router).await;
-    let renamed = Manifest::new(vec![
-        entry("certs/id_rsa", secret),
-        entry(PUSHED_PATH, PUSHED),
-    ]);
-    let (status, body) = negotiate(router, &session, epoch, &renamed).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["refused"], json!(["certs/id_rsa"]), "{body}");
-    assert_eq!(
-        body["deletes"], 1,
-        "the delete preview counts the refused path's stored copy: {body}"
-    );
-    assert_eq!(commit(router, &session, epoch).await.0, StatusCode::OK);
-
-    assert_eq!(
-        harness.fixture.indexed_paths(),
-        [PUSHED_PATH],
-        "the stored copy of a refused path is purged, not left behind"
-    );
 }
 
 // ---------------------------------------------------------------------------

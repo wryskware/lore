@@ -71,49 +71,42 @@ fn every_exclusion_category_is_enforced() {
     }
 }
 
-/// The exclusion policy is a file in the project, so a scan of a project that
-/// has none writes one — and the same pass then obeys what it wrote.
+/// A scan writes **nothing** into the project it is scanning.
+///
+/// This replaces the pair of tests that pinned `.loreignore` generation (that a
+/// first scan wrote one, and that later scans never rewrote it). D-0020 retired
+/// generation outright, so the property worth pinning inverted: a project that
+/// has no ignore file still has none afterwards, and a build tree is indexed
+/// until a human says otherwise.
 #[test]
-fn a_full_scan_generates_the_loreignore_and_then_honours_it() {
+fn a_full_scan_writes_nothing_into_the_project() {
     let fixture = Fixture::new("demo");
     fixture.write("Cargo.toml", "[package]\nname = \"demo\"\n");
     fixture.write("src/lib.rs", "pub fn a() {}\n");
     fixture.write("target/debug/build.rs", "fn generated() {}\n");
-    let generated = fixture.root.join(".loreignore");
-    assert!(!generated.exists());
+    let ignore_file = fixture.root.join(".loreignore");
 
     full_scan(&fixture.context(), &fixture.project);
 
-    let body = std::fs::read_to_string(&generated).expect("the scan should have written it");
-    assert!(body.contains("\n# Rust (Cargo.toml)\ntarget/\n"), "{body}");
+    assert!(!ignore_file.exists(), "the scan must not generate one");
+    assert!(
+        fixture
+            .indexed_paths()
+            .contains(&"target/debug/build.rs".to_string()),
+        "nothing excludes it yet, and lore ships no rule that would: {:?}",
+        fixture.indexed_paths()
+    );
+
+    // And a hand-written one is obeyed on the next pass, with no generation
+    // step to fight it.
+    std::fs::write(&ignore_file, "target/\n").unwrap();
+    full_scan(&fixture.context(), &fixture.project);
+    assert_eq!(std::fs::read_to_string(&ignore_file).unwrap(), "target/\n");
     assert!(
         !fixture
             .indexed_paths()
             .contains(&"target/debug/build.rs".to_string()),
         "{:?}",
-        fixture.indexed_paths()
-    );
-}
-
-/// Generated once and then left alone — including when the edit is "index
-/// everything after all".
-#[test]
-fn a_later_scan_never_rewrites_the_users_loreignore() {
-    let fixture = Fixture::new("demo");
-    fixture.write("Cargo.toml", "[package]\nname = \"demo\"\n");
-    fixture.write("target/debug/build.rs", "fn generated() {}\n");
-    full_scan(&fixture.context(), &fixture.project);
-
-    let generated = fixture.root.join(".loreignore");
-    std::fs::write(&generated, "# mine now\n").unwrap();
-    full_scan(&fixture.context(), &fixture.project);
-
-    assert_eq!(std::fs::read_to_string(&generated).unwrap(), "# mine now\n");
-    assert!(
-        fixture
-            .indexed_paths()
-            .contains(&"target/debug/build.rs".to_string()),
-        "an emptied file is an escape hatch, not a no-op: {:?}",
         fixture.indexed_paths()
     );
 }
@@ -274,6 +267,9 @@ fn the_daemons_own_data_directory_is_never_indexed() {
     std::fs::create_dir_all(&nested).unwrap();
     std::fs::write(nested.join("lore.db"), "pretend database").unwrap();
     std::fs::write(nested.join("config.toml"), "[embeddings]\n").unwrap();
+    // The user-level rules live beside `config.toml`, so moving the data
+    // directory moves them: this pass reads them from `nested`.
+    std::fs::write(nested.join(lore::daemon::walk::USER_IGNORE_FILE), ".*\n").unwrap();
 
     let mut context = fixture.context();
     context.data_dir = nested;
@@ -423,10 +419,11 @@ fn a_file_that_became_ignored_is_dropped_from_the_index() {
     assert_eq!(fixture.indexed_paths(), ["README.md"]);
 }
 
-/// Two layers, and where the line between them sits matters. Only `.git` and
-/// hidden paths are rejected on the name alone; a build tree is rejected by
-/// the project's `.loreignore`, which costs a directory listing but is a rule
-/// the user can read and change.
+/// Two layers, and where the line between them sits matters — it moved with
+/// D-0020. Only `.git` is rejected on the name alone now, because it is the one
+/// exclusion no rule can argue with. A hidden path is an *ordinary* ignored
+/// path: it costs a directory listing, exactly as a build tree does, and it is
+/// re-includable by a rule the user can read and change.
 #[test]
 fn an_incremental_pass_indexes_neither_hidden_nor_ignored_paths() {
     let fixture = Fixture::new("demo");
@@ -436,11 +433,22 @@ fn an_incremental_pass_indexes_neither_hidden_nor_ignored_paths() {
     let stat_free = index_paths(
         &fixture.context(),
         &fixture.project,
-        &paths(&[".vs/state.txt", ".git/config"]),
+        &paths(&[".git/config"]),
     );
     assert_eq!(
         stat_free.seen, 0,
-        "the disk is never consulted: {stat_free:?}"
+        "the disk is never consulted for the one hard floor: {stat_free:?}"
+    );
+
+    let hidden = index_paths(
+        &fixture.context(),
+        &fixture.project,
+        &paths(&[".vs/state.txt"]),
+    );
+    assert_eq!(
+        (hidden.indexed, hidden.removed),
+        (0, 0),
+        "observed and then excluded by a rule, rather than dropped on its name: {hidden:?}"
     );
 
     let ignored = index_paths(

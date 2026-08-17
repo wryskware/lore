@@ -524,9 +524,14 @@ async fn a_root_lore_toml_edit_schedules_a_rescan() {
         "a rescan, not an incremental edit to an excluded file"
     );
 
-    // Only at the registered root. A nested copy is an ordinary (excluded)
-    // dot-file, and honoring it would let any vendored subdirectory force
-    // full rescans of the repo that happens to contain it.
+    // Only at the registered root. A nested copy is not configuration, and
+    // honoring it would let any vendored subdirectory force full rescans of the
+    // repo that happens to contain it.
+    //
+    // It is queued as an ordinary path rather than dropped: since D-0020 the
+    // only name the router rejects outright is `.git`, because every other
+    // exclusion is a rule some `.loreignore` may have re-included. The
+    // incremental pass then evaluates it like any other file.
     seam.forget_served();
     seam.emit(&[r"C:\repo\vendor\thing\.lore.toml", r"C:\repo\src\lib.rs"]);
     wait_until("the ordinary edit in the same batch to arrive", || {
@@ -534,8 +539,11 @@ async fn a_root_lore_toml_edit_schedules_a_rescan() {
         !seam.paths_for(1).is_empty()
     })
     .await;
-    assert_eq!(seam.paths_for(1), ["src/lib.rs"]);
-    assert!(!seam.full_for(1), "the nested config is inert");
+    assert_eq!(seam.paths_for(1), ["src/lib.rs", "vendor/thing/.lore.toml"]);
+    assert!(
+        !seam.full_for(1),
+        "the nested config is inert as *configuration*, which is the property"
+    );
 }
 
 /// A reconnecting volume or a transient Windows error refuses the arm once.

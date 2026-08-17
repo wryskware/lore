@@ -60,8 +60,6 @@ pub struct IndexContext {
     pub embed_notify: Arc<Notify>,
     /// Where a refused apply is recorded for `lore status`.
     pub guard: GuardStatus,
-    /// Where a degraded manifest basis is recorded for `lore status`.
-    pub basis: BasisStatus,
 }
 
 impl IndexContext {
@@ -72,7 +70,6 @@ impl IndexContext {
             cancel,
             embed_notify: Arc::new(Notify::new()),
             guard: GuardStatus::new(),
-            basis: BasisStatus::new(),
         }
     }
 }
@@ -124,49 +121,6 @@ impl GuardStatus {
 
     fn lock(&self) -> MutexGuard<'_, BTreeMap<ProjectId, MassDeleteTrip>> {
         self.trips
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-}
-
-/// Per-project record that the last local observation could not take the
-/// git-aware manifest basis (D-0017), shared read-only with `/v1/status`.
-///
-/// Same shape and same reasoning as [`GuardStatus`]: in memory, describing what
-/// this daemon's last pass *did* rather than what the index is, and cleared by
-/// the next pass that manages it. A degraded basis is not an error — the pass
-/// succeeds on the walker's own rules, which over-include — but it silently
-/// changes what a manifest means, and D-0012 already established that this
-/// daemon's answer to a silent change of meaning is to report it.
-#[derive(Clone, Debug, Default)]
-pub struct BasisStatus {
-    errors: Arc<Mutex<BTreeMap<ProjectId, String>>>,
-}
-
-impl BasisStatus {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn of(&self, project: ProjectId) -> Option<String> {
-        self.lock().get(&project).cloned()
-    }
-
-    fn set(&self, project: ProjectId, error: Option<&str>) {
-        match error {
-            Some(error) => self.lock().insert(project, error.to_string()),
-            None => self.lock().remove(&project),
-        };
-    }
-
-    /// Drop a deregistered project's record, for the reason
-    /// [`GuardStatus::forget`] gives.
-    pub fn forget(&self, project: ProjectId) {
-        self.lock().remove(&project);
-    }
-
-    fn lock(&self) -> MutexGuard<'_, BTreeMap<ProjectId, String>> {
-        self.errors
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -309,11 +263,6 @@ fn apply(
         Scope::Paths(_) => "incremental",
     };
     let profile = refresh_profile(ctx, project, &mut summary);
-    // Recorded before the early returns below: a pass that a cancelled walk or
-    // the mass-delete guard cuts short still observed the basis it observed,
-    // and the degradation is exactly the kind of thing that would explain the
-    // shrunken listing the guard just refused.
-    ctx.basis.set(project.id, snapshot.basis_error.as_deref());
 
     summary.seen = snapshot.considered();
     // A file the observer could not read is not evidence of anything: it is

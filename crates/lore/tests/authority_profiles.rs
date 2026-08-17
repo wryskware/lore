@@ -41,6 +41,11 @@ const OFF: &str = "[authority]\nprofile = \"lore-v1\"\nbehavior = \"off\"\n";
 /// That disagreement is the whole instrument: `annotate` must resolve it the
 /// way retrieval did, `rank` the way authority did.
 fn populate_vault(fixture: &Fixture) {
+    // Since D-0020 lore ships no ignore rules, so a `.lore.toml` committed
+    // mid-test is ordinary indexable content unless something says otherwise.
+    // These tests are about what *committing a profile* costs, and a new file
+    // arriving in the same pass would be measuring something else.
+    fixture.write(".loreignore", ".*\n");
     fixture.write(
         LEDGER,
         "# Ledger\n\n## D-0001 — Live canon\n\n\

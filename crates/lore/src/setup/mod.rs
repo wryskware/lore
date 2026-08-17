@@ -14,6 +14,13 @@
 //! `lore setup` reports without writing anything — discovery must never be a
 //! mutation.
 //!
+//! One target is not a host: `lore setup loreignore` writes [`USER_IGNORE`] into
+//! lore's own data directory. It lives here because it answers the same
+//! question — what does this machine need for lore to be useful — and because
+//! since D-0020 it is the *only* way lore excludes anything by default. The
+//! evaluator ships no rules; this file is a starting point a human installs,
+//! reads and owns.
+//!
 //! # What this deliberately does not do
 //!
 //! It does not edit `CLAUDE.md`, `AGENTS.md`, or any other file the repository
@@ -57,6 +64,25 @@ pub const SKILLS: &[Skill] = &[Skill {
     summary: "tune a project's .loreignore by measuring the repo",
     body: include_str!("assets/lore-ignore.md"),
 }];
+
+/// The `lore setup` target that installs the user-level ignore rules. Not a
+/// host: it writes into lore's own data directory.
+pub const USER_IGNORE_TARGET: &str = "loreignore";
+
+/// A commented starting point for `<data-dir>/loreignore` — the lowest of the
+/// three rule sources the walker evaluates (D-0020).
+///
+/// Shipped as an asset rather than compiled into the evaluator, which is the
+/// substance of the decision: lore applies no ignore rules of its own, so every
+/// exclusion is a line in a file a user can read, edit and delete. Installing it
+/// is an explicit act (`lore setup loreignore`), and an existing file at that
+/// path is never overwritten — the never-clobber rule above covers it, because
+/// a file lore did not stamp reads as the user's.
+const USER_IGNORE: Skill = Skill {
+    name: USER_IGNORE_TARGET,
+    summary: "machine-wide ignore rules: dot-files, credentials, build output",
+    body: include_str!("assets/user-loreignore"),
+};
 
 /// A coding agent Lore knows how to install into.
 ///
@@ -126,11 +152,29 @@ impl fmt::Display for Host {
 // The stamp
 // ---------------------------------------------------------------------------
 
-/// Marks the stamp line. An HTML comment because every asset Lore ships is
-/// Markdown, and a comment is the one thing that is inert in all of it — a
-/// frontmatter key would be extra surface for a host's own schema validation to
-/// reject.
-const STAMP_PREFIX: &str = "<!-- lore-asset:";
+/// How the stamp line is commented out, in the asset's own syntax.
+///
+/// A comment is the one construct that is inert in every format Lore ships — a
+/// frontmatter key would be extra surface for a host's schema validation to
+/// reject, and in a gitignore file it would be a rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    prefix: &'static str,
+    suffix: &'static str,
+}
+
+/// Markdown, for the agent-host skills.
+const MARKDOWN: Stamp = Stamp {
+    prefix: "<!-- lore-asset:",
+    suffix: " -->",
+};
+
+/// Gitignore syntax, for the user-level ignore rules. `#` to end of line, so
+/// there is nothing to close.
+const IGNORE: Stamp = Stamp {
+    prefix: "# lore-asset:",
+    suffix: "",
+};
 
 fn hash(body: &str) -> String {
     blake3::hash(body.as_bytes()).to_hex().to_string()
@@ -141,10 +185,12 @@ fn hash(body: &str) -> String {
 /// Trailing whitespace is normalised away before hashing so that the hash
 /// [`unstamp`] can recompute from disk is the hash written here. Without that
 /// every asset would read as locally modified the moment it was installed.
-fn stamped(body: &str) -> String {
+fn stamped(body: &str, stamp: Stamp) -> String {
     let body = body.trim_end();
     format!(
-        "{body}\n\n{STAMP_PREFIX} lore {version} {hash} -->\n",
+        "{body}\n\n{prefix} lore {version} {hash}{suffix}\n",
+        prefix = stamp.prefix,
+        suffix = stamp.suffix,
         version = env!("CARGO_PKG_VERSION"),
         hash = hash(body),
     )
@@ -155,14 +201,16 @@ fn stamped(body: &str) -> String {
 ///
 /// `None` when there is no stamp at all: a file at one of our paths that Lore
 /// did not write is treated as the user's, which is the safe reading.
-fn unstamp(text: &str) -> Option<(&str, &str)> {
-    let (before, stamp) = text.trim_end().rsplit_once(STAMP_PREFIX)?;
-    let recorded = stamp
-        .trim()
-        .trim_end_matches("-->")
-        .trim()
-        .rsplit(' ')
-        .next()?;
+fn unstamp(text: &str, stamp: Stamp) -> Option<(&str, &str)> {
+    let (before, line) = text.trim_end().rsplit_once(stamp.prefix)?;
+    let line = line.trim();
+    // Guarded rather than an unconditional `trim_end_matches`: an empty pattern
+    // matches everywhere, and this must not depend on what that does.
+    let line = match stamp.suffix.trim() {
+        "" => line,
+        closing => line.trim_end_matches(closing).trim(),
+    };
+    let recorded = line.rsplit(' ').next()?;
     // `stamped` writes body, then a blank line, then the stamp. Trimming the
     // trailing newlines here rather than matching them exactly means an editor
     // that normalises line endings does not read as an edit.
@@ -207,6 +255,10 @@ pub struct Item {
     pub summary: &'static str,
     pub path: Utf8PathBuf,
     pub state: State,
+    /// What [`apply`] writes. Carried here rather than looked up by name, so
+    /// assets from different lists travel through one code path.
+    body: &'static str,
+    stamp: Stamp,
 }
 
 /// What every shipped skill looks like on disk right now.
@@ -218,22 +270,44 @@ pub fn plan(skills_dir: &Utf8Path) -> Vec<Item> {
     SKILLS
         .iter()
         .map(|skill| {
-            let path = skills_dir.join(skill.name).join("SKILL.md");
-            Item {
-                name: skill.name,
-                summary: skill.summary,
-                state: state_of(&path, skill.body),
-                path,
-            }
+            item(
+                skill,
+                skills_dir.join(skill.name).join("SKILL.md"),
+                MARKDOWN,
+            )
         })
         .collect()
 }
 
-fn state_of(path: &Utf8Path, shipped: &str) -> State {
+/// The user-level ignore rules, as they are on this machine right now.
+///
+/// The path is [`crate::daemon::walk::USER_IGNORE_FILE`] in the data directory —
+/// the file the walker reads, from the same constant, so the installer cannot
+/// write somewhere the evaluator does not look.
+pub fn plan_user_ignore(data_dir: &Utf8Path) -> Item {
+    item(
+        &USER_IGNORE,
+        data_dir.join(crate::daemon::walk::USER_IGNORE_FILE),
+        IGNORE,
+    )
+}
+
+fn item(skill: &'static Skill, path: Utf8PathBuf, stamp: Stamp) -> Item {
+    Item {
+        name: skill.name,
+        summary: skill.summary,
+        state: state_of(&path, skill.body, stamp),
+        path,
+        body: skill.body,
+        stamp,
+    }
+}
+
+fn state_of(path: &Utf8Path, shipped: &str, stamp: Stamp) -> State {
     let Ok(text) = std::fs::read_to_string(path) else {
         return State::Missing;
     };
-    let Some((body, recorded)) = unstamp(&text) else {
+    let Some((body, recorded)) = unstamp(&text, stamp) else {
         return State::Modified;
     };
     if hash(body) != recorded {
@@ -270,16 +344,12 @@ pub fn apply(item: &Item, force: bool) -> Result<Outcome> {
         (State::Modified, false) => return Ok(Outcome::Kept),
     };
 
-    let skill = SKILLS
-        .iter()
-        .find(|skill| skill.name == item.name)
-        .expect("items are built from SKILLS");
     let parent = item
         .path
         .parent()
-        .expect("skill paths always have a parent directory");
+        .expect("asset paths always have a parent directory");
     std::fs::create_dir_all(parent).with_context(|| format!("creating {parent}"))?;
-    std::fs::write(&item.path, stamped(skill.body.trim_end()))
+    std::fs::write(&item.path, stamped(item.body.trim_end(), item.stamp))
         .with_context(|| format!("writing {}", item.path))?;
     Ok(outcome)
 }
@@ -293,7 +363,11 @@ pub fn pending(items: &[Item], force: bool) -> bool {
 }
 
 /// The line `lore add` prints so a user who has never heard of the skill still
-/// learns that the generated `.loreignore` is a floor rather than an answer.
+/// learns that lore indexes everything until something says otherwise.
+///
+/// It matters more since D-0020: nothing is generated into the project and lore
+/// ships no rules of its own, so a fresh project's ignore rules are whatever the
+/// repo's `.gitignore` already said.
 ///
 /// It names the command that is actually the next step, which depends on
 /// whether the asset is installed — a nudge to run something already installed
@@ -314,11 +388,21 @@ pub fn ignore_nudge() -> String {
             Host::ClaudeCode
         )
     };
-    format!(".loreignore covers this project's ecosystems, not its own bulk; {action}")
+    format!("lore indexes what this repo's .gitignore allows; to tune it, {action}")
 }
 
-/// Guard against shipping a skill whose frontmatter a host would reject.
+/// Guard against shipping an asset a host would reject, or one that would fight
+/// the stamp.
 pub fn validate_shipped() -> Result<()> {
+    // The ignore template is not Markdown and has no frontmatter, but it must
+    // still be stampable — and gitignore syntax means a stray stamp in the body
+    // would be an inert comment rather than a visible defect.
+    if USER_IGNORE.body.contains(IGNORE.prefix) {
+        bail!(
+            "{}: body must not contain a stamp; lore appends one",
+            USER_IGNORE.name
+        );
+    }
     for skill in SKILLS {
         let mut lines = skill.body.lines();
         if lines.next() != Some("---") {
@@ -337,7 +421,7 @@ pub fn validate_shipped() -> Result<()> {
         if !front.iter().any(|line| line.starts_with("description:")) {
             bail!("{}: frontmatter needs a `description:`", skill.name);
         }
-        if skill.body.contains(STAMP_PREFIX) {
+        if skill.body.contains(MARKDOWN.prefix) {
             bail!(
                 "{}: body must not contain a stamp; lore appends one",
                 skill.name
@@ -364,14 +448,67 @@ mod tests {
         assert!(!SKILLS.is_empty());
     }
 
+    /// Both stamp syntaxes round-trip, because both files get rehashed from disk
+    /// to answer "has the user touched this?".
     #[test]
     fn a_stamp_round_trips_to_the_body_it_was_written_from() {
-        let body = "# hello\n\nsome prose\n";
-        let text = stamped(body);
-        let (parsed, recorded) = unstamp(&text).unwrap();
-        assert_eq!(parsed, body.trim_end());
-        assert_eq!(recorded, hash(body.trim_end()));
-        assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
+        for (stamp, body) in [(MARKDOWN, "# hello\n\nsome prose\n"), (IGNORE, "target/\n")] {
+            let text = stamped(body, stamp);
+            let (parsed, recorded) = unstamp(&text, stamp).unwrap();
+            assert_eq!(parsed, body.trim_end());
+            assert_eq!(recorded, hash(body.trim_end()));
+            assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
+        }
+    }
+
+    /// The ignore template's stamp has to be inert *as a rule*: a stamp that
+    /// parsed as a pattern would exclude something, and nothing in the file
+    /// would say why.
+    #[test]
+    fn the_ignore_templates_stamp_is_a_comment() {
+        let text = stamped(USER_IGNORE.body, IGNORE);
+        let stamp = text
+            .lines()
+            .find(|line| line.contains(IGNORE.prefix))
+            .expect("stamped");
+        assert!(stamp.starts_with('#'), "{stamp}");
+        // And the template itself is rules and comments only — a blank-indented
+        // line or a stray `-->` would be a silently dead rule.
+        for line in USER_IGNORE.body.lines() {
+            assert_eq!(line, line.trim_end(), "trailing space: {line:?}");
+            assert!(!line.starts_with(char::is_whitespace), "indented: {line:?}");
+        }
+    }
+
+    /// The installer must write where the evaluator reads, from one constant.
+    #[test]
+    fn the_user_level_rules_land_where_the_walker_looks_for_them() {
+        let (_dir, root) = temp();
+        let item = plan_user_ignore(&root);
+        assert_eq!(item.path, root.join(crate::daemon::walk::USER_IGNORE_FILE));
+        assert_eq!(item.state, State::Missing, "never installed by default");
+        assert_eq!(apply(&item, false).unwrap(), Outcome::Installed);
+        assert_eq!(plan_user_ignore(&root).state, State::UpToDate);
+    }
+
+    /// A `loreignore` the user wrote themselves is theirs, and an install must
+    /// not eat it — the same never-clobber rule the skills get, on a file that is
+    /// much more likely to already exist.
+    #[test]
+    fn a_hand_written_user_loreignore_is_never_replaced() {
+        let (_dir, root) = temp();
+        std::fs::write(
+            root.join(crate::daemon::walk::USER_IGNORE_FILE),
+            "my-own-rule/\n",
+        )
+        .unwrap();
+        let item = plan_user_ignore(&root);
+        assert_eq!(item.state, State::Modified);
+        assert_eq!(apply(&item, false).unwrap(), Outcome::Kept);
+        assert_eq!(
+            std::fs::read_to_string(&item.path).unwrap(),
+            "my-own-rule/\n"
+        );
     }
 
     /// The whole point of the stamp: an installed asset is a prompt, and a user
@@ -426,7 +563,7 @@ mod tests {
         let (_dir, root) = temp();
         let item = &plan(&root)[0];
         std::fs::create_dir_all(item.path.parent().unwrap()).unwrap();
-        std::fs::write(&item.path, stamped("# an older body\n")).unwrap();
+        std::fs::write(&item.path, stamped("# an older body\n", MARKDOWN)).unwrap();
 
         let stale = &plan(&root)[0];
         assert_eq!(stale.state, State::Outdated);

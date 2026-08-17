@@ -5,286 +5,93 @@
 //! if "is this file indexed?" had two implementations, a watcher event could
 //! index something a rescan would then delete, forever.
 //!
-//! Rules, in order:
-//! 1. Never anything inside the daemon's own data directory (its SQLite WAL
-//!    is a busy file living outside every project root, but a project root
-//!    could still be an ancestor of it).
-//! 2. Never a directory named in [`HARD_EXCLUDES`] — which is `.git` alone.
-//!    Anything more opinionated than that is ecosystem policy, and ecosystem
-//!    policy belongs in a file the user can read and edit.
-//! 3. Never *into* a subdirectory that is itself a repository root — see
-//!    [`is_repo_root`] for what that means and why the `ignore` crate does not
-//!    do it for us. Unlike rules 1 and 2 this is a default rather than a
-//!    refusal: the project's own `.loreignore` can re-include such a directory
-//!    with `!`.
-//! 4. [`LORE_IGNORE_FILE`] (`.loreignore`) — gitignore syntax, nested like
-//!    `.gitignore`, and honored **regardless of VCS**. This is the
-//!    user-visible knob, generated per project by
-//!    [`super::ignorefile`]: a Unity VCS or Perforce workspace has no
-//!    `.gitignore`, so without it telemetry dumps and serialized-asset YAML
-//!    index as if they were code.
-//! 5. Otherwise ripgrep's rules via the `ignore` crate: `.gitignore`
-//!    (including nested and parent files), `.git/info/exclude`, hidden files
-//!    skipped.
+//! ## One evaluator, three sources (D-0020)
 //!
-//! Plus one safety net: a project root with **no** `.loreignore` at all gets
-//! [`FALLBACK_EXCLUDES`] applied in memory. See that constant for why.
+//! Exactly one ignore evaluation decides what is observed — the `ignore`
+//! crate's, with rule sources stacked lowest to highest:
 //!
-//! ## What is *not* here
+//! 1. the user's own [`USER_IGNORE_FILE`], beside `config.toml` in the daemon's
+//!    data directory, applying to every project this machine indexes. Not
+//!    installed by default (`lore setup loreignore` writes a commented starting
+//!    point); absent is simply an empty source;
+//! 2. the repo's own **`.gitignore`**, through the same evaluator as a courtesy
+//!    to the user — no git subprocess, no tracked/untracked distinction, no
+//!    `core.excludesFile`, no global gitignore, and untracked files are
+//!    observed like any other. A repository's own declaration outranks a
+//!    machine-wide preference;
+//! 3. the project's **`.loreignore`**, registered as a *custom* ignore file,
+//!    which the crate ranks above every other source. It is sovereign: it
+//!    inherits rungs 1 and 2 by staying silent, and its `!` re-includes beat
+//!    both.
 //!
-//! [`CREDENTIAL_EXCLUDES`] lives in this file, beside the rules it outranks,
-//! but is applied one layer up in [`super::snapshot`] rather than inside
-//! [`walk_files`]. Two reasons. It is not an ignore rule — it is a refusal that
-//! no ignore file may argue with, and mixing it into the `ignore` crate's
-//! precedence stack is exactly how it would acquire an override. And its one
-//! escape hatch is repository configuration ([`super::snapshot`] reads
-//! `.lore.toml` once per observation), which a per-directory walk predicate has
-//! no business loading. [`refusal`] is the shared verdict, and the receiving
-//! daemon's backstop calls the same function over paths it never walked.
+//! **Lore ships no compiled-in ignore rules at all.** Out of the box a project
+//! is observed whole, minus the two mechanical exclusions below; hidden files
+//! included. That is deliberate: a rule nobody can see is a rule nobody can
+//! fix, and every exclusion lore applies is now a line in a file somebody can
+//! read, at a precedence somebody can argue with.
 //!
-//! The git-aware manifest basis (D-0017) sits at that same layer, in
-//! [`super::basis`]: it intersects with what this module returns rather than
-//! replacing it.
+//! Uniform precedence is the whole substance of D-0020, which retired five
+//! interacting rule systems (hard excludes, non-overridable credential
+//! excludes, a git-aware basis taken by subprocess, `.loreignore`, and an
+//! exact-path override key in `.lore.toml`) — each pair with its own quirk.
+//! **Working rule for this repo: one evaluator, uniform precedence. A new rule
+//! system needs a decision, not a code path.**
+//!
+//! ## What is outside the stack
+//!
+//! [`lore_core::snapshot::GIT_DIR`] — `.git` — is a hard floor, pruned by name
+//! at any depth. It is not an ecosystem opinion but the mechanism rule source 2
+//! is read out of, and it holds the remote's credentials. The receiver enforces
+//! the same floor structurally, from the same constant.
+//!
+//! Plus two exclusions that are not rules about the project at all: the
+//! daemon's own data directory (its SQLite WAL is a busy file living outside
+//! every project root, but a project root could still be an ancestor of it),
+//! and paths that are not UTF-8 (chunk ids are derived from the path string, so
+//! they cannot be stored).
 
 use camino::{Utf8Path, Utf8PathBuf};
 use ignore::WalkBuilder;
+use lore_core::snapshot::GIT_DIR;
 use tokio_util::sync::CancellationToken;
 
 use super::paths;
 
 /// Per-directory ignore file, gitignore syntax. Named for lore rather than
 /// reusing `.ignore` (ripgrep's convention) so that a rule meant for search
-/// tools and a rule meant for the index can differ.
+/// tools and a rule meant for the index can differ — which is also why the
+/// walker below leaves `.ignore` files switched off.
 pub const LORE_IGNORE_FILE: &str = ".loreignore";
 
-/// Directory names never descended into, at any depth, whatever any ignore
-/// file says. Only `.git`: it is not an ecosystem opinion but the mechanism
-/// the ignore rules are themselves read from.
-pub const HARD_EXCLUDES: &[&str] = &[".git"];
+/// The user-level ignore file: `<data-dir>/loreignore`, beside `config.toml`
+/// (on Windows, `%LOCALAPPDATA%\lore\loreignore`).
+///
+/// Undotted like `config.toml` beside it — the data directory is lore's own,
+/// not a repository, and nothing there is hiding. Deliberately *not* a
+/// machine-global file outside the data directory: `LORE_DATA_DIR` already
+/// scopes every other piece of daemon state, and a rules file that ignored it
+/// would make what lore indexes depend on state a test cannot control. A
+/// system-level (`/etc`-style) source is out of scope.
+pub const USER_IGNORE_FILE: &str = "loreignore";
 
-/// The entry whose presence makes a directory a repository root.
+/// Whether some component of `rel` is [`GIT_DIR`] — the one exclusion no rule
+/// source can argue with.
 ///
-/// Deliberately an *existence* test and never a directory test: in an ordinary
-/// clone `.git` is a directory, but in a linked worktree — and in a submodule
-/// under git's modern layout — it is a **file** holding a `gitdir:` pointer.
-/// A rule that only looked for the directory would miss exactly the case that
-/// motivated this one.
-pub const GIT_ENTRY: &str = ".git";
-
-/// Is `dir` the root of its own repository?
+/// Case-insensitively, because a Windows volume makes `.GIT` the same directory
+/// as `.git` and a floor a rename defeats is not a floor.
 ///
-/// The walker refuses to descend into such a directory when it is *below* the
-/// project root, because everything under it belongs to another repository and
-/// indexing it duplicates that repository inside this project — every file
-/// chunked twice, both copies competing in the rankings, the embedding cost
-/// paid twice. The concrete case is an agent tool's `git worktree` living
-/// inside the repo it was made from, which is a byte-for-byte second copy.
+/// Answers about a whole project-relative path rather than one walk component,
+/// because the watcher names paths that no walk produced: an event may name a
+/// file that no longer exists, so there is nothing left to walk and no ignore
+/// rules can be evaluated for it either.
 ///
-/// The `ignore` crate does **not** do this. It knows about repository
-/// boundaries only for deciding which `.gitignore` files apply
-/// (`require_git`); it walks straight through a nested clone and a nested
-/// worktree alike, under either setting. That is established by
-/// `the_ignore_crate_walks_into_a_nested_repository_on_its_own`, which pins
-/// the upstream behavior so a crate upgrade that changed it would be noticed
-/// rather than silently making this rule redundant.
-///
-/// This is a *default*, not a refusal like [`HARD_EXCLUDES`]: vendoring a
-/// repository into a project and wanting it indexed is legitimate, and
-/// `!vendor/dep/` in the project's `.loreignore` re-includes it. That escape
-/// hatch cannot rescue a *hidden* directory (`.claude/worktrees/`), which the
-/// crate's `hidden(true)` prunes before any of this is consulted.
-pub fn is_repo_root(dir: &Utf8Path) -> bool {
-    dir.join(GIT_ENTRY).exists()
-}
-
-/// Credential patterns that never enter a manifest, whatever any ignore file
-/// says (D-0015, "Ignore rules and secrets").
-///
-/// **Non-overridable.** Unlike everything else in this module these are not
-/// ignore *rules* — they are a refusal. A `.loreignore` cannot re-include them
-/// with `!`, a `.gitignore` cannot, and no walk order can reach around them,
-/// because the failure they prevent is a private key becoming a search result
-/// that an agent then quotes into a transcript. The single escape hatch is the
-/// repository naming the exact path in `.lore.toml`'s `[ingest]
-/// allow_secret_paths` (see [`crate::repo_config::allow_secret_paths`]): an
-/// explicit, committed, reviewable act rather than a `!` buried in an ignore
-/// file among fifty build-output rules.
-///
-/// Pattern-based only — **no entropy scanning** (D-0015 killed it by name:
-/// false-positive-prone, and it trains the reflex of overriding the guard).
-/// The list is therefore knowingly incomplete; it is a floor, not a promise,
-/// and the substantive data-protection measure is an encrypted store.
-///
-/// Grammar, deliberately tiny so the constant is the whole specification:
-///
-/// - trailing `/` — a directory path. Every file under a matching run of
-///   components is refused (`.config/gcloud/` matches
-///   `home/.config/gcloud/creds.json`).
-/// - otherwise a file-name pattern with at most one `*`, matched against the
-///   last component only.
-///
-/// Matching is ASCII-case-insensitive throughout, because a case-insensitive
-/// Windows volume makes `ID_RSA` the same file as `id_rsa`.
-pub const CREDENTIAL_EXCLUDES: &[&str] = &[
-    // Process environment files. `.env.local`, `.env.production` and friends
-    // are the same file with a suffix, and they are where deployed secrets
-    // actually live.
-    ".env",
-    ".env.*",
-    // OpenSSH private keys, as `ssh-keygen` names them. The `.pub` half is
-    // public and would be harmless, but `id_rsa*` refusing `id_rsa.pub` too
-    // costs nothing anybody wanted indexed.
-    "id_rsa*",
-    "id_ecdsa*",
-    "id_ed25519*",
-    "id_dsa*",
-    // PEM containers and generic key files. Broad on purpose — see the module
-    // note in `credential_exclusion` about what `*.key` also catches.
-    "*.pem",
-    "*.key",
-    // Credential directories. Every one of these is hidden, so the walker
-    // already skips them locally; they earn their place at the *receiver*,
-    // which has no walker and only ever sees a list of strings a client chose.
-    ".ssh/",
-    ".aws/",
-    ".gnupg/",
-    ".config/gcloud/",
-];
-
-/// The exclusion list Lore used before `.loreignore` existed, applied in
-/// memory **only** while a project root has no `.loreignore` at all.
-///
-/// The file is generated at registration and at every full scan, so this list
-/// is normally dead weight. It matters when generation could not happen — a
-/// read-only root, a permissions failure — where the alternative is quietly
-/// indexing a Unity `Library/` or a `node_modules/`, which is the failure
-/// this whole module exists to prevent.
-///
-/// An existing `.loreignore` disables it entirely, **including an empty one**:
-/// that is the deliberate "index everything" escape hatch, and a fallback
-/// that survived it would make the escape hatch a lie.
-pub const FALLBACK_EXCLUDES: &[&str] = &[
-    "target",
-    "node_modules",
-    "Library",
-    "Temp",
-    "obj",
-    "bin",
-    ".obsidian",
-    ".vs",
-    ".idea",
-];
-
-/// Case-insensitive: `Library` on a case-insensitive Windows volume is the
-/// same directory as `library`, and Unity is inconsistent about casing.
-fn matches_any(names: &[&str], name: &str) -> bool {
-    names.iter().any(|entry| entry.eq_ignore_ascii_case(name))
-}
-
-pub fn is_hard_excluded(name: &str) -> bool {
-    matches_any(HARD_EXCLUDES, name)
-}
-
-/// The [`HARD_EXCLUDES`] entry some component of `rel` names, if any.
-///
-/// The name-level [`is_hard_excluded`] answers about one component during a
-/// walk; this answers about a whole project-relative path, which is the only
-/// form a *pushed* manifest entry ever takes — there is no walk on that side to
-/// prune anything.
-pub fn hard_excluded_component(rel: &Utf8Path) -> Option<&'static str> {
-    rel.components().find_map(|component| {
-        HARD_EXCLUDES
-            .iter()
-            .copied()
-            .find(|name| name.eq_ignore_ascii_case(component.as_str()))
-    })
-}
-
-/// The [`CREDENTIAL_EXCLUDES`] pattern `rel` matches, if any.
-///
-/// Returns the pattern rather than a bool so every refusal can *name the rule
-/// that refused it* — a pusher told "refused: `certs/dev.pem` (`*.pem`)" can
-/// tell a credential guard from a bug in ten seconds, and a bare "refused"
-/// costs an afternoon.
-///
-/// Known-broad edges, kept rather than narrowed because a missed key is
-/// unrecoverable and a missed *document* is one config line away:
-///
-/// - `*.key` also catches Apple Keynote documents and a handful of
-///   game-engine asset formats. All binary; the chunker would refuse them
-///   anyway, so the cost is a file that was never going to be a search result.
-/// - `*.pem` catches public certificate chains as well as private keys. PEM
-///   does not distinguish them in the file name and Lore must not read the
-///   file to find out.
-pub fn credential_exclusion(rel: &Utf8Path) -> Option<&'static str> {
-    let components: Vec<&str> = rel.components().map(|c| c.as_str()).collect();
-    let name = *components.last()?;
-    CREDENTIAL_EXCLUDES.iter().copied().find(|pattern| {
-        match pattern.strip_suffix('/') {
-            // A directory pattern: some consecutive run of components equals
-            // it. Testing every window rather than only a prefix is what makes
-            // a vendored `home/.ssh/` refused as firmly as a root-level one.
-            Some(dir) => {
-                let wanted: Vec<&str> = dir.split('/').collect();
-                components.windows(wanted.len()).any(|window| {
-                    window
-                        .iter()
-                        .zip(&wanted)
-                        .all(|(a, b)| a.eq_ignore_ascii_case(b))
-                })
-            }
-            None => matches_glob(pattern, name),
-        }
-    })
-}
-
-/// Why `rel` may never be indexed, whoever listed it: the [`HARD_EXCLUDES`]
-/// component or the [`CREDENTIAL_EXCLUDES`] pattern that refuses it.
-///
-/// One function so the observer (which refuses before sending) and the
-/// receiving daemon's backstop (which refuses what a client sent anyway) cannot
-/// drift into two different notions of "never".
-pub fn refusal(rel: &Utf8Path) -> Option<&'static str> {
-    hard_excluded_component(rel).or_else(|| credential_exclusion(rel))
-}
-
-/// The one-`*` glob [`CREDENTIAL_EXCLUDES`] uses, over one path component.
-///
-/// Byte-wise rather than char-wise so a non-ASCII file name can never land the
-/// slice on a UTF-8 boundary and panic; the patterns are all ASCII, so the
-/// comparison means the same thing either way.
-fn matches_glob(pattern: &str, name: &str) -> bool {
-    let (name, pattern) = (name.as_bytes(), pattern.as_bytes());
-    match pattern.iter().position(|&b| b == b'*') {
-        None => name.eq_ignore_ascii_case(pattern),
-        Some(star) => {
-            let (prefix, suffix) = (&pattern[..star], &pattern[star + 1..]);
-            name.len() >= prefix.len() + suffix.len()
-                && name[..prefix.len()].eq_ignore_ascii_case(prefix)
-                && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
-        }
-    }
-}
-
-/// Cheap, stat-free rejection of a project-relative path: hard-excluded or
-/// hidden (a component starting with `.`, matching the `ignore` crate's
-/// `hidden(true)`).
-///
-/// Needed because a watcher event may name a file that no longer exists, so
-/// there is nothing left to walk — and gitignore rules cannot be evaluated
-/// for it either. Anything this rejects was never indexed in the first place,
-/// so rejecting it again on removal is harmless.
-///
-/// Deliberately *not* consulting [`FALLBACK_EXCLUDES`]: this has no project
-/// root to test for a `.loreignore`, and a hardcoded list here would silently
-/// drop watcher events for a `target/` the user re-included. The cost is that
-/// a build's churn now reaches [`walk_files`] instead of being rejected on
-/// the name alone; the batch is coalesced and the walk still rejects it.
-pub fn is_excluded_rel(rel: &Utf8Path) -> bool {
-    rel.components().any(|c| {
-        let name = c.as_str();
-        is_hard_excluded(name) || (name.starts_with('.') && name != "." && name != "..")
-    })
+/// Deliberately the *only* thing checked this way. Under D-0020 every other
+/// exclusion is an overridable rule, so a name-level shortcut for (say)
+/// dot-files would quietly outrank a `.loreignore` that re-included one — the
+/// exact layering D-0020 deleted.
+pub fn is_git_metadata(rel: &Utf8Path) -> bool {
+    rel.components()
+        .any(|component| component.as_str().eq_ignore_ascii_case(GIT_DIR))
 }
 
 /// Enumerate indexable files, as project-relative forward-slash paths.
@@ -336,79 +143,69 @@ pub fn walk_files(
         // below the walk root.
         .max_depth(max_depth.map(|depth| depth + offset))
         .follow_links(false)
-        .hidden(true)
+        // Hidden-ness is not lore's opinion to hold (D-0020). It is a rule like
+        // any other, and the file that holds it is one of the three sources —
+        // where a project can re-include a dot-file it wants indexed. This flag
+        // is the same policy at a precedence nothing can argue with.
+        .hidden(false)
         .parents(true)
         .git_ignore(true)
-        .git_exclude(true)
+        // Not among the three decided sources: `.git/info/exclude` lives inside
+        // the hard floor, and `.ignore` is configuration for search tools
+        // rather than for the index (see `LORE_IGNORE_FILE`).
+        .git_exclude(false)
+        .ignore(false)
         // A `.gitignore` expresses intent whether or not the directory has
         // been `git init`ed yet; the default (`require_git(true)`) would
         // silently index everything in a not-yet-initialized project.
         .require_git(false)
-        // The developer's *global* gitignore is deliberately not consulted:
-        // it would make what Lore indexes depend on unrelated machine state,
-        // and make this walk untestable.
-        .git_global(false);
-    // Registered after the builder chain because it returns `&mut` rather
-    // than the builder. Custom ignore files outrank `.gitignore`, so a
-    // `.loreignore` can also *re-include* (`!pattern`) something git ignores.
+        // The developer's *global* gitignore is deliberately not consulted
+        // (D-0020 names it): it would make what Lore indexes depend on
+        // unrelated machine state. `USER_IGNORE_FILE` is the sanctioned
+        // machine-wide source, and it lives where the rest of lore's state does.
+        .git_global(false)
+        // Must be set *before* `add_ignore` below, and must be the project
+        // root: `add_ignore` roots the rules it reads at the builder's current
+        // directory, and the walker matches absolute paths. Left to the process
+        // CWD, a user-level `.*` would be tested against a path whose own
+        // prefix may contain a dot component — and the walk would ignore the
+        // entire project.
+        .current_dir(root);
+    // Registered after the builder chain because these return `&mut` rather
+    // than the builder.
+    //
+    // The crate's precedence, highest first: custom ignore files, `.ignore`,
+    // `.gitignore`, `.git/info/exclude`, the global gitignore, then explicit
+    // ignore files ("lower precedence than all other sources", in its own
+    // words). So the project's file as a *custom* one and the user's as an
+    // *explicit* one put `.gitignore` between them — exactly the D-0020 stack.
     builder.add_custom_ignore_filename(LORE_IGNORE_FILE);
+    let user_rules = data_dir.join(USER_IGNORE_FILE);
+    // Existence checked here rather than left to `add_ignore`, because not
+    // having one is the default state and not a condition to report.
+    if user_rules.is_file() {
+        // Partial failure is possible (one unparseable glob, the rest applied),
+        // so this reports rather than bails: some of the user's rules are better
+        // than none, and the line names the file to fix.
+        if let Some(err) = builder.add_ignore(&user_rules) {
+            tracing::warn!(path = %user_rules, error = %err, "user-level ignore rules did not fully load");
+        }
+    }
 
-    // Decided from the *project root*, not from `start`: a watcher-driven
-    // single-directory walk has to reach the same verdict as the full scan it
-    // must agree with, or the two would fight over the same files forever.
-    let fallback = !root.join(LORE_IGNORE_FILE).exists();
-
-    // The one escape hatch for rule 3, built from the *project's* own
-    // `.loreignore` only. A nested repository is skipped during descent, so the
-    // crate's own matcher stack never gets to weigh in on it — this asks the
-    // same question the crate would have asked, over the one file whose author
-    // is unambiguously the project owner rather than the vendored repository
-    // itself. A malformed line is ignored rather than failing the walk; the
-    // `ignore` crate reports the same line again when it parses the file for
-    // real.
-    let reinclude = {
-        let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
-        let _ = builder.add(root.join(LORE_IGNORE_FILE));
-        builder.build().ok()
-    };
-
-    let root_owned = root.to_owned();
     let data_dir = data_dir.to_owned();
     builder.filter_entry(move |entry| {
-        let name = entry.file_name().to_string_lossy();
-        if is_hard_excluded(&name) {
-            return false;
-        }
-        // A `filter_entry` rather than an `Override`: this must reject by
-        // directory *name* at any depth, exactly as the old hardcoded list
-        // did, and must not be re-includable — an override set would let a
-        // nested `.loreignore` argue with a rule that only exists because
-        // there is no `.loreignore` to argue with.
-        if fallback && matches_any(FALLBACK_EXCLUDES, &name) {
+        // A `filter_entry` rather than a rule: this is the one exclusion that
+        // must not be re-includable, because the rules are read out of it.
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(GIT_DIR)
+        {
             return false;
         }
         match Utf8Path::from_path(entry.path()) {
             Some(path) => {
                 if paths::is_within(&data_dir, path) {
-                    return false;
-                }
-                // Rule 3. Strictly below the root, because the project root is
-                // itself a repository root in the overwhelmingly common case —
-                // and a linked worktree registered directly as its own project
-                // must index normally rather than returning nothing at all.
-                // Belt and braces today: this crate version does not run
-                // `filter_entry` against the walk root, so the guard is
-                // load-bearing only if that changes. It is one string compare,
-                // and the alternative is a rule whose most important
-                // must-not-break case rests on an undocumented upstream
-                // detail.
-                if entry.file_type().is_some_and(|kind| kind.is_dir())
-                    && paths::relative_to(&root_owned, path).is_some()
-                    && is_repo_root(path)
-                    && !reinclude
-                        .as_ref()
-                        .is_some_and(|set| set.matched(path, true).is_whitelist())
-                {
                     return false;
                 }
                 // Keep `start`'s subtree and the directories on the way down
@@ -453,124 +250,259 @@ pub fn walk_files(
 mod tests {
     use super::*;
 
-    /// Walk a fixture tree with no data-dir overlap and no cancellation.
-    fn walk(root: &Utf8Path) -> Vec<String> {
-        walk_from(root, root, None)
+    /// A fixture project plus the data directory the user-level rules live in.
+    ///
+    /// Both are temporary and the data directory is outside the project, which
+    /// is what the daemon guarantees in practice.
+    struct Fixture {
+        _project: tempfile::TempDir,
+        _data: tempfile::TempDir,
+        root: Utf8PathBuf,
+        data_dir: Utf8PathBuf,
     }
 
-    fn walk_from(root: &Utf8Path, start: &Utf8Path, max_depth: Option<usize>) -> Vec<String> {
-        let far_away = Utf8PathBuf::from("Z:/nowhere/lore-data");
-        let mut files: Vec<String> = walk_files(root, start, max_depth, &far_away, None)
-            .into_iter()
-            .map(|p| p.to_string())
-            .collect();
-        files.sort();
-        files
-    }
+    impl Fixture {
+        fn new(spec: &[(&str, &str)]) -> Self {
+            let project = tempfile::tempdir().unwrap();
+            let data = tempfile::tempdir().unwrap();
+            let fixture = Self {
+                root: Utf8PathBuf::from_path_buf(project.path().to_path_buf()).unwrap(),
+                data_dir: Utf8PathBuf::from_path_buf(data.path().to_path_buf()).unwrap(),
+                _project: project,
+                _data: data,
+            };
+            for (path, contents) in spec {
+                fixture.write(path, contents);
+            }
+            fixture
+        }
 
-    fn fixture(spec: &[(&str, &str)]) -> (tempfile::TempDir, Utf8PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
-        for (path, contents) in spec {
-            let abs = root.join(path);
+        fn write(&self, path: &str, contents: &str) {
+            let abs = self.root.join(path);
             std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
             std::fs::write(abs, contents).unwrap();
         }
-        (dir, root)
+
+        /// Install user-level rules — rung 1, the lowest source.
+        fn user_rules(&self, rules: &str) -> &Self {
+            std::fs::write(self.data_dir.join(USER_IGNORE_FILE), rules).unwrap();
+            self
+        }
+
+        fn walk(&self) -> Vec<String> {
+            self.walk_from(&self.root.clone(), None)
+        }
+
+        fn walk_from(&self, start: &Utf8Path, max_depth: Option<usize>) -> Vec<String> {
+            let mut files: Vec<String> =
+                walk_files(&self.root, start, max_depth, &self.data_dir, None)
+                    .into_iter()
+                    .map(|p| p.to_string())
+                    .collect();
+            files.sort();
+            files
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Out of the box
+    // -----------------------------------------------------------------------
+
+    /// **Chosen, not overlooked** (D-0020/D-0021): lore ships no ignore rules of
+    /// its own. With no user-level file, no `.gitignore` and no `.loreignore`, a
+    /// project is observed whole — build output, dot-files and a plaintext
+    /// credential included. Every exclusion lore applies is a line in a file
+    /// somebody can read and argue with, and the cost of that is this test.
+    #[test]
+    fn with_no_rules_anywhere_everything_is_observed() {
+        let fixture = Fixture::new(&[
+            ("src/main.rs", "fn main() {}"),
+            ("target/debug/build.rs", "generated"),
+            ("node_modules/pkg/index.js", "vendored"),
+            (".env", "API_TOKEN=hunter2"),
+            (".github/workflows/ci.yml", "on: push"),
+        ]);
+        assert!(!fixture.data_dir.join(USER_IGNORE_FILE).exists());
+        assert_eq!(
+            fixture.walk(),
+            [
+                ".env",
+                ".github/workflows/ci.yml",
+                "node_modules/pkg/index.js",
+                "src/main.rs",
+                "target/debug/build.rs",
+            ]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The three sources, and which one wins (D-0020)
+    // -----------------------------------------------------------------------
+
+    /// Rung 1 applies wherever the higher sources are silent — which is what
+    /// makes a user-level file worth installing at all.
+    #[test]
+    fn user_level_rules_apply_when_the_project_is_silent() {
+        let fixture = Fixture::new(&[
+            ("src/main.rs", "fn main() {}"),
+            ("target/debug/build.rs", "generated"),
+            (".env", "API_TOKEN=hunter2"),
+            ("game/Library/cache.dat", "unity"),
+        ]);
+        fixture.user_rules(".*\n[Tt]arget/\n[Ll]ibrary/\n");
+        assert_eq!(fixture.walk(), ["src/main.rs"]);
+    }
+
+    /// Rung 2 over rung 1: a repository's own declaration outranks a
+    /// machine-wide preference, in both directions.
+    #[test]
+    fn gitignore_outranks_the_user_level_file() {
+        let fixture = Fixture::new(&[
+            ("src/main.rs", "fn main() {}"),
+            ("logs/keep.log", "wanted here"),
+            ("scratch/notes.txt", "n"),
+        ]);
+        fixture.user_rules("*.log\n");
+        // The repo re-includes what the user excluded…
+        fixture.write(".gitignore", "!*.log\nscratch/\n");
+        // …and its own exclusion applies with no git binary in sight.
+        //
+        // `.gitignore` is in the listing because nothing excludes it: lore has
+        // no dot-file rule of its own now. See
+        // `the_ignore_file_itself_is_excluded_by_the_dot_file_rule`.
+        assert_eq!(
+            fixture.walk(),
+            [".gitignore", "logs/keep.log", "src/main.rs"]
+        );
+    }
+
+    /// Rung 3 over rung 2: the sovereign file's re-include beats `.gitignore`.
+    #[test]
+    fn a_loreignore_reinclusion_beats_gitignore() {
+        let fixture = Fixture::new(&[
+            ("data/model.onnx", "bin"),
+            ("data/readme.md", "docs"),
+            (".gitignore", "data/\n"),
+            (".loreignore", "!data/\n!data/readme.md\ndata/*.onnx\n"),
+        ]);
+        assert_eq!(
+            fixture.walk(),
+            [".gitignore", ".loreignore", "data/readme.md"]
+        );
+    }
+
+    /// Rung 3 over rung 1, on the line that matters most: a credential rule is
+    /// an ordinary rule, and a committed `!` beats it.
+    ///
+    /// This is the accepted trade stated in D-0020 — a bad ignore file can admit
+    /// a secret; hygiene is best-effort user responsibility and an encrypted
+    /// store is the substantive measure. Asserted rather than merely allowed,
+    /// because the previous model (D-0015/D-0017) refused it and the change is
+    /// the point.
+    #[test]
+    fn a_loreignore_reinclusion_beats_a_user_level_credential_rule() {
+        let fixture = Fixture::new(&[
+            ("src/main.rs", "fn main() {}"),
+            (".env.example", "API_TOKEN=<yours here>"),
+            (".env", "API_TOKEN=hunter2"),
+            (".loreignore", "!.env.example\n"),
+        ]);
+        fixture.user_rules(".*\n.env\n.env.*\n");
+        // Exactly what was named: the real `.env` beside it still loses.
+        assert_eq!(fixture.walk(), [".env.example", "src/main.rs"]);
+    }
+
+    /// Sovereignty is *layering*, not replacement: a project's file inherits
+    /// every user-level rule it does not mention. A `.loreignore` that exists
+    /// but says nothing about `target/` still gets `target/`.
+    #[test]
+    fn a_project_file_inherits_the_user_level_rules_it_is_silent_about() {
+        let fixture = Fixture::new(&[
+            ("src/main.rs", "fn main() {}"),
+            ("target/debug/build.rs", "generated"),
+            ("notes/scratch.md", "n"),
+            (".loreignore", "notes/\n"),
+        ]);
+        // `.*` as well, so the project's own ignore file stays out of the
+        // listings below and the inheritance is the only thing on show.
+        fixture.user_rules(".*\n[Tt]arget/\n");
+        assert_eq!(fixture.walk(), ["src/main.rs"]);
+
+        // Including when it is empty — a file that says nothing overrides
+        // nothing, and saying it takes a `!` line like every other override.
+        fixture.write(".loreignore", "");
+        assert_eq!(fixture.walk(), ["notes/scratch.md", "src/main.rs"]);
+        fixture.write(".loreignore", "![Tt]arget/\n");
+        assert_eq!(
+            fixture.walk(),
+            ["notes/scratch.md", "src/main.rs", "target/debug/build.rs"]
+        );
+    }
+
+    /// Untracked files are observed like any other (D-0020 retires the
+    /// tracked/untracked distinction), and `.gitignore` is honoured whether or
+    /// not the directory was ever `git init`ed.
+    #[test]
+    fn gitignore_applies_without_git_and_untracked_files_are_observed() {
+        let fixture = Fixture::new(&[
+            ("src/main.rs", "fn main() {}"),
+            ("src/brand_new.rs", "just written by an agent"),
+            ("build.log", "noise"),
+            (".gitignore", "*.log\n"),
+        ]);
+        assert!(!fixture.root.join(".git").exists());
+        assert_eq!(
+            fixture.walk(),
+            [".gitignore", "src/brand_new.rs", "src/main.rs"]
+        );
     }
 
     #[test]
     fn loreignore_excludes_without_any_git_metadata() {
         // A VCS-less workspace: no .git anywhere, so gitignore semantics
         // alone would index the telemetry.
-        let (_dir, root) = fixture(&[
+        let fixture = Fixture::new(&[
             ("src/main.rs", "fn main() {}"),
             ("telemetry/run1.jsonl", "{\"tick\":1}"),
             ("assets/big.asset", "yaml: 1"),
             (".loreignore", "telemetry/\n*.asset\n"),
         ]);
-        assert_eq!(walk(&root), ["src/main.rs"]);
+        assert_eq!(fixture.walk(), [".loreignore", "src/main.rs"]);
     }
 
     #[test]
     fn loreignore_nests_like_gitignore() {
-        // No root `.loreignore`, so the in-memory fallback is live; none of
-        // these names are in it, so it changes nothing here.
-        let (_dir, root) = fixture(&[
+        let fixture = Fixture::new(&[
             ("a/keep.txt", "k"),
             ("a/logs/noise.txt", "n"),
             ("a/.loreignore", "logs/\n"),
             ("b/logs/kept.txt", "k"),
         ]);
         // Only `a`'s logs are ignored; `b` has no rule.
-        assert_eq!(walk(&root), ["a/keep.txt", "b/logs/kept.txt"]);
-    }
-
-    #[test]
-    fn loreignore_outranks_gitignore_for_reinclusion() {
-        let (_dir, root) = fixture(&[
-            ("data/model.onnx", "bin"),
-            ("data/readme.md", "docs"),
-            (".gitignore", "data/\n"),
-            (".loreignore", "!data/\n!data/readme.md\ndata/*.onnx\n"),
-        ]);
-        assert_eq!(walk(&root), ["data/readme.md"]);
-    }
-
-    #[test]
-    fn the_ignore_file_itself_is_hidden_from_the_index() {
-        let (_dir, root) = fixture(&[("kept.rs", "x"), (".loreignore", "")]);
-        assert_eq!(walk(&root), ["kept.rs"]);
-    }
-
-    /// The safety net: generation failed (or has not run yet), there is no
-    /// VCS metadata either, and the build trees still must not be indexed.
-    #[test]
-    fn without_a_loreignore_the_built_in_exclusions_apply_at_any_depth() {
-        let (_dir, root) = fixture(&[
-            ("src/main.rs", "fn main() {}"),
-            ("target/debug/build.rs", "generated"),
-            ("node_modules/pkg/index.js", "vendored"),
-            ("game/Library/ScriptAssemblies/Asm.dll.txt", "unity"),
-            ("game/deep/nested/obj/Debug/gen.cs", "msbuild"),
-            (".idea/workspace.xml", "editor"),
-        ]);
-        assert!(!root.join(LORE_IGNORE_FILE).exists());
-        assert_eq!(walk(&root), ["src/main.rs"]);
-    }
-
-    /// The escape hatch, and the reason the fallback keys off *existence*
-    /// rather than content: an empty file is a complete statement.
-    #[test]
-    fn an_empty_loreignore_disables_the_fallback_entirely() {
-        let (_dir, root) = fixture(&[
-            ("src/main.rs", "fn main() {}"),
-            ("node_modules/pkg/index.js", "vendored"),
-            ("target/debug/build.rs", "generated"),
-            (".loreignore", ""),
-        ]);
         assert_eq!(
-            walk(&root),
-            [
-                "node_modules/pkg/index.js",
-                "src/main.rs",
-                "target/debug/build.rs"
-            ]
+            fixture.walk(),
+            ["a/.loreignore", "a/keep.txt", "b/logs/kept.txt"]
         );
     }
 
-    /// A nested `.loreignore` is not the project's `.loreignore`: the
-    /// fallback is a property of the root, so a rule three directories down
-    /// cannot switch it off.
+    /// The ignore files are policy rather than content, but nothing special
+    /// keeps them out of the index — a user-level `.*`, or the project's own
+    /// rule, is all that does.
     #[test]
-    fn a_nested_loreignore_does_not_disable_the_fallback() {
-        let (_dir, root) = fixture(&[
-            ("app/src/main.rs", "fn main() {}"),
-            ("app/node_modules/pkg/index.js", "vendored"),
-            ("app/.loreignore", "*.tmp\n"),
-        ]);
-        assert_eq!(walk(&root), ["app/src/main.rs"]);
+    fn the_ignore_file_itself_is_excluded_by_the_dot_file_rule() {
+        let fixture = Fixture::new(&[("kept.rs", "x"), (".loreignore", "")]);
+        assert_eq!(
+            fixture.walk(),
+            [".loreignore", "kept.rs"],
+            "with no rule saying otherwise, it is just a file"
+        );
+        fixture.user_rules(".*\n");
+        assert_eq!(fixture.walk(), ["kept.rs"]);
     }
+
+    // -----------------------------------------------------------------------
+    // Scoped listings — the incremental path must agree with the full scan
+    // -----------------------------------------------------------------------
 
     /// The incremental path lists one directory; it must reach the same
     /// verdict the full scan does, including when the rule that excludes it
@@ -578,302 +510,108 @@ mod tests {
     /// itself.
     #[test]
     fn listing_a_subdirectory_obeys_the_rules_that_apply_to_its_ancestors() {
-        let (_dir, root) = fixture(&[
+        let fixture = Fixture::new(&[
             ("keep.rs", "x"),
             ("build/out/gen.rs", "generated"),
             (".loreignore", "build/\n"),
         ]);
-        assert!(walk_from(&root, &root.join("build/out"), Some(1)).is_empty());
-        assert_eq!(walk(&root), ["keep.rs"]);
+        assert!(
+            fixture
+                .walk_from(&fixture.root.join("build/out"), Some(1))
+                .is_empty()
+        );
+        assert_eq!(fixture.walk(), [".loreignore", "keep.rs"]);
     }
 
-    /// Same, for the fallback: no `.loreignore` at all, and the listing still
-    /// must not hand back a build tree.
+    /// Same, for rung 1: the lowest source has to reach a scoped listing too,
+    /// or a watcher event would index what the next full scan deletes.
     #[test]
-    fn listing_a_subdirectory_obeys_the_fallback_too() {
-        let (_dir, root) = fixture(&[("target/debug/build.rs", "generated")]);
-        assert!(walk_from(&root, &root.join("target/debug"), Some(1)).is_empty());
+    fn listing_a_subdirectory_obeys_the_user_level_rules_too() {
+        let fixture = Fixture::new(&[
+            ("target/debug/build.rs", "generated"),
+            (".env", "API_TOKEN=hunter2"),
+        ]);
+        fixture.user_rules("[Tt]arget/\n.env\n");
+        assert!(
+            fixture
+                .walk_from(&fixture.root.join("target/debug"), Some(1))
+                .is_empty()
+        );
+        assert!(fixture.walk_from(&fixture.root.clone(), Some(1)).is_empty());
     }
 
     /// Rooting the walk above `start` must not widen what it returns.
     #[test]
     fn a_depth_limited_listing_returns_only_that_directorys_own_files() {
-        let (_dir, root) = fixture(&[
+        let fixture = Fixture::new(&[
             ("top.rs", "x"),
             ("a/one.rs", "x"),
             ("a/b/two.rs", "x"),
             ("z/other.rs", "x"),
         ]);
-        assert_eq!(walk_from(&root, &root.join("a"), Some(1)), ["a/one.rs"]);
         assert_eq!(
-            walk_from(&root, &root.join("a"), None),
+            fixture.walk_from(&fixture.root.join("a"), Some(1)),
+            ["a/one.rs"]
+        );
+        assert_eq!(
+            fixture.walk_from(&fixture.root.join("a"), None),
             ["a/b/two.rs", "a/one.rs"]
         );
     }
 
-    /// `.git` is the one name the user cannot argue with, in either state of
-    /// the fallback: the ignore rules are read out of it.
+    // -----------------------------------------------------------------------
+    // The hard floor
+    // -----------------------------------------------------------------------
+
+    /// `.git` is the one name the user cannot argue with: the ignore rules are
+    /// read out of it, and it holds the remote's credentials.
     #[test]
     fn git_metadata_is_never_indexed() {
-        let (_dir, root) = fixture(&[
+        let fixture = Fixture::new(&[
             ("kept.rs", "x"),
             (".git/config", "[core]"),
             (".git/objects/ab/cdef", "blob"),
         ]);
-        assert_eq!(walk(&root), ["kept.rs"]);
+        assert_eq!(fixture.walk(), ["kept.rs"]);
 
-        // Even when a `.loreignore` disables the fallback and tries to
-        // re-include it.
-        std::fs::write(root.join(LORE_IGNORE_FILE), "!.git/\n").unwrap();
-        assert_eq!(walk(&root), ["kept.rs"]);
+        // Even when the sovereign file tries to re-include it, which every
+        // other rule here would obey.
+        fixture.write(".loreignore", "!.git/\n!.git/*\n");
+        assert_eq!(fixture.walk(), [".loreignore", "kept.rs"]);
     }
 
-    // -----------------------------------------------------------------------
-    // Nested repository boundaries
-    //
-    // Real checkouts throughout, never a hand-built directory shape: the whole
-    // question is what `git worktree add` actually puts on disk (a `.git`
-    // *file*) versus what a clone does (a `.git` directory), and a mocked
-    // fixture would be a restatement of this module's assumptions rather than
-    // a test of them.
-    // -----------------------------------------------------------------------
-
-    fn git_in(dir: &Utf8Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .expect("git is on PATH");
-        assert!(
-            output.status.success(),
-            "git {args:?} in {dir}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    /// A repository with one commit — `git worktree add` needs a commit to
-    /// check out.
-    fn init_repo(dir: &Utf8Path) {
-        std::fs::create_dir_all(dir).unwrap();
-        git_in(dir, &["init", "-q", "."]);
-        git_in(
-            dir,
-            &["config", "--local", "user.email", "t@example.invalid"],
-        );
-        git_in(dir, &["config", "--local", "user.name", "test"]);
-        git_in(dir, &["commit", "-q", "--allow-empty", "-m", "root"]);
-    }
-
-    /// A project root that is a real repository, with a real linked worktree
-    /// of itself nested inside it and a real second repository vendored in.
-    /// Both nested checkouts are at *non-hidden* paths, because `hidden(true)`
-    /// would otherwise prune them and hide what is being tested.
-    fn nested_checkouts() -> (tempfile::TempDir, Utf8PathBuf) {
-        let (dir, root) = fixture(&[("src/main.rs", "fn main() {}"), ("keep.md", "# notes")]);
-        init_repo(&root);
-        git_in(&root, &["add", "-A"]);
-        git_in(&root, &["commit", "-q", "-m", "content"]);
-        // The defect, exactly: an agent tool's worktree of this very
-        // repository, living inside it. Every committed file appears twice.
-        git_in(&root, &["worktree", "add", "-q", "wt/agent", "-b", "agent"]);
-        // And an ordinary nested clone, whose `.git` is a directory.
-        let vendored = root.join("vendor/dep");
-        init_repo(&vendored);
-        std::fs::write(vendored.join("lib.rs"), "pub fn dep() {}").unwrap();
-        (dir, root)
-    }
-
-    /// What the `ignore` crate does on its own, pinned. Its repository-boundary
-    /// notions (`require_git`) decide which `.gitignore` files apply, **not**
-    /// where the walk stops: under either setting it descends into a nested
-    /// worktree and a nested clone alike. If a crate upgrade ever changed
-    /// that, this failing would be the notice that [`is_repo_root`] had become
-    /// redundant.
+    /// The path-level form, for the watcher: it names paths no walk produced.
     #[test]
-    fn the_ignore_crate_walks_into_a_nested_repository_on_its_own() {
-        let (_dir, root) = nested_checkouts();
-        for require_git in [false, true] {
-            let mut builder = WalkBuilder::new(&root);
-            builder
-                .follow_links(false)
-                .hidden(true)
-                .parents(true)
-                .git_ignore(true)
-                .git_exclude(true)
-                .require_git(require_git)
-                .git_global(false);
-            let mut files: Vec<String> = builder
-                .build()
-                .flatten()
-                .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
-                .filter_map(|entry| {
-                    Utf8Path::from_path(entry.path()).and_then(|p| paths::relative_to(&root, p))
-                })
-                .map(|p| p.to_string())
-                .collect();
-            files.sort();
-            assert!(
-                files.iter().any(|p| p == "wt/agent/src/main.rs"),
-                "require_git={require_git}: the crate stopped at the nested worktree by itself: \
-                 {files:#?}"
-            );
-            assert!(
-                files.iter().any(|p| p == "vendor/dep/lib.rs"),
-                "require_git={require_git}: the crate stopped at the nested clone by itself: \
-                 {files:#?}"
-            );
+    fn the_floor_answers_about_a_whole_path_at_any_depth_and_case() {
+        for path in [".git/config", "vendor/dep/.git/HEAD", ".GIT/config"] {
+            assert!(is_git_metadata(Utf8Path::new(path)), "{path}");
+        }
+        // Named for git without being git's directory — and, crucially, nothing
+        // else is checked this way, because everything else is overridable.
+        for path in [".gitignore", "src/.gitkeep", ".env", "src/main.rs"] {
+            assert!(!is_git_metadata(Utf8Path::new(path)), "{path}");
         }
     }
 
-    /// The defect. A worktree of the project inside the project is a
-    /// byte-for-byte duplicate of it, and a vendored clone is somebody else's
-    /// repository; neither is part of this project's content.
+    /// The daemon's own data directory is not a rule either — and a project
+    /// root can be an ancestor of it.
     #[test]
-    fn a_nested_repository_is_not_walked_as_part_of_its_parent() {
-        let (_dir, root) = nested_checkouts();
-        assert_eq!(walk(&root), ["keep.md", "src/main.rs"]);
-    }
+    fn the_daemons_data_directory_is_never_walked() {
+        let project = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(project.path().to_path_buf()).unwrap();
+        // Joined component by component: the containment check compares strings
+        // against what the walker reports, which uses the platform separator.
+        let data_dir = root.join("state").join("lore");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(data_dir.join("index.sqlite3"), "db").unwrap();
+        std::fs::write(root.join("keep.rs"), "x").unwrap();
 
-    /// The case that must not break: a linked worktree registered *directly*
-    /// as its own project (what the benchmark harness does) is a repository
-    /// root too, and the rule applies to subdirectories only — a walk that
-    /// refused the root it was pointed at would index nothing at all.
-    #[test]
-    fn a_worktree_registered_as_its_own_project_indexes_normally() {
-        let (dir, main) = fixture(&[("src/main.rs", "fn main() {}")]);
-        init_repo(&main);
-        git_in(&main, &["add", "-A"]);
-        git_in(&main, &["commit", "-q", "-m", "content"]);
-        let sibling = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
-            .unwrap()
-            .join("checkout");
-        git_in(
-            &main,
-            &["worktree", "add", "-q", sibling.as_str(), "-b", "wt"],
-        );
-
-        // A `.git` *file*, which is what makes this the case a directory test
-        // would have missed.
-        let marker = sibling.join(GIT_ENTRY);
-        assert!(marker.is_file(), "expected a gitdir: pointer file");
-        assert!(
-            std::fs::read_to_string(&marker)
-                .unwrap()
-                .starts_with("gitdir:"),
-            "expected a gitdir: pointer file"
-        );
-        assert!(is_repo_root(&sibling));
-        assert_eq!(walk(&sibling), ["src/main.rs"]);
-    }
-
-    /// The escape hatch, and the reason rule 3 is a default rather than a
-    /// refusal: vendoring a repository and wanting it indexed is legitimate.
-    #[test]
-    fn a_loreignore_reinclude_overrides_the_nested_repository_skip() {
-        let (_dir, root) = nested_checkouts();
-        std::fs::write(root.join(LORE_IGNORE_FILE), "!vendor/dep/\n").unwrap();
-        assert_eq!(
-            walk(&root),
-            ["keep.md", "src/main.rs", "vendor/dep/lib.rs"],
-            "the re-include must reach the vendored repo and nothing else"
-        );
-    }
-
-    /// The incremental path must reach the same verdict as the full scan, or
-    /// the watcher indexes a nested repository's files and the next full scan
-    /// deletes them, forever.
-    ///
-    /// Worth having here rather than trusting a layer above: the git basis
-    /// this landed beside (D-0017, since retired by D-0020) disagreed with
-    /// itself about exactly this — `git ls-files --others` collapses a nested
-    /// repository to one directory entry, while `git check-ignore`, which the
-    /// watcher batch used, reports paths inside it as *not ignored*. Deciding
-    /// it in the walker decides it once for both paths.
-    #[test]
-    fn listing_a_directory_inside_a_nested_repository_returns_nothing() {
-        let (_dir, root) = nested_checkouts();
-        assert!(walk_from(&root, &root.join("wt/agent/src"), Some(1)).is_empty());
-        assert!(walk_from(&root, &root.join("vendor/dep"), Some(1)).is_empty());
-    }
-
-    // -----------------------------------------------------------------------
-    // Credential refusals (D-0015)
-    // -----------------------------------------------------------------------
-
-    fn refused(path: &str) -> Option<&'static str> {
-        credential_exclusion(Utf8Path::new(path))
-    }
-
-    #[test]
-    fn every_credential_pattern_refuses_something_and_names_itself() {
-        // One case per entry in the constant, so a pattern cannot be added
-        // without a demonstration that it matches, or removed without a
-        // failure here.
-        let cases = [
-            (".env", ".env"),
-            ("app/.env", ".env"),
-            (".env.production", ".env.*"),
-            ("deploy/.env.local", ".env.*"),
-            ("id_rsa", "id_rsa*"),
-            ("keys/id_rsa.pub", "id_rsa*"),
-            ("id_ecdsa", "id_ecdsa*"),
-            ("id_ed25519", "id_ed25519*"),
-            ("id_dsa", "id_dsa*"),
-            ("certs/server.pem", "*.pem"),
-            ("tls/private.key", "*.key"),
-            ("home/.ssh/known_hosts", ".ssh/"),
-            (".aws/credentials", ".aws/"),
-            (".gnupg/secring.gpg", ".gnupg/"),
-            ("home/.config/gcloud/creds.json", ".config/gcloud/"),
-        ];
-        for (path, pattern) in cases {
-            assert_eq!(refused(path), Some(pattern), "{path}");
-        }
-        let unmatched: Vec<&&str> = CREDENTIAL_EXCLUDES
-            .iter()
-            .filter(|pattern| !cases.iter().any(|(_, matched)| *matched == **pattern))
+        let mut files: Vec<String> = walk_files(&root, &root, None, &data_dir, None)
+            .into_iter()
+            .map(|p| p.to_string())
             .collect();
-        assert!(unmatched.is_empty(), "untested patterns: {unmatched:?}");
-    }
-
-    /// A case-insensitive volume makes `ID_RSA` the same file as `id_rsa`, and
-    /// a refusal that a rename to uppercase defeats is not a refusal.
-    #[test]
-    fn credential_matching_ignores_ascii_case() {
-        assert_eq!(refused("ID_RSA"), Some("id_rsa*"));
-        assert_eq!(refused("Certs/Server.PEM"), Some("*.pem"));
-        assert_eq!(refused("Home/.SSH/config"), Some(".ssh/"));
-    }
-
-    /// The patterns are narrow enough that ordinary source survives them — the
-    /// guard is worth nothing if the reflex it trains is to switch it off.
-    #[test]
-    fn ordinary_source_is_not_a_credential() {
-        for path in [
-            "src/main.rs",
-            "src/environment.rs",
-            "docs/env.md",
-            "keyboard.rs",
-            "src/keys.rs",
-            "config/gcloud.md",
-            "scripts/ssh-setup.sh",
-            "id_generator.rs",
-            // Non-ASCII names must compare, not panic.
-            "docs/日本語.md",
-            "café.pemx",
-        ] {
-            assert_eq!(refused(path), None, "{path}");
-        }
-    }
-
-    /// The receiver's backstop reaches paths no walk ever pruned, so the two
-    /// refusal families answer through one function.
-    #[test]
-    fn refusal_covers_git_metadata_and_credentials_alike() {
-        assert_eq!(refusal(Utf8Path::new(".git/config")), Some(".git"));
-        assert_eq!(refusal(Utf8Path::new("vendor/.git/HEAD")), Some(".git"));
-        assert_eq!(refusal(Utf8Path::new("certs/key.pem")), Some("*.pem"));
-        assert_eq!(refusal(Utf8Path::new("src/main.rs")), None);
+        files.sort();
+        assert_eq!(files, ["keep.rs"]);
+        assert!(walk_files(&root, &data_dir, None, &data_dir, None).is_empty());
     }
 }
