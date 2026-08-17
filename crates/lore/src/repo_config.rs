@@ -9,8 +9,10 @@
 //! only — a nested `.lore.toml` in a subdirectory is not configuration, it is
 //! a file like any other.
 //!
-//! Two independent tables live here, and neither implies the other:
-//! `[authority]` (D-0012) and `[project]` (the committed name, D-0016). There is
+//! Four independent tables live here, and none implies another: `[authority]`
+//! (D-0012), `[project]` (the committed name, D-0016), `[[sources]]` (the
+//! declared extent, D-0022, resolved by [`crate::sources`]) and `[plugins]`
+//! (chunker-plugin opt-in, resolved by [`enabled_plugins`]). There is
 //! deliberately no ingestion table: D-0020 made every ignore rule an ordinary
 //! overridable line in a `.loreignore`, which retired the `[ingest]
 //! allow_secret_paths` escape hatch along with the hard-excludes it defeated.
@@ -31,6 +33,8 @@
 //! [`RepoAuthority::error`], where `lore status` and the refresh diagnostics
 //! put it in front of the user. D-0012's requirement is that the failure is
 //! loud, not that it is fatal.
+
+use std::collections::BTreeSet;
 
 use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
@@ -231,6 +235,8 @@ struct RepoConfigFile {
     /// [`crate::sources::Sources`], which is a third independent thing in this
     /// file and implies nothing about the two above it.
     sources: Vec<crate::sources::SourceEntry>,
+    /// Likewise for `[plugins]`, resolved by [`enabled_plugins`].
+    plugins: Option<PluginsTable>,
 }
 
 /// The repository's committed project name, written by `lore add`.
@@ -258,6 +264,73 @@ struct AuthorityTable {
     /// Absent means [`Behavior::Annotate`].
     #[serde(default)]
     behavior: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// [plugins].enable — chunker-plugin opt-in
+// ---------------------------------------------------------------------------
+
+/// The repository's chunker-plugin opt-in:
+///
+/// ```toml
+/// [plugins]
+/// enable = ["unity"]
+/// ```
+///
+/// Independent of every other table here. Naming a plugin this daemon has not
+/// installed is **not** an error: those files chunk exactly as they would with
+/// no plugin at all, and the gap is reported by `lore status` rather than
+/// refused — the same "visible, not fatal" posture the rest of this file takes.
+/// What is chunked by a plugin is therefore the intersection of *installed*
+/// (the daemon's `plugins/` directory) and *enabled* (this list).
+///
+/// Opt-in rather than automatic because a chunker sees every byte that survived
+/// the ignore rules, so which formats get plugin-authored structural indexing is
+/// a repo-visible choice (2026-08-17 contract, "Installation, opt-in, remote
+/// mode").
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PluginsTable {
+    /// Absent is legal, and means the same as an empty list: the table may
+    /// exist for keys this build does not yet read.
+    #[serde(default)]
+    enable: Option<Vec<String>>,
+}
+
+/// Read `<root>/.lore.toml`'s `[plugins] enable`.
+///
+/// Never fails, and deliberately says nothing about a malformed file:
+/// [`RepoAuthority::load`] parses the same bytes and already reports the defect
+/// where `lore status` shows it, and repeating it here would put one problem in
+/// front of the user twice in two voices — exactly the split
+/// [`crate::sources::Sources::load`] makes for `[[sources]]`.
+///
+/// A file Lore cannot parse therefore enables nothing, which is what a repo
+/// with no file at all does.
+pub fn enabled_plugins(root: &Utf8Path) -> BTreeSet<String> {
+    match std::fs::read_to_string(root.join(REPO_CONFIG_FILE)) {
+        Ok(text) => parse_enabled_plugins(&text),
+        Err(_) => BTreeSet::new(),
+    }
+}
+
+/// The parse half of [`enabled_plugins`], over the file's text.
+///
+/// Names are trimmed and case-folded: plugin names are lowercase slugs by
+/// construction ([`crate::plugin::manifest`]), so `enable = ["Unity"]` can only
+/// mean `unity`, and matching it exactly would present as a plugin that
+/// mysteriously never turned on.
+pub fn parse_enabled_plugins(text: &str) -> BTreeSet<String> {
+    let Ok(file) = toml::from_str::<RepoConfigFile>(text) else {
+        return BTreeSet::new();
+    };
+    file.plugins
+        .and_then(|plugins| plugins.enable)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -493,6 +566,75 @@ mod tests {
                 "{text:?} must not pass silently"
             );
         }
+    }
+
+    /// The fourth table, and as independent as the other three: opting into a
+    /// chunker plugin says nothing about authority, and a profile says nothing
+    /// about plugins.
+    #[test]
+    fn the_plugins_table_is_independent_of_every_other_table() {
+        let both = RepoAuthority::parse(
+            "[plugins]\nenable = [\"unity\"]\n\n[authority]\nprofile = \"lore-v1\"\n",
+        );
+        assert_eq!(both.profile, Some(Profile::LoreV1));
+        assert_eq!(both.error, None);
+        // A plugins-only file is as neutral as no file at all.
+        assert_eq!(
+            RepoAuthority::parse("[plugins]\nenable = [\"unity\"]\n"),
+            RepoAuthority::default()
+        );
+        assert_eq!(
+            parse_enabled_plugins("[plugins]\nenable = [\"unity\"]\n\n[project]\nname = \"x\"\n"),
+            BTreeSet::from(["unity".to_string()])
+        );
+        // ...and a profile alone enables nothing.
+        assert!(parse_enabled_plugins("[authority]\nprofile = \"lore-v1\"\n").is_empty());
+    }
+
+    #[test]
+    fn enabled_plugin_names_are_trimmed_folded_and_deduplicated() {
+        assert_eq!(
+            parse_enabled_plugins("[plugins]\nenable = [\"Unity\", \"  unity \", \"toy\", \"\"]\n"),
+            BTreeSet::from(["toy".to_string(), "unity".to_string()])
+        );
+        // The three ways of saying "no plugins".
+        for text in ["", "[plugins]\n", "[plugins]\nenable = []\n"] {
+            assert!(parse_enabled_plugins(text).is_empty(), "{text:?}");
+            assert_eq!(RepoAuthority::parse(text).error, None, "{text:?}");
+        }
+    }
+
+    /// Same strictness as every other table: a misspelled key must not read as
+    /// "this repo enabled nothing".
+    #[test]
+    fn an_unknown_key_inside_plugins_is_a_visible_error() {
+        for text in [
+            "[plugins]\nenabled = [\"unity\"]\n",
+            "[plugins]\nenable = [\"unity\"]\nversion = 2\n",
+            "[plugin]\nenable = [\"unity\"]\n",
+        ] {
+            assert!(
+                RepoAuthority::parse(text).error.is_some(),
+                "{text:?} must be visible"
+            );
+            // And a file Lore cannot parse enables nothing, rather than
+            // enabling something it half-understood.
+            assert!(parse_enabled_plugins(text).is_empty(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn enabled_plugins_reads_the_root_file_and_tolerates_its_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        assert!(enabled_plugins(&root).is_empty());
+
+        std::fs::write(
+            root.join(REPO_CONFIG_FILE),
+            "[plugins]\nenable = [\"toy\"]\n",
+        )
+        .unwrap();
+        assert_eq!(enabled_plugins(&root), BTreeSet::from(["toy".to_string()]));
     }
 
     #[test]
