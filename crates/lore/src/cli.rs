@@ -371,25 +371,80 @@ fn plugin_list_from_disk(why: &str) -> Result<()> {
 /// which is also why the closing line says so.
 pub fn plugin_add(path: String) -> Result<()> {
     let source = absolute_utf8(&path)?;
+    let installed = install_plugin(&source, &plugins_dir()?)?;
+    if installed.unchanged {
+        println!(
+            "{name} is already installed and unchanged ({target})",
+            name = installed.name,
+            target = installed.target,
+        );
+        return Ok(());
+    }
+
+    println!(
+        "installed {name}  {fingerprint}  {extensions}",
+        name = installed.name,
+        fingerprint = short_fingerprint(&installed.fingerprint),
+        extensions = extension_list(&installed.extensions),
+    );
+    println!("  {}", installed.target);
+    // Both halves, because either one alone leaves a user with a plugin that
+    // appears to do nothing.
+    println!(
+        "  restart the daemon to load it (`lore stop`, then `lore daemon`), and enable it in a \
+         project's .lore.toml:\n\n    [plugins]\n    enable = [\"{name}\"]\n",
+        name = installed.name
+    );
+    println!("  then `lore index <project>` re-chunks the files it claims (nothing else moves)");
+    Ok(())
+}
+
+/// What `lore plugin add` installed, or found already there.
+#[derive(Debug)]
+struct Installed {
+    name: String,
+    fingerprint: String,
+    extensions: Vec<String>,
+    target: Utf8PathBuf,
+    /// The same plugin, byte for byte, was already installed and nothing was
+    /// copied.
+    unchanged: bool,
+}
+
+/// The whole of `lore plugin add` except the printing, so the refusals are
+/// testable against a directory a test owns rather than the machine's real
+/// data directory.
+fn install_plugin(source: &Utf8Path, plugins_dir: &Utf8Path) -> Result<Installed> {
     if !source.is_dir() {
         bail!(
             "not a directory: {source}\nA chunker plugin is a directory holding lore-plugin.toml and its assets."
         );
     }
-    let plugin = lore::plugin::Plugin::load(&source)
+    let plugin = lore::plugin::Plugin::load(source)
         .map_err(|diagnostic| anyhow::anyhow!("{diagnostic}\nFix the plugin, then try again."))?;
 
-    let target = plugins_dir()?.join(&plugin.name);
+    let target = plugins_dir.join(&plugin.name);
+    let found = Installed {
+        name: plugin.name.clone(),
+        fingerprint: plugin.fingerprint.clone(),
+        extensions: plugin
+            .extensions()
+            .into_iter()
+            .map(ToString::to_string)
+            .collect(),
+        target: target.clone(),
+        unchanged: false,
+    };
+
     if target.exists() {
         match lore::plugin::Plugin::load(&target) {
             // Byte-for-byte the same plugin: installing it again is a no-op,
             // and saying "already installed" is more useful than a refusal.
             Ok(installed) if installed.fingerprint == plugin.fingerprint => {
-                println!(
-                    "{name} is already installed and unchanged ({target})",
-                    name = plugin.name
-                );
-                return Ok(());
+                return Ok(Installed {
+                    unchanged: true,
+                    ..found
+                });
             }
             Ok(installed) => bail!(
                 "a different plugin named `{name}` is already installed at {target}\n  \
@@ -411,29 +466,8 @@ pub fn plugin_add(path: String) -> Result<()> {
         }
     }
 
-    copy_tree(&source, &target).with_context(|| format!("copying {source} to {target}"))?;
-    println!(
-        "installed {name}  {fingerprint}  {extensions}",
-        name = plugin.name,
-        fingerprint = short_fingerprint(&plugin.fingerprint),
-        extensions = extension_list(
-            &plugin
-                .extensions()
-                .into_iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        ),
-    );
-    println!("  {target}");
-    // Both halves, because either one alone leaves a user with a plugin that
-    // appears to do nothing.
-    println!(
-        "  restart the daemon to load it (`lore stop`, then `lore daemon`), and enable it in a \
-         project's .lore.toml:\n\n    [plugins]\n    enable = [\"{name}\"]\n",
-        name = plugin.name
-    );
-    println!("  then `lore index <project>` re-chunks the files it claims (nothing else moves)");
-    Ok(())
+    copy_tree(source, &target).with_context(|| format!("copying {source} to {target}"))?;
+    Ok(found)
 }
 
 /// Where installed plugins live: the daemon's data directory, resolved exactly
@@ -2065,6 +2099,159 @@ mod tests {
             vec!["design/a.md".into(), "design/b.md".into()],
         ));
         assert!(truncated.contains("... and 7 more"), "{truncated}");
+    }
+
+    /// The two ways a chunker plugin disappoints, and the one way it works.
+    ///
+    /// All three are invisible in search results — a plugin that never ran
+    /// produces a perfectly ordinary index of line windows — so `status` is the
+    /// only place the difference exists. And silent when there is nothing to
+    /// say: a project that enabled no plugins gets no plugin lines at all.
+    #[test]
+    fn status_reports_plugins_only_where_there_is_something_to_report() {
+        let daemon = |plugins: Vec<lore_core::PluginInfo>,
+                      diagnostics: Vec<String>,
+                      project: ProjectStatus| DaemonStatus {
+            api_version: 1,
+            daemon_version: "0.1.0".into(),
+            generation: 3,
+            projects: vec![project],
+            embeddings: EmbeddingStatus::Unconfigured,
+            latency: Vec::new(),
+            embed_abandoned: 0,
+            plugins,
+            plugin_diagnostics: diagnostics,
+        };
+        let unity = || lore_core::PluginInfo {
+            name: "unity".into(),
+            fingerprint: "6f1d2a3b4c5d6e7f8091a2b3c4d5e6f7".into(),
+            extensions: vec!["uxml".into(), "uss".into()],
+        };
+        let bare = ProjectStatus {
+            id: 1,
+            name: "lore".into(),
+            root: r"C:\repos\lore".into(),
+            ..ProjectStatus::default()
+        };
+
+        // A machine with no plugins and a project that enabled none: silence.
+        let quiet = render_status(&daemon(Vec::new(), Vec::new(), bare.clone()));
+        assert!(!quiet.contains("plugin"), "{quiet}");
+        assert!(!quiet.contains("PLUGIN"), "{quiet}");
+
+        // Installed and in force: named, with a fingerprint short enough to
+        // compare by eye and long enough to be a handle.
+        let working = render_status(&daemon(
+            vec![unity()],
+            Vec::new(),
+            ProjectStatus {
+                plugins_enabled: vec![unity()],
+                ..bare.clone()
+            },
+        ));
+        assert!(
+            working.contains("plugins: unity 6f1d2a3b4c5d (uxml, uss)"),
+            "{working}"
+        );
+        assert!(
+            working.contains("    plugins: unity 6f1d2a3b4c5d\n"),
+            "{working}"
+        );
+        assert!(!working.contains("PLUGIN"), "nothing is wrong: {working}");
+
+        // Enabled but never installed: the files are indexed, just not the way
+        // the repository asked for, so the remedy is named.
+        let missing = render_status(&daemon(
+            Vec::new(),
+            Vec::new(),
+            ProjectStatus {
+                plugins_missing: vec!["unity".into()],
+                ..bare.clone()
+            },
+        ));
+        assert!(
+            missing.contains("PLUGINS: unity enabled in .lore.toml but not installed"),
+            "{missing}"
+        );
+        assert!(missing.contains("lore plugin add"), "{missing}");
+
+        // Installed, enabled, and unable to run: the count of what fell back,
+        // plus the machine-wide diagnostic that says why.
+        let broken = render_status(&daemon(
+            vec![unity()],
+            vec!["plugin \"unity\" grammar `xml.wasm` is unavailable".into()],
+            ProjectStatus {
+                plugins_enabled: vec![unity()],
+                plugin_fallback_files: 12,
+                ..bare
+            },
+        ));
+        assert!(
+            broken.contains("PLUGIN: plugin \"unity\" grammar `xml.wasm` is unavailable"),
+            "{broken}"
+        );
+        assert!(
+            broken.contains("PLUGINS: 12 file(s) fell back to the built-in chunker"),
+            "{broken}"
+        );
+    }
+
+    /// Installing is a filesystem act with two refusals, and both of them exist
+    /// to keep a plugin's *identity* meaningful: a name is unique, and the
+    /// fingerprint is the version.
+    #[test]
+    fn installing_a_plugin_validates_it_and_refuses_to_replace_a_different_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let plugins = dir.join("plugins");
+        let source = dir.join("src/toy");
+        std::fs::create_dir_all(&source).unwrap();
+        let manifest = |extra: &str| {
+            format!(
+                "[plugin]\nname = \"toy\"\n\n[[chunker]]\nextensions = [\"toydata\"]\n\
+                 strategy = \"windows\"\nmax_file_bytes = 8192\n{extra}"
+            )
+        };
+        std::fs::write(source.join("lore-plugin.toml"), manifest("")).unwrap();
+
+        let installed = install_plugin(&source, &plugins).expect("a valid plugin installs");
+        assert_eq!(installed.name, "toy");
+        assert_eq!(installed.extensions, ["toydata"]);
+        assert!(!installed.unchanged);
+        assert!(plugins.join("toy/lore-plugin.toml").is_file());
+
+        // Idempotent: the same bytes are already there, so nothing is copied
+        // and nothing is refused.
+        let again = install_plugin(&source, &plugins).expect("re-adding is a no-op");
+        assert!(again.unchanged);
+        assert_eq!(again.fingerprint, installed.fingerprint);
+
+        // A different plugin under the same name is refused, naming both
+        // fingerprints — replacing it would re-chunk every file it owns.
+        std::fs::write(source.join("lore-plugin.toml"), manifest("# edited\n")).unwrap();
+        let err = install_plugin(&source, &plugins).unwrap_err().to_string();
+        assert!(err.contains("already installed"), "{err}");
+        assert!(err.contains("Delete that directory yourself"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(plugins.join("toy/lore-plugin.toml")).unwrap(),
+            manifest(""),
+            "a refused install must not have written anything"
+        );
+
+        // Validation is loading it: a directory that is not a plugin, and a
+        // manifest that does not parse, are both refused before any copying.
+        let empty = dir.join("src/empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let err = install_plugin(&empty, &plugins).unwrap_err().to_string();
+        assert!(err.contains("lore-plugin.toml"), "{err}");
+        std::fs::write(empty.join("lore-plugin.toml"), "[plugin]\nname = \"E\"\n").unwrap();
+        let err = install_plugin(&empty, &plugins).unwrap_err().to_string();
+        assert!(err.contains("lowercase slug"), "{err}");
+        assert!(!plugins.join("E").exists() && !plugins.join("e").exists());
+        let err = install_plugin(&dir.join("src/nope"), &plugins)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a directory"), "{err}");
     }
 
     #[test]
