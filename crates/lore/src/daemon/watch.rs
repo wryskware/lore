@@ -54,6 +54,7 @@ use tokio_util::sync::CancellationToken;
 
 use lore_core::WatchState;
 
+use crate::sources::Sources;
 use crate::store::{Project, ProjectId};
 
 use super::paths;
@@ -291,12 +292,108 @@ struct Retry {
     failures: u32,
 }
 
+/// One directory a project is watched through, and its arming state.
+#[derive(Debug)]
+struct RootWatch {
+    root: Utf8PathBuf,
+    /// `None` once armed.
+    retry: Option<Retry>,
+}
+
 /// One project the daemon has been told to watch.
+///
+/// A project is watched through **every root it is made of** (D-0022), each
+/// armed and retried independently: one unreachable mount must not cost a
+/// project the coverage of the roots that are fine.
+///
+/// The project's own root is always among them even when it is not a declared
+/// source. Watching is not indexing — an event from a directory no source owns
+/// is dropped by [`crate::sources::Sources::locate`] — but `.lore.toml` lives
+/// at the project root, and a project whose extent is entirely external would
+/// otherwise never see its own configuration change.
 #[derive(Debug)]
 struct Desired {
     project: Project,
-    /// `None` once armed.
-    retry: Option<Retry>,
+    /// The declared extent, re-read whenever `.lore.toml` changes. Carries
+    /// both the roots to arm and the mapping an event needs to become a
+    /// logical path.
+    sources: Sources,
+    roots: Vec<RootWatch>,
+}
+
+impl Desired {
+    fn new(project: Project) -> Self {
+        let sources = Sources::load(&project.root);
+        let mut desired = Self {
+            project,
+            sources,
+            roots: Vec::new(),
+        };
+        desired.roots = desired.wanted_roots();
+        desired
+    }
+
+    /// Every directory to arm: the declared sources plus the project root.
+    fn wanted_roots(&self) -> Vec<RootWatch> {
+        let mut roots: Vec<Utf8PathBuf> = self
+            .sources
+            .iter()
+            .map(|source| source.root.clone())
+            .collect();
+        if !roots.iter().any(|root| root == &self.project.root) {
+            roots.push(self.project.root.clone());
+        }
+        roots
+            .into_iter()
+            .map(|root| RootWatch {
+                root,
+                retry: Some(Retry {
+                    due: Instant::now(),
+                    failures: 0,
+                }),
+            })
+            .collect()
+    }
+
+    /// Re-read `.lore.toml` and reconcile the armed set with it.
+    ///
+    /// Returns the roots that are no longer wanted, for the caller to disarm —
+    /// this borrows `self` mutably and the backend is somebody else's.
+    /// Unchanged roots keep their arming state, so a mount that has been armed
+    /// for a week is not disturbed because a sibling was added.
+    fn reload_sources(&mut self) -> Vec<Utf8PathBuf> {
+        self.sources = Sources::load(&self.project.root);
+        let wanted = self.wanted_roots();
+        let dropped: Vec<Utf8PathBuf> = self
+            .roots
+            .iter()
+            .filter(|held| !wanted.iter().any(|want| want.root == held.root))
+            .map(|held| held.root.clone())
+            .collect();
+        let mut roots = Vec::with_capacity(wanted.len());
+        for want in wanted {
+            match self.roots.iter().position(|held| held.root == want.root) {
+                Some(index) => roots.push(self.roots.swap_remove(index)),
+                None => roots.push(want),
+            }
+        }
+        self.roots = roots;
+        dropped
+    }
+
+    /// The worst state of any root, which is what the project reports.
+    ///
+    /// Deliberately pessimistic: a project with three mounts, two armed and
+    /// one on a volume that will not answer, is *not* fully covered, and
+    /// reporting `Armed` because most of it is would be the silent degradation
+    /// this field exists to prevent.
+    fn state(&self) -> WatchState {
+        if self.roots.iter().any(|root| root.retry.is_some()) {
+            WatchState::Retrying
+        } else {
+            WatchState::Armed
+        }
+    }
 }
 
 /// Desired watches, and which of them are actually armed.
@@ -328,17 +425,34 @@ impl Watches {
             return;
         }
         let id = project.id;
-        self.projects.insert(
-            id,
-            Desired {
-                project,
-                retry: Some(Retry {
-                    due: Instant::now(),
-                    failures: 0,
-                }),
-            },
-        );
+        self.projects.insert(id, Desired::new(project));
         self.status.set(id, WatchState::Retrying);
+    }
+
+    /// Re-read one project's `.lore.toml` and reconcile its armed roots.
+    ///
+    /// Called when the file itself changes, which is the only thing that can
+    /// alter a project's extent. Without this a newly declared mount would
+    /// index on the next full scan and then never update again, and a removed
+    /// one would keep a watch armed on a directory the project no longer
+    /// claims.
+    fn reload_sources(&mut self, backend: &mut impl WatchBackend, project: ProjectId) {
+        let Some(desired) = self.projects.get_mut(&project) else {
+            return;
+        };
+        let dropped = desired.reload_sources();
+        let state = desired.state();
+        for root in &dropped {
+            backend.disarm(root);
+        }
+        if !dropped.is_empty() {
+            tracing::info!(
+                project = %self.projects[&project].project.name,
+                dropped = dropped.len(),
+                "declared extent changed; stopped watching roots it no longer claims"
+            );
+        }
+        self.status.set(project, state);
     }
 
     /// Forget a deregistered project: disarm its root and stop reporting it.
@@ -350,11 +464,14 @@ impl Watches {
         let Some(desired) = self.projects.remove(&project) else {
             return;
         };
-        backend.disarm(&desired.project.root);
+        for held in &desired.roots {
+            backend.disarm(&held.root);
+        }
         self.status.forget(project);
         tracing::info!(
             project = %desired.project.name,
             root = %desired.project.root,
+            roots = desired.roots.len(),
             "no longer watching; the project was deregistered"
         );
     }
@@ -362,39 +479,46 @@ impl Watches {
     /// Arm every watch whose attempt is due. Failures reschedule themselves.
     fn arm_due(&mut self, backend: &mut impl WatchBackend, now: Instant) {
         for desired in self.projects.values_mut() {
-            let Some(retry) = &desired.retry else {
-                continue;
-            };
-            if retry.due > now {
-                continue;
-            }
-            let failures = retry.failures;
+            let name = desired.project.name.clone();
             let id = desired.project.id;
-            let root = desired.project.root.clone();
-            if failures > 0 {
-                backend.disarm(&root);
-            }
-            match backend.arm(&root) {
-                Ok(()) => {
-                    tracing::info!(project = %desired.project.name, root = %root, "watching");
-                    desired.retry = None;
-                    self.status.set(id, WatchState::Armed);
+            for held in &mut desired.roots {
+                let Some(retry) = &held.retry else {
+                    continue;
+                };
+                if retry.due > now {
+                    continue;
                 }
-                Err(err) => {
-                    let failures = failures + 1;
-                    let delay = self.policy.delay(failures);
-                    tracing::warn!(
-                        project = %desired.project.name, root = %root, error = %err,
-                        failures, retry_in_ms = delay.as_millis(),
-                        "cannot watch project root; retrying (until then its changes are only seen on an explicit reindex)"
-                    );
-                    desired.retry = Some(Retry {
-                        due: now + delay,
-                        failures,
-                    });
-                    self.status.set(id, WatchState::Retrying);
+                let failures = retry.failures;
+                let root = held.root.clone();
+                if failures > 0 {
+                    backend.disarm(&root);
+                }
+                match backend.arm(&root) {
+                    Ok(()) => {
+                        tracing::info!(project = %name, root = %root, "watching");
+                        held.retry = None;
+                    }
+                    Err(err) => {
+                        let failures = failures + 1;
+                        let delay = self.policy.delay(failures);
+                        tracing::warn!(
+                            project = %name, root = %root, error = %err,
+                            failures, retry_in_ms = delay.as_millis(),
+                            "cannot watch this root; retrying (until then its changes are only seen on an explicit reindex)"
+                        );
+                        held.retry = Some(Retry {
+                            due: now + delay,
+                            failures,
+                        });
+                    }
                 }
             }
+            // Set once per project rather than once per root: the reported
+            // state is the worst of them, so writing it inside the loop would
+            // announce `Armed` the moment the first root came up and then
+            // correct itself — exactly backwards for a field whose job is to
+            // admit incomplete coverage.
+            self.status.set(id, desired.state());
         }
     }
 
@@ -402,7 +526,8 @@ impl Watches {
     fn next_due(&self) -> Option<Instant> {
         self.projects
             .values()
-            .filter_map(|desired| desired.retry.as_ref().map(|retry| retry.due))
+            .flat_map(|desired| &desired.roots)
+            .filter_map(|held| held.retry.as_ref().map(|retry| retry.due))
             .min()
     }
 
@@ -423,7 +548,28 @@ impl Watches {
         self.projects
             .values()
             .filter_map(|desired| {
-                paths::relative_to(&desired.project.root, abs).map(|rel| (&desired.project, rel))
+                // Through the source table, not the project root: a mounted
+                // root is somewhere else entirely, and the path the index
+                // knows is the *logical* one. A path no source owns belongs to
+                // nobody, which is how an event from a project root watched
+                // only for its `.lore.toml` is dropped rather than indexed
+                // under a prefix it does not have.
+                desired
+                    .sources
+                    .locate(abs)
+                    .map(|(_, logical)| (&desired.project, logical))
+            })
+            .collect()
+    }
+
+    /// Projects whose **own root** contains `abs`, with the root-relative
+    /// path. Used only to notice a `.lore.toml` edit, which can arrive from a
+    /// project root that is not itself a declared source.
+    fn config_owners(&self, abs: &Utf8Path) -> Vec<(ProjectId, Utf8PathBuf)> {
+        self.projects
+            .values()
+            .filter_map(|desired| {
+                paths::relative_to(&desired.project.root, abs).map(|rel| (desired.project.id, rel))
             })
             .collect()
     }
@@ -431,17 +577,24 @@ impl Watches {
     /// Move an armed watch back to the retry set after the platform
     /// invalidated it. A watch already awaiting retry keeps its backoff.
     fn invalidate(&mut self, project: ProjectId, now: Instant) {
+        let policy = self.policy;
         let Some(desired) = self.projects.get_mut(&project) else {
             return;
         };
-        if desired.retry.is_some() {
-            return;
+        // Every root, because a backend error is attributed to a project and
+        // not to one of its directories: the honest response is to re-arm all
+        // of them rather than guess which stream went bad.
+        for held in &mut desired.roots {
+            if held.retry.is_some() {
+                continue;
+            }
+            held.retry = Some(Retry {
+                due: now + policy.delay(1),
+                failures: 1,
+            });
         }
-        desired.retry = Some(Retry {
-            due: now + self.policy.delay(1),
-            failures: 1,
-        });
-        self.status.set(project, WatchState::Retrying);
+        let state = desired.state();
+        self.status.set(project, state);
     }
 
     /// Which projects an error batch is about.
@@ -457,10 +610,15 @@ impl Watches {
                     continue;
                 };
                 for desired in self.projects.values() {
-                    let root = &desired.project.root;
-                    // Either direction counts: the error may name the root
-                    // itself, something inside it, or an ancestor volume.
-                    if paths::is_within(root, path) || paths::is_within(path, root) {
+                    // Every root the project is watched through, not just its
+                    // own: an error on a mounted volume is this project's
+                    // problem even though the path is nowhere near its root.
+                    let touched = desired.roots.iter().any(|held| {
+                        // Either direction counts: the error may name the root
+                        // itself, something inside it, or an ancestor volume.
+                        paths::is_within(&held.root, path) || paths::is_within(path, &held.root)
+                    });
+                    if touched {
                         affected.insert(desired.project.id);
                     }
                 }
@@ -563,7 +721,7 @@ pub async fn run_with<B: WatchBackend>(
                 None => break,
             },
             batch = events.recv() => match batch {
-                Some(Ok(events)) => route(events, &watches, &queue, &data_dir),
+                Some(Ok(events)) => route(events, &mut watches, &mut backend, &queue, &data_dir),
                 Some(Err(errors)) => recover(&errors, &mut watches, &queue),
                 None => break,
             },
@@ -584,7 +742,17 @@ async fn sleep_until(deadline: Option<Instant>) {
 }
 
 /// Turn one debounced batch into queue work.
-fn route(events: Vec<DebouncedEvent>, watches: &Watches, queue: &IndexQueue, data_dir: &Utf8Path) {
+///
+/// Takes `watches` mutably because a `.lore.toml` edit can change the set of
+/// directories this project is watched through (D-0022), and the pump is the
+/// only thing that knows which watches are armed.
+fn route(
+    events: Vec<DebouncedEvent>,
+    watches: &mut Watches,
+    backend: &mut impl WatchBackend,
+    queue: &IndexQueue,
+    data_dir: &Utf8Path,
+) {
     for event in events {
         if event.kind.is_access() {
             continue;
@@ -606,33 +774,59 @@ fn route(events: Vec<DebouncedEvent>, watches: &Watches, queue: &IndexQueue, dat
             if paths::is_within(data_dir, abs) {
                 continue;
             }
+            // `.lore.toml` first, and against the project *root* rather than
+            // the source table: it declares the extent, so a project whose
+            // content is entirely external still has to notice its own
+            // configuration changing — and at that point the set of
+            // directories to watch may have changed too.
+            //
+            // Only at the root. A nested copy is not configuration, and one
+            // inside a mounted tree is that tree's business, not this
+            // project's.
+            let reconfigured: Vec<ProjectId> = watches
+                .config_owners(abs)
+                .into_iter()
+                .filter(|(_, rel)| rel.as_str() == crate::repo_config::REPO_CONFIG_FILE)
+                .map(|(id, _)| id)
+                .collect();
+            for project in reconfigured {
+                tracing::info!(
+                    project_id = project,
+                    "declared extent or authority profile changed; reloading and rescanning"
+                );
+                watches.reload_sources(backend, project);
+                queue.request_full(project);
+            }
+
             // Every containing project, not just the first: nested roots are
             // two legitimate projects, and first-match leaves one of them
-            // deterministically stale.
-            for (project, rel) in watches.containing(abs) {
+            // deterministically stale. The path is *logical* — a mount's
+            // prefix is already on it.
+            let matched: Vec<(ProjectId, String, Utf8PathBuf)> = watches
+                .containing(abs)
+                .into_iter()
+                .map(|(project, rel)| (project.id, project.name.clone(), rel))
+                .collect();
+            for (project, name_of, rel) in matched {
                 // Policy first, before anything below can drop the event: these
                 // files are not content, and an edit to one changes the meaning
                 // of the files that are.
                 //
-                // - the ignore rules changed, so what is indexable changed with
-                //   them — only a rescan can tell how. Both files, because
-                //   `.loreignore` is the one a user is actually invited to edit;
-                // - `.lore.toml` changed, so whether this repo has authority
-                //   semantics at all may have changed (D-0012), and the
-                //   project's Markdown has to be re-chunked under the new
-                //   profile. Only at the root: a nested copy is not
-                //   configuration.
+                // The ignore rules changed, so what is indexable changed with
+                // them and only a rescan can tell how. Both files, because
+                // `.loreignore` is the one a user is actually invited to edit.
+                // Matched anywhere rather than only at a root, because these
+                // nest: a `.loreignore` deep in a tree governs its own subtree.
                 let name = rel.file_name();
                 let ignore_rules =
                     name == Some(".gitignore") || name == Some(walk::LORE_IGNORE_FILE);
-                let repo_config = rel.as_str() == crate::repo_config::REPO_CONFIG_FILE;
-                if ignore_rules || repo_config {
+                if ignore_rules {
                     tracing::info!(
-                        project = %project.name,
+                        project = %name_of,
                         file = %rel,
                         "repository policy changed; scheduling rescan"
                     );
-                    queue.request_full(project.id);
+                    queue.request_full(project);
                     continue;
                 }
                 // The hard floor is all that is rejected on the name alone —
@@ -645,7 +839,7 @@ fn route(events: Vec<DebouncedEvent>, watches: &Watches, queue: &IndexQueue, dat
                 if walk::is_git_metadata(&rel) {
                     continue;
                 }
-                queue.request_paths(project.id, [rel]);
+                queue.request_paths(project, [rel]);
             }
         }
     }

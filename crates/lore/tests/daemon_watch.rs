@@ -283,6 +283,8 @@ struct FakeState {
     arms: Vec<Utf8PathBuf>,
     disarms: Vec<Utf8PathBuf>,
     refusing: bool,
+    /// Refuse only this root; every other one arms.
+    refusing_root: Option<Utf8PathBuf>,
     stopped: bool,
 }
 
@@ -297,8 +299,25 @@ impl FakeBackend {
         self.lock().refusing = true;
     }
 
+    /// Refuse exactly one root and accept the rest — a mount on a volume that
+    /// will not answer while the project's own root is perfectly fine, which
+    /// is the shape a partially covered project actually has.
+    fn refuse_only(&self, root: &Utf8Path) {
+        self.lock().refusing_root = Some(root.to_owned());
+    }
+
+    /// Every root the pump has tried to arm, in order.
+    fn armed_paths(&self) -> Vec<Utf8PathBuf> {
+        self.lock().arms.clone()
+    }
+
     fn allow(&self) {
         self.lock().refusing = false;
+    }
+
+    /// Stop singling out a root, for a volume that has come back.
+    fn allow_all_roots(&self) {
+        self.lock().refusing_root = None;
     }
 
     fn arms(&self) -> usize {
@@ -322,7 +341,8 @@ impl WatchBackend for FakeBackend {
     fn arm(&mut self, root: &Utf8Path) -> anyhow::Result<()> {
         let mut state = self.lock();
         state.arms.push(root.to_owned());
-        if state.refusing {
+        let singled_out = state.refusing_root.as_deref() == Some(root);
+        if state.refusing || singled_out {
             anyhow::bail!("the fake backend is refusing to arm {root}");
         }
         Ok(())
@@ -726,4 +746,193 @@ async fn status_json(router: &Router) -> Value {
         .await
         .unwrap();
     serde_json::from_slice(&bytes).expect("status is JSON")
+}
+
+// ---------------------------------------------------------------------------
+// Declared extent: a project is watched through every root it is made of
+// (D-0022)
+// ---------------------------------------------------------------------------
+
+/// A project root and a sibling directory to mount, plus a written
+/// `.lore.toml` — real paths, because `Sources` canonicalizes and reads from
+/// disk and a hand-built path would test neither.
+struct Mounted {
+    _parent: TempDir,
+    root: Utf8PathBuf,
+    engine: Utf8PathBuf,
+}
+
+impl Mounted {
+    /// `declare` false leaves the project as its own root, so a test can watch
+    /// the extent *change*.
+    fn new(declare: bool) -> Self {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let parent_path = canonicalize_root(parent.path()).expect("canonical parent");
+        let root = parent_path.join("project");
+        let engine = parent_path.join("engine");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(&engine).unwrap();
+        let mounted = Self {
+            _parent: parent,
+            root,
+            engine,
+        };
+        if declare {
+            mounted.declare();
+        }
+        mounted
+    }
+
+    /// Write the table naming both roots. Relative, which is the only form
+    /// `[[sources]]` accepts.
+    fn declare(&self) {
+        std::fs::write(
+            self.root.join(lore::repo_config::REPO_CONFIG_FILE),
+            "[[sources]]\npath = \".\"\n\n[[sources]]\npath = \"../engine\"\nmount = \"engine\"\n",
+        )
+        .unwrap();
+    }
+
+    fn project(&self, id: ProjectId) -> Project {
+        project(id, self.root.as_str(), "mounted")
+    }
+}
+
+/// A declared mount is watched, not merely indexed.
+///
+/// Without this a mount refreshed on a full scan and then never again — the
+/// silent staleness D-0021 refused to accept for links, arriving through the
+/// mechanism built to replace them.
+#[tokio::test]
+async fn every_declared_root_is_armed() {
+    let tree = Mounted::new(true);
+    let backend = FakeBackend::default();
+    let seam = Seam::new(backend.clone());
+    seam.want(&tree.project(1));
+    seam.wait_armed(1).await;
+
+    let armed = backend.armed_paths();
+    assert!(armed.contains(&tree.root), "the project root: {armed:?}");
+    assert!(armed.contains(&tree.engine), "and the mount: {armed:?}");
+}
+
+/// An edit inside a mount is queued under the mount's prefix, because that is
+/// the path the index knows. Queuing the physical path would name a file the
+/// store has never heard of.
+#[tokio::test]
+async fn an_edit_inside_a_mount_is_queued_under_its_prefix() {
+    let tree = Mounted::new(true);
+    let mut seam = Seam::new(FakeBackend::default());
+    seam.want(&tree.project(1));
+    seam.wait_armed(1).await;
+
+    seam.emit(&[tree.engine.join("render.rs").as_str()]);
+    wait_until("the mounted edit to be queued", || {
+        seam.collect();
+        !seam.paths_for(1).is_empty()
+    })
+    .await;
+    assert_eq!(seam.paths_for(1), ["engine/render.rs"]);
+}
+
+/// Editing `.lore.toml` changes what the project *is*, so the pump re-reads it
+/// and arms whatever it now names. Without this a newly declared mount would
+/// index once on the rescan and then go stale forever — live for the root,
+/// dead for the mount, with nothing saying so.
+#[tokio::test]
+async fn declaring_a_mount_arms_it_without_a_restart() {
+    let tree = Mounted::new(false);
+    let backend = FakeBackend::default();
+    let mut seam = Seam::new(backend.clone());
+    seam.want(&tree.project(1));
+    seam.wait_armed(1).await;
+    assert!(
+        !backend.armed_paths().contains(&tree.engine),
+        "nothing declared it yet"
+    );
+
+    tree.declare();
+    seam.emit(&[tree.root.join(lore::repo_config::REPO_CONFIG_FILE).as_str()]);
+
+    wait_until("the newly declared mount to be armed", || {
+        seam.collect();
+        backend.armed_paths().contains(&tree.engine)
+    })
+    .await;
+    assert!(
+        seam.full_for(1),
+        "and the extent change is a rescan, not an incremental edit"
+    );
+}
+
+/// A project whose content is entirely external still has to see its own
+/// configuration change, so its root is watched even though no source owns it.
+///
+/// Watching is not indexing, and the second half is the point: an ordinary
+/// file at that root reaches no queue, because no declared source claims it.
+#[tokio::test]
+async fn a_root_that_is_not_a_source_is_watched_only_for_its_config() {
+    let tree = Mounted::new(false);
+    std::fs::write(
+        tree.root.join(lore::repo_config::REPO_CONFIG_FILE),
+        "[[sources]]\npath = \"../engine\"\nmount = \"engine\"\n",
+    )
+    .unwrap();
+    let backend = FakeBackend::default();
+    let mut seam = Seam::new(backend.clone());
+    seam.want(&tree.project(1));
+    seam.wait_armed(1).await;
+
+    assert!(
+        backend.armed_paths().contains(&tree.root),
+        "the root is armed for its config: {:?}",
+        backend.armed_paths()
+    );
+
+    // An ordinary file there belongs to no source, so it is not project
+    // content and must not be queued under any prefix.
+    seam.emit(&[tree.root.join("src/stray.rs").as_str()]);
+    // A mounted edit in the same batch gives the wait something to succeed on,
+    // so this is not a sleep dressed up as an assertion.
+    seam.emit(&[tree.engine.join("real.rs").as_str()]);
+    wait_until("the mounted edit to arrive", || {
+        seam.collect();
+        !seam.paths_for(1).is_empty()
+    })
+    .await;
+    assert_eq!(
+        seam.paths_for(1),
+        ["engine/real.rs"],
+        "the unowned path reached no queue"
+    );
+}
+
+/// Coverage is reported pessimistically: a project with one unreachable root
+/// is not covered, however many of its others are fine.
+///
+/// Reporting `Armed` because most of it worked is the silent degradation this
+/// field exists to prevent — and a mount on a disconnected volume is the
+/// likeliest way a project ends up partly watched.
+#[tokio::test]
+async fn a_project_with_one_unreachable_root_reports_retrying() {
+    let tree = Mounted::new(true);
+    let backend = FakeBackend::default();
+    backend.refuse_only(&tree.engine);
+    let seam = Seam::new(backend.clone());
+    seam.want(&tree.project(1));
+
+    wait_until("the reachable root to be armed", || {
+        backend.armed_paths().contains(&tree.root)
+    })
+    .await;
+    assert_eq!(
+        seam.status.of(1),
+        WatchState::Retrying,
+        "one refused root keeps the whole project short of covered"
+    );
+
+    // And it recovers as a whole once the volume answers.
+    backend.allow();
+    backend.allow_all_roots();
+    seam.wait_armed(1).await;
 }
