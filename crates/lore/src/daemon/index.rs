@@ -521,7 +521,10 @@ fn refresh_authority(
             project = %project.name,
             path = %violation.path,
             detail = %violation.detail,
-            "decision record excluded from the active set"
+            // Covers both kinds the resolver reports: a record excluded from
+            // the active set, and a project carrying more than one authority
+            // root. The detail says which.
+            "decision corpus defect"
         );
     }
     summary.decision_violations = decisions.violations.len();

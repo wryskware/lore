@@ -406,11 +406,13 @@ pub struct DecisionEntry {
 ///
 /// Distinct from [`Demotion`]: a demotion is a verdict about one *document's*
 /// ranking, this is a defect in the decision corpus itself — a record whose
-/// heading and filename disagree, or two records claiming one id. Both kinds
-/// end up in `lore status`, from different columns.
+/// heading and filename disagree, two records claiming one id, or a project
+/// carrying more than one authority root (see [`namespace_warnings`]). Both
+/// kinds end up in `lore status`, from different columns.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DecisionViolation {
-    /// Project-relative path of the offending file.
+    /// Project-relative path of the offending file, or of the offending
+    /// authority root.
     pub path: Utf8PathBuf,
     pub detail: String,
 }
@@ -444,6 +446,9 @@ pub struct Decisions {
 pub struct DecisionIndex {
     entries: Vec<Origin>,
     violations: Vec<DecisionViolation>,
+    /// Distinct `0_Canon` directories decisions were read from — the project's
+    /// authority roots. More than one is the D-0012 namespace hazard (#17).
+    roots: BTreeSet<Utf8PathBuf>,
 }
 
 #[derive(Debug)]
@@ -462,6 +467,8 @@ impl DecisionIndex {
     /// degrades to a smaller active set — which demotes over-claiming
     /// documents — rather than failing the index pass.
     pub fn add_ledger(&mut self, path: &Utf8Path, src: &str) {
+        self.roots
+            .insert(path.parent().unwrap_or(Utf8Path::new("")).to_owned());
         for entry in ledger_entries(src) {
             self.entries.push(Origin {
                 path: path.to_owned(),
@@ -479,6 +486,11 @@ impl DecisionIndex {
         let Some(id) = decision_record_id(path) else {
             return;
         };
+        // `<root>/0_Canon/decisions/D-NNNN-slug.md` — two levels up is the
+        // authority root, the same one the mono ledger sits directly in.
+        if let Some(root) = path.parent().and_then(Utf8Path::parent) {
+            self.roots.insert(root.to_owned());
+        }
         match parse_record(&id, src) {
             Ok(entry) => self.entries.push(Origin {
                 path: path.to_owned(),
@@ -562,6 +574,7 @@ impl DecisionIndex {
             // resolution.
         }
         self.violations.extend(collisions);
+        self.violations.extend(namespace_warnings(&self.roots));
         self.violations
             .sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.detail.cmp(&b.detail)));
 
@@ -589,6 +602,38 @@ impl DecisionIndex {
             violations: self.violations,
         }
     }
+}
+
+/// The interim warning for #17's deferred hazard: one warning per authority
+/// root beyond the first.
+///
+/// Every recognized ledger and record under a registered project feeds **one**
+/// project-wide active set, so two embedded vaults both defining `D-0001` let
+/// either domain's entry validate the other's `decided` documents. D-0012
+/// defers resolving that — nearest-root resolution, enforced single roots and
+/// profile-qualified namespaces are all still open, and fixing it before
+/// D-0013's discovery model settles would be redone — so this only *names* the
+/// condition. Nothing here changes how an id is resolved or validated.
+///
+/// Warned on multiplicity, not on observed collisions: the roots share the
+/// namespace whether or not they have collided yet, and the first collision is
+/// silent by construction.
+fn namespace_warnings(roots: &BTreeSet<Utf8PathBuf>) -> Vec<DecisionViolation> {
+    let mut roots = roots.iter();
+    let Some(first) = roots.next() else {
+        return Vec::new();
+    };
+    roots
+        .map(|root| DecisionViolation {
+            path: root.clone(),
+            detail: format!(
+                "second authority root: decision ids here share one project-wide \
+                 namespace with {first}, so an entry in either can validate \
+                 `decided` documents belonging to the other (D-0012 defers \
+                 namespace resolution; lore-v1 limitation)"
+            ),
+        })
+        .collect()
 }
 
 /// Every `## D-NNNN` entry of a mono ledger, in file order.
@@ -1268,6 +1313,92 @@ mod tests {
         assert!(resolved.active.is_empty(), "{resolved:?}");
         assert_eq!(resolved.total, 0);
         assert_eq!(resolved.violations.len(), 2, "both are named");
+    }
+
+    /// #17, the interim warning only. Two embedded vaults in one project feed
+    /// one project-wide active set, so either root's `D-0001` can validate the
+    /// other's `decided` documents. D-0012 defers the fix; until then the
+    /// condition is *named* — and resolution is deliberately left exactly as
+    /// it was, union and all.
+    ///
+    /// No registered repository has two vaults today, so the situation only
+    /// exists in a fixture like this one.
+    #[test]
+    fn more_than_one_authority_root_is_warned_about_without_changing_resolution() {
+        let entry = |id: &str| {
+            format!("## {id} — Something\n- **Status:** Accepted\n- **Supersedes:** None\n")
+        };
+
+        // One root: the ordinary case, and it must stay silent.
+        let mut index = DecisionIndex::default();
+        index.add_ledger(
+            Utf8Path::new("design/0_Canon/DECISIONS.md"),
+            &entry("D-0001"),
+        );
+        index.add_record(
+            &record("D-0002"),
+            "- **Status:** Accepted\n- **Supersedes:** None\n",
+        );
+        assert!(
+            index.resolve().violations.is_empty(),
+            "one vault is not a namespace collision"
+        );
+
+        // Two vaults, both defining D-0001 — the hazard itself.
+        let mut index = DecisionIndex::default();
+        index.add_ledger(
+            Utf8Path::new("design/0_Canon/DECISIONS.md"),
+            &entry("D-0001"),
+        );
+        index.add_ledger(
+            Utf8Path::new("vendor/widget/docs/0_Canon/DECISIONS.md"),
+            &entry("D-0001"),
+        );
+        let resolved = index.resolve();
+
+        assert_eq!(
+            resolved.violations.len(),
+            1,
+            "one warning per extra root: {resolved:?}"
+        );
+        let warning = &resolved.violations[0];
+        assert_eq!(warning.path, "vendor/widget/docs/0_Canon");
+        assert!(
+            warning.detail.contains("design/0_Canon") && warning.detail.contains("D-0012"),
+            "{warning:?}"
+        );
+
+        // Resolution is untouched: still the union, still one active id, and
+        // the duplicate is still not an exclusion.
+        assert_eq!(
+            resolved
+                .active
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["D-0001"]
+        );
+        assert_eq!(resolved.total, 1);
+
+        // A per-file record in a second vault is the same hazard: the root is
+        // two levels above the record, not one.
+        let mut index = DecisionIndex::default();
+        index.add_record(
+            &record("D-0001"),
+            "- **Status:** Accepted\n- **Supersedes:** None\n",
+        );
+        index.add_record(
+            Utf8Path::new("vendor/widget/docs/0_Canon/decisions/D-0001-theirs.md"),
+            "- **Status:** Accepted\n- **Supersedes:** None\n",
+        );
+        let resolved = index.resolve();
+        assert!(
+            resolved
+                .violations
+                .iter()
+                .any(|v| v.path == "vendor/widget/docs/0_Canon"),
+            "{resolved:?}"
+        );
     }
 
     /// A record whose first heading is a plain title is still identified by
