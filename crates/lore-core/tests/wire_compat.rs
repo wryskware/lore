@@ -23,7 +23,10 @@
 
 use lore_core::{
     ExpandRequest, ProjectInfo, ProjectStatus, SearchRequest, SearchResult, WatchState,
-    snapshot::MassDeleteTrip,
+    snapshot::{
+        Manifest, MassDeleteTrip, PushCommitResponse, PushFileResponse, PushLeaseResponse,
+        PushManifestRequest, PushManifestResponse,
+    },
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -294,6 +297,12 @@ fn a_response_from_a_daemon_that_predates_this_change_still_deserializes() {
     assert_eq!(parsed.authority_config_error, None);
     assert_eq!((parsed.decisions_active, parsed.decisions_total), (0, 0));
     assert!(parsed.decision_violations.is_empty());
+    // A daemon that predates the push surface reports no lease and nothing
+    // staged, which is also exactly what a purely local project looks like on a
+    // current daemon — the honest reading either way.
+    assert_eq!(parsed.push_lease_epoch, None);
+    assert!(!parsed.push_staged);
+    assert_eq!(parsed.mass_delete_guard, None);
 
     // The request direction: an old client sends no `sources` and no
     // `project_key`, and a new daemon must accept both bodies.
@@ -308,6 +317,61 @@ fn a_response_from_a_daemon_that_predates_this_change_still_deserializes() {
             .expect("old expand parses");
     assert_eq!(old_expand.project_key, None);
     assert_eq!(old_expand.context_lines, None);
+}
+
+/// The push protocol's own additive fields (D-0015).
+///
+/// A pusher is a `lore` binary talking to a daemon that may be older or newer
+/// than it, over a protocol whose whole point is that a lost or partial message
+/// is harmless. Every field the contract marks additive is therefore asserted
+/// absent-and-defaulted here, from both ends of the flow: the daemon's
+/// advertised cadence, the per-invocation override a client sends, and the
+/// three progress counters it reads back.
+#[test]
+fn a_push_message_missing_its_additive_fields_still_parses() {
+    // Daemon → pusher: a receiver that predates the advertised floor says
+    // nothing about it, and a pusher must read that as "no floor" rather than
+    // failing to take a lease at all.
+    let lease: PushLeaseResponse = serde_json::from_value(json!({
+        "session": "9f3a1c2b9f3a1c2b9f3a1c2b9f3a1c2b",
+        "epoch": 7,
+        "ttl_secs": 30,
+        "heartbeat_secs": 10
+    }))
+    .expect("a lease response without the advertised floor still parses");
+    assert_eq!(lease.session.0, "9f3a1c2b9f3a1c2b9f3a1c2b9f3a1c2b");
+    assert_eq!(lease.epoch.0, 7);
+    assert_eq!(lease.min_push_interval_secs, 0, "absent means no floor");
+
+    // Pusher → daemon: the mass-delete override is a per-invocation decision by
+    // a human, so its absence is the answer "no", never a parse failure.
+    let manifest: PushManifestRequest = serde_json::from_value(json!({
+        "project": "lore",
+        "session": "9f3a1c2b9f3a1c2b9f3a1c2b9f3a1c2b",
+        "epoch": 7,
+        "manifest": Manifest::new(vec![])
+    }))
+    .expect("a manifest request without the override still parses");
+    assert!(!manifest.allow_mass_delete);
+
+    // Daemon → pusher, the three answers. Each carries a count that arrived
+    // after the field beside it, and a client reading `0` degrades to "the
+    // daemon did not say" rather than to a failed push.
+    let needed: PushManifestResponse =
+        serde_json::from_value(json!({ "needed": ["src/lib.rs"] })).expect("needed-only parses");
+    assert_eq!(needed.needed, ["src/lib.rs"]);
+    assert_eq!(needed.deletes, 0);
+
+    let staged: PushFileResponse =
+        serde_json::from_value(json!({ "staged": 3 })).expect("staged-only parses");
+    assert_eq!((staged.staged, staged.needed), (3, 0));
+
+    let committed: PushCommitResponse =
+        serde_json::from_value(json!({ "generation": 42 })).expect("generation-only parses");
+    assert_eq!(
+        (committed.generation, committed.indexed, committed.deleted),
+        (42, 0, 0)
+    );
 }
 
 // The response shapes exactly as they were before package 3, re-declared so a

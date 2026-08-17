@@ -499,3 +499,59 @@ fn a_snapshot_that_would_delete_most_of_a_project_is_refused_until_overridden() 
     assert!(forced.mass_delete_blocked.is_none(), "{forced:?}");
     assert_eq!(fixture.indexed_paths().len(), 50);
 }
+
+/// A trip is *remembered*, not merely returned to whoever ran the pass.
+///
+/// D-0015 requires a tripped guard to be visible in `status`, and what `status`
+/// reports is this record. It has to survive every subsequent refused pass —
+/// the watcher keeps re-observing the same shrunken tree — and clear only when
+/// an apply actually succeeds, which for a deletion the human meant is
+/// `lore index --allow-mass-delete`.
+#[test]
+fn a_tripped_guard_is_remembered_until_a_pass_succeeds() {
+    let fixture = Fixture::new("demo");
+    // One context for every pass here: the daemon has one, and a record that
+    // did not outlive the pass that made it would report nothing.
+    let ctx = fixture.context();
+    for i in 0..120 {
+        fixture.write(&format!("src/f{i}.rs"), rust_fn("f", i));
+    }
+    full_scan(&ctx, &fixture.project);
+    assert_eq!(
+        ctx.guard.of(fixture.project.id),
+        None,
+        "a project whose index is tracking it reports no trip"
+    );
+
+    for i in 0..110 {
+        fixture.remove(&format!("src/f{i}.rs"));
+    }
+    full_scan(&ctx, &fixture.project);
+    assert_eq!(
+        ctx.guard
+            .of(fixture.project.id)
+            .map(|trip| (trip.deletes, trip.stored)),
+        Some((110, 120)),
+        "the numbers that refused the apply are the ones `status` shows"
+    );
+
+    // The tree is still shrunken, so the next pass refuses identically. A
+    // record that reset itself here would make a stuck index look healthy
+    // between passes.
+    full_scan(&ctx, &fixture.project);
+    assert!(ctx.guard.of(fixture.project.id).is_some());
+
+    full_scan_with(
+        &ctx,
+        &fixture.project,
+        ApplyOptions {
+            allow_mass_delete: true,
+        },
+    );
+    assert_eq!(
+        ctx.guard.of(fixture.project.id),
+        None,
+        "the deletion the human authorized clears the trip"
+    );
+    assert_eq!(fixture.indexed_paths().len(), 10);
+}
