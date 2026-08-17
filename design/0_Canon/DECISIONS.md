@@ -197,3 +197,15 @@ Append-only. Newest entries at the bottom. Schema per [[README]].
 - **Consequences:** The wire contract's project identifier (already mandatory per the shipped scoping work) resolves against the registry binding. The scoping brief's Resolution section is closed by this entry.
 - **Supersedes:** None
 - **Canonical sources:** [[../4_Interfaces/2026-08-16_project-scoping-decision-brief]]; [[../1_Architecture/1.2_Ingestion]]
+
+## D-0017 — Manifest basis for git repos: git-aware, not tracked-only
+
+- **Date:** 2026-08-17
+- **Status:** Accepted
+- **Scope:** The git-repo manifest basis (amends one D-0015 clause)
+- **Decided by:** Wrysk (option (b), 2026-08-17)
+- **Decision:** A git repo's manifest basis is **git-aware**: tracked files plus untracked files not excluded by gitignore (`git ls-files --cached --others --exclude-standard` semantics), intersected with lore's ignore rules. The credential hard-excludes still apply on top and remain non-overridable by `.loreignore`. Non-git projects are unchanged (walker + hard-excludes).
+- **Rationale:** Tracked-only made a brand-new file invisible to the index until `git add` — a freshness regression in exactly the agent workflow Lore serves, discovered at implementation time. `.gitignore` is where secrets actually live, so the practical leak protection is preserved; the only content git-aware admits that tracked-only refused is untracked-un-gitignored files, which the pre-D-0015 walker indexed anyway and which the hard-excludes still screen.
+- **Consequences:** The pusher-side basis implementation targets this; D-0015's secrecy layering is otherwise unchanged.
+- **Supersedes:** D-0015's git-tracked-files-only clause only ("git repos default to git-tracked-files-only manifests"); every other D-0015 clause stands.
+- **Canonical sources:** [[../1_Architecture/1.2_Ingestion]]
