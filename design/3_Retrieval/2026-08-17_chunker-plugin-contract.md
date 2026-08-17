@@ -1,7 +1,8 @@
 ---
-design_status: leaning
+design_status: decided
 last_reviewed: 2026-08-17
 decision_refs:
+  - D-0023
   - D-0004
   - D-0005
   - D-0015
@@ -10,12 +11,12 @@ decision_refs:
 # Chunker plugin contract — declarative core, WASM grammars
 
 Outcome of the M2 contract session (2026-08-17), planning against the framing
-notes in [[2026-08-16_pluggable-chunkers-brief]]. Wrysk endorsed the mechanism
-direction in that session ("declarative + WASM grammars — 100% for it") and
-the built-in disposition below; **no ledger entry exists yet**, so this
-document is `leaning`: the direction is set, the material doubt is the
-wasmtime feasibility spike running against it. A proposed decision entry is
-drafted at the bottom, unpromoted per canon rules.
+notes in [[2026-08-16_pluggable-chunkers-brief]]. Wrysk chose the mechanism in
+that session ("declarative + WASM grammars — 100% for it"), the contract was
+implemented and dogfooded the same day, and Wrysk promoted the decision:
+**this document is the canonical source of [[../0_Canon/DECISIONS#D-0023 — Chunker plugins: declarative contract, WASM grammars|D-0023]]**,
+which binds the summary there; prose here that goes beyond the entry is
+detail, not additional requirement.
 
 Related: [[3.1_Chunking_and_Ranking]] (current chunking, `leaning`),
 [[../1_Architecture/1.2_Ingestion]] (D-0015, decided),
@@ -146,7 +147,7 @@ are actively marked for migration —
 
 ## Amendments owed if adopted
 
-On promotion of the decision below: 3.1's file-class table drops the
+Executed with D-0023's promotion (2026-08-17): 3.1's file-class table drops the
 UXML/USS and Unity-YAML rows in favor of a "plugin-routed" row; 5.1's M2
 line replaces "UXML/USS first-class; bounded experimental Unity YAML" with
 "chunker plugin contract"; 5.1's Go/C/C++ backlog item re-points at plugin
@@ -229,22 +230,12 @@ Performance is explicitly *not* an open question: the 2026-08-16 perf
 session measured drain (embedding) at ~99% of index wall time; a wasm-speed
 parse path is invisible in total index time.
 
-## Proposed decision entry (draft — unpromoted)
+## Decision entry
 
-Drafted for Wrysk to promote or edit; not an accepted entry.
-
-```markdown
-## D-00XX — Chunker plugins: declarative contract, WASM grammars
-
-- **Date:** (on promotion)
-- **Status:** Proposed
-- **Scope:** Chunking extensibility (amends 3.1 file-class table and the 5.1 M2 line; touches D-0004, D-0005, D-0015)
-- **Decided by:** Wrysk (M2 contract session, 2026-08-17)
-- **Decision:** File-type support beyond the built-in set arrives via **declarative chunker plugins**: a manifest plus assets, no plugin code. Strategies: tree-sitter grammars compiled to WASM (loaded at runtime, memory-isolated, mapped onto the internal Spec walker) and configured line-windowing. Wasm plugin support is a Cargo feature of core. Core alone derives chunk IDs, builds embedding headers, and extracts authority metadata; built-ins win extension conflicts and `.md` is never claimable. Per-plugin invalidation via content fingerprint (manifest + assets) folded into the per-file hash. Plugins install daemon-side (receiver-side in remote mode, advertised in the push surface); projects opt in via `.lore.toml`; absent-plugin fallback is surfaced in `status`, never silent. Unity support (UXML/USS/serialized YAML) ships as the first out-of-tree plugin, not as core features. In-tree language chunkers are marked for migration (feature-gate, then plugin crates); Markdown stays native.
-- **Rationale:** Data-only plugins make the brief's constraints structural instead of policed; the measured embedding-bound perf budget absorbs wasm parse cost; WASM grammars are single-artifact and sandboxed where native DLLs are neither.
-- **Supersedes:** None (amends the 3.1/5.1 prose listed in Scope).
-- **Canonical sources:** [[../3_Retrieval/2026-08-17_chunker-plugin-contract]]; [[../3_Retrieval/2026-08-16_pluggable-chunkers-brief]]
-```
+Promoted by Wrysk as **D-0023** (2026-08-17) — see
+[[../0_Canon/DECISIONS]]. The draft that previously sat here moved into the
+ledger, updated to the implemented reality (enabled-scope contest
+settlement, fingerprint-only versioning, the first-consumer consequences).
 
 ## Implementation plan
 
