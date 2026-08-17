@@ -7,7 +7,7 @@ use rusqlite_migration::{M, Migrations};
 
 /// Ordered migration list. Index + 1 == `user_version` after application.
 pub(crate) fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(V1), M::up(V2), M::up(V3)])
+    Migrations::new(vec![M::up(V1), M::up(V2), M::up(V3), M::up(V4)])
 }
 
 /// v1 — initial schema.
@@ -220,4 +220,23 @@ ALTER TABLE projects ADD COLUMN authority_error    TEXT;
 ALTER TABLE projects ADD COLUMN decisions_total    INTEGER NOT NULL DEFAULT 0;
 -- serde_json array of authority::DecisionViolation; NULL == none.
 ALTER TABLE projects ADD COLUMN decision_violations TEXT;
+"#;
+
+/// v4 — the push epoch survives a restart (D-0015).
+///
+/// The lease itself is process state: a daemon that restarts holds no leases,
+/// and every pusher has to acquire again. The *epoch* cannot be, because it is
+/// the thing that makes a stale pusher's commit refusable. If a restart minted
+/// epoch 1 again, a pusher still holding a handle stamped with the previous
+/// run's epoch 1 would look current, and its snapshot — observed before
+/// whatever the restart was for — could publish over a newer one.
+///
+/// So the counter lives on the project row and only ever increments, in the
+/// same statement that reads it (`UPDATE ... RETURNING`), which is what makes
+/// two simultaneous acquirers get two distinct epochs with a defined order.
+/// Nothing resets it: a project removed and re-added is a new row, and a new
+/// row starting at 0 is correct, because no handle can name a project id that
+/// did not exist when the handle was minted.
+const V4: &str = r#"
+ALTER TABLE projects ADD COLUMN push_epoch INTEGER NOT NULL DEFAULT 0;
 "#;

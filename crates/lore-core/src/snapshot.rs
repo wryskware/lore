@@ -141,8 +141,49 @@ impl fmt::Display for PushEpoch {
 }
 
 // ---------------------------------------------------------------------------
-// The push flow: manifest → needed paths → upload → commit
+// The push flow: lease → manifest → needed paths → upload → commit
 // ---------------------------------------------------------------------------
+
+/// Step 1 of the push flow: claim the project's push lease.
+///
+/// Conflict policy is **takeover** (D-0015): an acquire always succeeds and
+/// bumps the epoch, displacing whoever held it. There is nothing to
+/// authorize — a lease is a consistency primitive, and the daemon has no
+/// users and no roles.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushLeaseRequest {
+    /// Project identity — the registry-bound declared name (D-0016).
+    pub project: String,
+}
+
+/// The lease, plus the two cadences the pusher has to respect to keep it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushLeaseResponse {
+    pub session: PushSessionId,
+    pub epoch: PushEpoch,
+    /// Seconds of silence after which the daemon reaps this lease and deletes
+    /// its staging area. Every accepted push request counts as proof of life,
+    /// so the heartbeat below is only for the gaps between them.
+    pub ttl_secs: u64,
+    /// How often to renew while idle. Comfortably inside [`Self::ttl_secs`].
+    pub heartbeat_secs: u64,
+    /// The receiving daemon's floor on how often it accepts a manifest for one
+    /// project. Advertised so a pusher can pace itself rather than discover the
+    /// floor by being refused (D-0015: "a receiving daemon enforces a hard
+    /// minimum push interval and rejects clients configured hotter").
+    #[serde(default)]
+    pub min_push_interval_secs: u64,
+}
+
+/// Heartbeat: keep an idle lease alive. Names its epoch like every other push
+/// request, so a renewal from a session that has been taken over is refused
+/// rather than silently resurrecting it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushRenewRequest {
+    pub project: String,
+    pub session: PushSessionId,
+    pub epoch: PushEpoch,
+}
 
 /// Step 2 of the push flow: here is the whole listing, tell me what you need.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,6 +216,36 @@ pub struct PushManifestResponse {
     /// listing looks like a catastrophe *before* uploading anything.
     #[serde(default)]
     pub deletes: u64,
+}
+
+/// Step 3 of the push flow: one needed path's content.
+///
+/// The bytes travel as the request *body*, unencoded, so the largest messages
+/// in the protocol do not pay a base64 third on top of themselves; everything
+/// that identifies the upload travels as query parameters instead. That is why
+/// this is the one wire type here that is not a JSON document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushFileParams {
+    pub project: String,
+    pub session: PushSessionId,
+    pub epoch: PushEpoch,
+    /// Project-relative path, forward slashes — and it must be one the
+    /// session's manifest listed. The receiver never derives a filesystem path
+    /// from this string (staged content is stored under its own hash), so a
+    /// traversal attempt is a lookup miss rather than an escape.
+    pub path: String,
+}
+
+/// What the receiver has, after staging one upload.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PushFileResponse {
+    /// Needed paths whose content is now staged.
+    pub staged: u64,
+    /// Needed paths still missing. The commit refuses while this is non-zero:
+    /// an unstaged path would otherwise read as absent content, and absence is
+    /// how this protocol spells deletion.
+    #[serde(default)]
+    pub needed: u64,
 }
 
 /// Step 4 of the push flow: publish everything staged under this session.

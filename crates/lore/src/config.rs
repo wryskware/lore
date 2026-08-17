@@ -61,11 +61,42 @@ pub const DEFAULT_MODEL_ID: &str = "default";
 /// An operational default, tunable without a new decision.
 pub const DEFAULT_WATCH_DEBOUNCE_SECS: u64 = 20;
 
+/// Floor on how often a *receiving* daemon accepts a manifest for one project
+/// (D-0015: "a receiving daemon enforces a hard minimum push interval and
+/// rejects clients configured hotter").
+///
+/// Ten seconds, half the watcher debounce above: a pusher pacing itself at the
+/// intended ~20s cadence never comes near the floor even with jitter or a
+/// manual `lore index` in between, while a client configured for the sub-10s
+/// freshness D-0015 says buys nothing is refused by name rather than quietly
+/// costing the daemon a pass, a generation bump and an embed wake per push.
+///
+/// It is a floor, not a schedule: nothing here makes a slow pusher push, and
+/// the refusal names the number so a misconfigured client can be fixed.
+///
+/// An operational default, tunable without a new decision.
+pub const DEFAULT_PUSH_MIN_INTERVAL_SECS: u64 = 10;
+
+/// How long a push lease survives silence before the daemon reaps it and
+/// deletes its staging area.
+///
+/// Thirty seconds. With takeover as the conflict policy (D-0015) the TTL never
+/// blocks a successor — an acquirer displaces the holder immediately, whatever
+/// the clock says — so this number only decides how long a dead pusher's
+/// staged files sit on disk and how long `status` keeps naming an epoch nobody
+/// holds. Long enough that an ordinary pause between uploads is not a lost
+/// lease; short enough that a crashed pusher is forgotten in seconds rather
+/// than at cleanup.
+///
+/// An operational default, tunable without a new decision.
+pub const DEFAULT_PUSH_LEASE_TTL_SECS: u64 = 30;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub embeddings: EmbeddingsConfig,
     pub watcher: WatcherConfig,
+    pub push: PushConfig,
 }
 
 /// Filesystem-watch behaviour.
@@ -93,6 +124,58 @@ impl WatcherConfig {
     /// pump exists to prevent. `lore index` is the immediate path.
     pub fn debounce(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.debounce_secs.max(1))
+    }
+}
+
+/// The receiving side of the push protocol (D-0015).
+///
+/// Both keys are the *receiver's* policy, which is why they live here and the
+/// mass-delete override does not: the override is a human's per-invocation
+/// decision about one push and D-0015 forbids it as a config key, while these
+/// two describe what this daemon will put up with from any client at all.
+///
+/// Nothing here is an authorization concept. The daemon still binds loopback
+/// only, has no users and no roles; a lease is a consistency primitive and
+/// these are its cadences.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PushConfig {
+    /// Seconds that must pass between accepted manifests for one project.
+    pub min_interval_secs: u64,
+    /// Seconds of silence before a push lease is reaped and its staging area
+    /// deleted.
+    pub lease_ttl_secs: u64,
+}
+
+impl Default for PushConfig {
+    fn default() -> Self {
+        Self {
+            min_interval_secs: DEFAULT_PUSH_MIN_INTERVAL_SECS,
+            lease_ttl_secs: DEFAULT_PUSH_LEASE_TTL_SECS,
+        }
+    }
+}
+
+impl PushConfig {
+    /// The floor as handed to the lease manager. Zero is honoured: a
+    /// deployment whose pusher *is* the cadence (a test, a one-shot forwarder)
+    /// can switch the floor off, which is different from the debounce's clamp
+    /// because a floor of zero is a coherent policy while a debounce of zero is
+    /// a debouncer that fires once per event.
+    pub fn min_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.min_interval_secs)
+    }
+
+    /// Clamped to a second at the bottom: a zero TTL would reap every lease
+    /// before its holder could use it.
+    pub fn lease_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.lease_ttl_secs.max(1))
+    }
+
+    /// The renewal cadence advertised to pushers — a third of the TTL, so two
+    /// heartbeats can be lost before a lease is at risk.
+    pub fn heartbeat(&self) -> std::time::Duration {
+        std::time::Duration::from_secs((self.lease_ttl_secs / 3).max(1))
     }
 }
 

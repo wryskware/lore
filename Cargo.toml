@@ -25,6 +25,11 @@ dirs = "6"
 # concurrently. Already in the tree transitively (reqwest, axum), so the
 # direct pin adds no weight; default features off keeps it that way.
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+# OS randomness, for push session handles (D-0015: unguessable, bound to
+# project + epoch). Already in the tree transitively, so the direct pin adds no
+# weight, and the alternative — deriving handles from a counter or a clock —
+# would make a handle guessable, which is the one property it has to have.
+getrandom = "0.4"
 # ripgrep's walker: gitignore semantics (including nested and parent
 # `.gitignore` files) for free, which the indexer needs to match what a
 # developer expects to be searchable.

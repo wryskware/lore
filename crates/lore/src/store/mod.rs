@@ -1071,6 +1071,28 @@ impl Store {
         Ok(g as u64)
     }
 
+    /// Mint the next push epoch for one project (D-0015).
+    ///
+    /// Read and increment in one statement, so two acquirers racing for the
+    /// same project's lease get two distinct epochs and a defined winner — the
+    /// higher one. Persisted rather than kept in memory so a restart can never
+    /// re-mint an epoch a live pusher is still carrying; see the v4 migration.
+    ///
+    /// `Ok(None)` for an unregistered project, which is how a lease acquired
+    /// for a project removed mid-flight fails rather than silently creating
+    /// state for a row that is gone.
+    pub fn bump_push_epoch(&mut self, project: ProjectId) -> Result<Option<u64>> {
+        let epoch: Option<i64> = self
+            .conn
+            .query_row(
+                "UPDATE projects SET push_epoch = push_epoch + 1 WHERE id = ? RETURNING push_epoch",
+                [project],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(epoch.map(|epoch| epoch as u64))
+    }
+
     pub fn status(&self) -> Result<Status> {
         let mut stmt = self.conn.prepare(
             "SELECT p.id, p.root, p.name, p.key, p.kind,
@@ -1674,7 +1696,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3, "every shipped migration applied");
+        assert_eq!(version, 4, "every shipped migration applied");
     }
 
     /// The external-content FTS5 table can drift from its content table if a

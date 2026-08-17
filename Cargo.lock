@@ -1038,6 +1038,7 @@ dependencies = [
  "clap",
  "dirs",
  "futures-util",
+ "getrandom 0.4.3",
  "ignore",
  "insta",
  "lore-core",
