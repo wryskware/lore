@@ -7,7 +7,7 @@ use rusqlite_migration::{M, Migrations};
 
 /// Ordered migration list. Index + 1 == `user_version` after application.
 pub(crate) fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(V1), M::up(V2), M::up(V3), M::up(V4)])
+    Migrations::new(vec![M::up(V1), M::up(V2), M::up(V3), M::up(V4), M::up(V5)])
 }
 
 /// v1 — initial schema.
@@ -237,6 +237,102 @@ ALTER TABLE projects ADD COLUMN decision_violations TEXT;
 /// Nothing resets it: a project removed and re-added is a new row, and a new
 /// row starting at 0 is correct, because no handle can name a project id that
 /// did not exist when the handle was minted.
+///
+/// That last clause is only true once ids stop being recycled, which is what
+/// [`V5`] makes structural.
 const V4: &str = r#"
 ALTER TABLE projects ADD COLUMN push_epoch INTEGER NOT NULL DEFAULT 0;
+"#;
+
+/// v5 — a project id is never handed out twice.
+///
+/// `id INTEGER PRIMARY KEY` is a rowid alias, and SQLite allocates a plain
+/// rowid as `max(rowid) + 1`. Delete the highest project and the next
+/// registration is handed the id that just died — so anything still holding the
+/// old id (a push handle, an in-memory lease/queue/watch entry keyed by
+/// `ProjectId`, a client that cached one) silently re-attaches to a *different*
+/// project rather than failing. Every holder defending itself against that
+/// individually is one forgotten `forget` away from the bug; the store is the
+/// only place it can be closed once.
+///
+/// `AUTOINCREMENT` is exactly that guarantee: SQLite keeps the high-water mark
+/// in `sqlite_sequence` and refuses to reuse anything at or below it, so an id
+/// is retired the moment it is allocated. The cost is one extra row read and
+/// written per insert into a table that gains rows when a human runs
+/// `lore add`, which is not a rate worth optimizing.
+///
+/// SQLite cannot `ALTER TABLE ... ADD AUTOINCREMENT`, so this is the documented
+/// table-rebuild dance: new table, copy, drop, rename. Notes on the pieces:
+///
+/// - **Every column, default and constraint is reproduced verbatim** from v1's
+///   `projects` plus the columns v2/v3/v4 appended, in the order
+///   `ALTER TABLE ADD COLUMN` left them, so a `SELECT *` reads identically
+///   before and after. `root`'s `UNIQUE` comes back with the table; the
+///   `projects_by_key` index has to be recreated by hand, because dropping a
+///   table drops its indexes.
+/// - **Rows are copied with their ids.** Existing project ids are live
+///   references (`files.project_id`, `chunks.project_id`,
+///   `embeddings.project_id`, `project_decisions.project_id`, and the manifest's
+///   view of the world); renumbering them would be a far worse bug than the one
+///   this fixes.
+/// - **The sequence is seeded above every id this database can still see.**
+///   Copying rows already pushes `sqlite_sequence` to `max(projects.id)`, but
+///   the referencing tables are the only remaining witness of an id that was
+///   allocated and then deleted — a row orphaned by an interrupted removal names
+///   an id that must never be issued again. Ids whose last trace is already
+///   gone are unknowable; for those `max + 1` is the best available floor, and
+///   the reuse window it leaves is closed for every id allocated from here on.
+/// - **Foreign keys must be off**, which is `rusqlite_migration`'s documented
+///   requirement and what [`crate::store::Store::open`] does. The guard table
+///   makes it a refusal instead of a catastrophe: with enforcement on,
+///   `DROP TABLE projects` is an implicit `DELETE` that would cascade away every
+///   file, chunk and vector in the database. `PRAGMA` is a no-op inside the
+///   migration's transaction, so aborting is the only thing left to do.
+const V5: &str = r#"
+CREATE TABLE migration_v5_guard (
+    foreign_keys INTEGER NOT NULL CHECK (foreign_keys = 0)
+);
+INSERT INTO migration_v5_guard SELECT * FROM pragma_foreign_keys;
+DROP TABLE migration_v5_guard;
+
+CREATE TABLE projects_v5 (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    root                TEXT NOT NULL UNIQUE,
+    name                TEXT NOT NULL,
+    created_at          INTEGER NOT NULL DEFAULT (unixepoch()),
+    kind                TEXT NOT NULL DEFAULT 'repo',
+    key                 TEXT,
+    authority_profile   TEXT,
+    authority_behavior  TEXT,
+    authority_error     TEXT,
+    decisions_total     INTEGER NOT NULL DEFAULT 0,
+    decision_violations TEXT,
+    push_epoch          INTEGER NOT NULL DEFAULT 0
+);
+
+INSERT INTO projects_v5 (
+    id, root, name, created_at, kind, key,
+    authority_profile, authority_behavior, authority_error,
+    decisions_total, decision_violations, push_epoch
+)
+SELECT
+    id, root, name, created_at, kind, key,
+    authority_profile, authority_behavior, authority_error,
+    decisions_total, decision_violations, push_epoch
+FROM projects;
+
+DROP TABLE projects;
+ALTER TABLE projects_v5 RENAME TO projects;
+
+CREATE UNIQUE INDEX projects_by_key ON projects(key);
+
+DELETE FROM sqlite_sequence WHERE name = 'projects';
+INSERT INTO sqlite_sequence (name, seq)
+SELECT 'projects', MAX(high_water) FROM (
+    SELECT COALESCE(MAX(id), 0)         AS high_water FROM projects
+    UNION ALL SELECT COALESCE(MAX(project_id), 0) FROM files
+    UNION ALL SELECT COALESCE(MAX(project_id), 0) FROM chunks
+    UNION ALL SELECT COALESCE(MAX(project_id), 0) FROM embeddings
+    UNION ALL SELECT COALESCE(MAX(project_id), 0) FROM project_decisions
+);
 "#;

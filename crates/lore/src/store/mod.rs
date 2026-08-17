@@ -1696,7 +1696,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4, "every shipped migration applied");
+        assert_eq!(version, 5, "every shipped migration applied");
     }
 
     /// The external-content FTS5 table can drift from its content table if a
@@ -2086,5 +2086,193 @@ mod tests {
                 "by key, each one is reachable"
             );
         }
+    }
+
+    /// Every project id ever allocated, in order.
+    fn project_ids(store: &Store) -> Vec<ProjectId> {
+        store
+            .list_projects()
+            .unwrap()
+            .iter()
+            .map(|p| p.id)
+            .collect()
+    }
+
+    /// The structural half of the deregistration hazard: a removed project's id
+    /// is retired, not recycled. Without it, every holder of a `ProjectId` — a
+    /// push handle, the lease/queue/watch maps, a client that cached one — has
+    /// to defend itself against silently re-attaching to a *different* project.
+    #[test]
+    fn a_removed_projects_id_is_never_handed_to_another_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path().join("lore.db")).unwrap();
+
+        let first = store
+            .register_project(Utf8Path::new("C:/repos/a"), "a")
+            .unwrap();
+        let second = store
+            .register_project(Utf8Path::new("C:/repos/b"), "b")
+            .unwrap();
+        assert!(store.remove_project(second).unwrap());
+
+        // Re-registering the *same* root and name is still a new project.
+        let again = store
+            .register_project(Utf8Path::new("C:/repos/b"), "b")
+            .unwrap();
+        assert!(
+            again > second,
+            "the deleted id came back: {second} -> {again}"
+        );
+        assert_ne!(again, first);
+
+        // And it stays true when the survivor is the one removed, which is the
+        // case a plain rowid alias gets right by accident.
+        assert!(store.remove_project(first).unwrap());
+        let third = store
+            .register_project(Utf8Path::new("C:/repos/c"), "c")
+            .unwrap();
+        assert!(third > again, "{third} must be past every retired id");
+    }
+
+    /// The upgrade path: a v4 database is the one that recycled ids, so the
+    /// fixture proves the reuse first and then proves the migration stops it —
+    /// while carrying every existing row, id and column across untouched.
+    #[test]
+    fn a_pre_v5_database_migrates_its_projects_and_stops_reusing_deleted_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .unwrap()
+            .join("lore.db");
+
+        // A v4 database with a project registered, deleted, and re-registered
+        // into the dead project's id — exactly what shipped.
+        {
+            let mut conn = Connection::open(&db).unwrap();
+            schema::migrations().to_version(&mut conn, 4).unwrap();
+            for (root, name, key) in [
+                ("C:/repos/keeper", "keeper", "keeper"),
+                ("C:/repos/doomed", "doomed", "doomed"),
+            ] {
+                conn.execute(
+                    "INSERT INTO projects (root, name, key) VALUES (?, ?, ?)",
+                    params![root, name, key],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "UPDATE projects SET push_epoch = 7 WHERE key = 'keeper'",
+                [],
+            )
+            .unwrap();
+            conn.execute("DELETE FROM projects WHERE key = 'doomed'", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO projects (root, name, key) VALUES ('C:/repos/next', 'next', 'next')",
+                [],
+            )
+            .unwrap();
+            let ids: Vec<i64> = conn
+                .prepare("SELECT id FROM projects ORDER BY id")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            assert_eq!(ids, vec![1, 2], "the fixture really did recycle id 2");
+        }
+
+        let mut store = Store::open(&db).unwrap();
+
+        // Nothing was renumbered, renamed or dropped on the way through.
+        let projects = store.list_projects().unwrap();
+        assert_eq!(
+            projects
+                .iter()
+                .map(|p| (p.id, p.key.as_str(), p.name.as_str(), p.root.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, "keeper", "keeper", "C:/repos/keeper"),
+                (2, "next", "next", "C:/repos/next"),
+            ]
+        );
+        let epoch: i64 = store
+            .conn
+            .query_row("SELECT push_epoch FROM projects WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(epoch, 7, "columns added after v1 survive the rebuild");
+
+        // The constraints came back with the table: `root` is still unique, and
+        // so is `key` (a separate index, which a rebuild is free to forget).
+        assert!(
+            store
+                .conn
+                .execute(
+                    "INSERT INTO projects (root, name, key) VALUES ('C:/repos/x', 'x', 'keeper')",
+                    [],
+                )
+                .is_err(),
+            "projects_by_key must survive the table rebuild"
+        );
+
+        // From here ids only ever climb, including past the id the pre-v5
+        // database had already recycled once.
+        assert!(store.remove_project(2).unwrap());
+        let fresh = store
+            .register_project(Utf8Path::new("C:/repos/fresh"), "fresh")
+            .unwrap();
+        assert_eq!(fresh, 3, "{:?}", project_ids(&store));
+        assert!(store.remove_project(fresh).unwrap());
+        assert_eq!(
+            store
+                .register_project(Utf8Path::new("C:/repos/fresher"), "fresher")
+                .unwrap(),
+            4
+        );
+    }
+
+    /// A removal interrupted between its child deletes and its project delete
+    /// leaves rows naming an id no `projects` row remembers. That orphan is the
+    /// last witness that the id was ever allocated, so the migration has to seed
+    /// the sequence above it rather than above `max(projects.id)`.
+    #[test]
+    fn migration_seeds_the_sequence_above_ids_only_orphaned_rows_still_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .unwrap()
+            .join("lore.db");
+
+        {
+            let mut conn = Connection::open(&db).unwrap();
+            // An orphan is by definition a row no live enforcement would let in;
+            // this build enforces foreign keys by default, so the fixture has to
+            // turn them off to reproduce what an interrupted delete leaves.
+            conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+            schema::migrations().to_version(&mut conn, 4).unwrap();
+            conn.execute(
+                "INSERT INTO projects (id, root, name, key) VALUES (1, 'C:/repos/a', 'a', 'a')",
+                [],
+            )
+            .unwrap();
+            // Project 9 is gone; its files never were.
+            conn.execute(
+                "INSERT INTO files (project_id, path, content_hash, indexed_at)
+                 VALUES (9, 'src/lib.rs', 'h', 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let mut store = Store::open(&db).unwrap();
+        let next = store
+            .register_project(Utf8Path::new("C:/repos/b"), "b")
+            .unwrap();
+        assert_eq!(
+            next,
+            10,
+            "an id an orphaned row still names is not free: {:?}",
+            project_ids(&store)
+        );
     }
 }
