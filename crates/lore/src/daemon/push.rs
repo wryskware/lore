@@ -593,8 +593,16 @@ impl PushLeases {
         expired
     }
 
-    /// Drop a deregistered project's push state, so a forgotten project's
-    /// lease cannot attach itself to whatever row later inherits its id.
+    /// Drop a deregistered project's push state, returning the staging
+    /// directory to delete: a lease with nothing left to commit should not keep
+    /// bytes on disk until the reaper notices, and `status` should stop naming
+    /// an epoch nobody can use.
+    ///
+    /// It used to also be the guard against a successor project inheriting the
+    /// lease, back when SQLite handed a deleted project's rowid to the next
+    /// registration. Schema v5 retires project ids instead (`AUTOINCREMENT`),
+    /// so that collision cannot be constructed any more and this is cleanup,
+    /// not a correctness barrier.
     pub fn forget(&self, project: ProjectId) -> Option<Utf8PathBuf> {
         let mut leases = self.lock();
         let push = leases.remove(&project)?;

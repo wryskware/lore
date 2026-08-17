@@ -1127,8 +1127,17 @@ async fn an_epoch_the_daemon_never_minted_is_refused_as_fabricated_not_as_a_take
 
 /// Deregistering a project takes its push state with it: the staged content of
 /// a lease that can no longer commit anything goes immediately rather than
-/// waiting for the reaper, and — because SQLite hands a deleted rowid straight
-/// back out — a later project inheriting that id must not inherit the lease.
+/// waiting for the reaper, and the epoch counter starts over with the new row.
+///
+/// `PushLeases::forget` is still both correct and necessary — it is what
+/// deletes the staged bytes at once and stops `status` naming an epoch nobody
+/// can commit. What it no longer has to defend against is a *successor*
+/// inheriting the lease: schema v5 made `projects.id` `AUTOINCREMENT`, so a
+/// deleted project's id is retired rather than handed to the next
+/// registration, and the id-collision class is prevented in the store instead
+/// of being cleaned up after in every map keyed by `ProjectId`. This test
+/// asserts that too, because "the successor got a different id" is the premise
+/// the rest of the reasoning now rests on.
 #[tokio::test]
 async fn deregistering_a_project_drops_the_push_state_bound_to_it() {
     let harness = harness();
@@ -1170,14 +1179,14 @@ async fn deregistering_a_project_drops_the_push_state_bound_to_it() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let new_id = body["id"].as_i64().expect("a project id");
-    assert_eq!(
-        new_id, original_id,
-        "this test is only worth anything while the deleted rowid is reused — \
-         that reuse is the confusion `forget` exists to prevent"
+    assert!(
+        new_id > original_id,
+        "a re-registration is a new project, never the dead one's id handed \
+         back: {original_id} -> {new_id}"
     );
 
-    // The old session named this very project id at this very epoch, and the
-    // lease it named is gone rather than inherited.
+    // The old session named a project id that no longer exists and can never
+    // exist again, so the lease it named is gone rather than inherited.
     let (status, body) = commit(router, &session, epoch).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(message(&body).contains("no push lease is held"), "{body}");
