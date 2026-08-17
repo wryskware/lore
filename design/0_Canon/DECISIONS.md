@@ -221,3 +221,15 @@ Append-only. Newest entries at the bottom. Schema per [[README]].
 - **Consequences:** Store migrations V1–V5 collapse into a single schema definition with the v5 AUTOINCREMENT guarantee baked in; their tests of migration *paths* are deleted, their tests of resulting *properties* (id non-reuse, reference integrity) are kept.
 - **Supersedes:** None
 - **Canonical sources:** `crates/lore/src/store/schema.rs`
+
+## D-0019 — Declared names fold ASCII case
+
+- **Date:** 2026-08-17
+- **Status:** Accepted
+- **Scope:** Extends D-0016's name identity (uniqueness and lookup)
+- **Decided by:** Wrysk (2026-08-17)
+- **Decision:** Declared project names are unique and resolved **ASCII-case-insensitively**, with the same folding on every platform — never the Windows-only folding root paths use, because a name is the identity that will someday travel between machines. Registering `Lore` while `lore` is bound to another root is refused (the refusal shows the stored spelling); `--project LORE` resolves `lore`; re-registering the *same* root under a case-variant is a rename, not a collision. Display always preserves the typed case. Opaque project keys stay byte-exact.
+- **Rationale:** A case-variant collision is human error, not intent; Windows-first users expect forgiving lookup; platform-dependent folding of an identity would be a latent cross-machine bug.
+- **Consequences:** ASCII folding only for now — full Unicode case-folding is a contract change to take deliberately if non-ASCII names ever matter.
+- **Supersedes:** None (extends D-0016).
+- **Canonical sources:** `crates/lore/src/registry.rs` (`name_key`)
