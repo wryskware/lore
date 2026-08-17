@@ -187,12 +187,29 @@ better to go than re-proposing following.
 > reach into the subtree it just mounted, so the owner could not scope what
 > they had added.
 >
-> Any `[[sources]]` design must answer this explicitly: either the declaring
-> project's `.loreignore` is evaluated against mounted paths (which needs the
-> rules rebased across the `mount` prefix, since the two trees have different
-> path roots), or mounts are declared as governed by their own files and the
-> asymmetry with the single-root case is stated rather than stumbled into. Do
-> not let it fall out of whichever is easier to implement.
+> **Answered, 2026-08-17 (Wrysk): composition, localmost wins.** This was
+> filed as an either/or and that framing was wrong — the rule already exists
+> and this is just another rung of it. D-0020's stack *composes*: a lower
+> source stands wherever a higher one is silent, and the more local file wins
+> where they conflict. That is already true of user-level versus project
+> (`a_project_file_inherits_the_user_level_rules_it_is_silent_about`) and
+> already true *within* a project, where a nested `.loreignore` governs its own
+> subtree (`loreignore_nests_like_gitignore`). A mounted tree is one more
+> level of the same nesting, not a new regime.
+>
+> So: the declaring project's `.loreignore` reaches into the mount, and the
+> mounted tree's own `.loreignore` nests beneath it and wins locally. The
+> owner can scope what they mounted; the mounted tree can still exclude its own
+> build output without the declaring project having to know about it.
+>
+> **The implementation constraint that falls out of this is the load-bearing
+> part:** a mount cannot be walked as an independent root with its own fresh
+> rule stack, because `current_dir(root)` and the crate's per-directory matcher
+> would rebase the whole stack at the mount and the declaring project's rules
+> would never be consulted. Either the walk is single-rooted with mounts
+> grafted in, or the parent's rules are explicitly rebased across the `mount`
+> prefix before the mount's own walk begins. Anything that "just walks the
+> other path" gets this wrong silently.
 
 If an intermediate mode is ever wanted, the only acceptable one is
 `follow_symlinks = "within-project"` — canonicalizing targets, requiring them
