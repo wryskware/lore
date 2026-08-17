@@ -176,7 +176,10 @@ impl Embedder {
     /// search per query until the worker notices. The demotion goes through a
     /// ticket taken before the request: this is the slowest health writer in
     /// the daemon, and a five-second-old verdict must not overwrite a probe
-    /// that has since said the endpoint is back.
+    /// that has since said the endpoint is back. It also raises
+    /// [`Health::request_probe`], because publishing a demotion is not the
+    /// same as arranging for anyone to revisit it — see the note at the
+    /// demotion itself.
     ///
     /// A *timeout* does not demote, and that asymmetry is the point. Running
     /// out of this request's patience is an observation about the deadline,
@@ -202,6 +205,13 @@ impl Embedder {
             Ok(Err(err)) => {
                 tracing::debug!(error = %err, "query embedding failed; this search is lexical-only");
                 ticket.set_unreachable(client.endpoint(), err.to_string());
+                // Publishing the demotion is not the same as acting on it: a
+                // worker parked in its select is watching the indexer pulse,
+                // the probe request, the idle tick and cancellation — a health
+                // write wakes none of them. Without this ask the endpoint stays
+                // reported unreachable, and every search stays lexical-only,
+                // until the 60s fallback tick.
+                self.health.request_probe();
                 None
             }
             Err(_) => {

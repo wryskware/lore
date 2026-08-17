@@ -1051,3 +1051,66 @@ async fn the_worker_waits_for_an_endpoint_that_is_not_there_yet() {
     cancel.cancel();
     task.await.expect("cancellation is prompt");
 }
+
+/// The other half of #5's asymmetry. A query embedding that *fails* — as
+/// opposed to one that ran out of patience — does publish a verdict, and that
+/// verdict is what leaves the daemon lexical-only until something re-probes.
+///
+/// A health write is not a wake-up: a worker parked in its select is watching
+/// the pulse, the probe request, the idle tick and cancellation, none of which
+/// a demotion touches. So the demotion has to ask for the probe itself, or the
+/// endpoint stays reported unreachable — and every search stays lexical-only —
+/// for up to a minute after it came back.
+///
+/// The end-of-pass re-probe does not cover this: it fires when a demotion lands
+/// while the worker is *running* a pass
+/// (see [`an_idle_pass_reprobes_a_stale_unreachable_instead_of_sleeping`]), and
+/// the worker here has nothing to drain.
+#[tokio::test]
+async fn a_query_side_demotion_wakes_a_parked_worker() {
+    // Nothing is indexed, so the only requests this worker makes are probes.
+    let rig = Rig::new("demo").await;
+    let probes = || {
+        rig.stub
+            .state
+            .inputs()
+            .iter()
+            .filter(|input| input.contains(lore::embed::client::PROBE_INPUT))
+            .count()
+    };
+
+    let task = tokio::spawn(rig.worker().run());
+    until("the worker's first probe to land", || {
+        rig.embedder.health().is_ready()
+    })
+    .await;
+    // With an empty backlog the pass after that probe does no I/O at all, so
+    // this settles the worker into its select rather than racing the pass —
+    // the arm under test is the parked one.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let before = probes();
+
+    // A hard refusal, which the query path *does* publish (unlike a timeout).
+    rig.stub.state.script([Reply::Status(400)]);
+    assert!(
+        rig.embedder.embed_query("results ordering").await.is_none(),
+        "the endpoint refused the query, so it has no vector"
+    );
+    assert!(
+        !rig.embedder.health().is_ready(),
+        "a refused query embedding publishes the failure: {:?}",
+        rig.embedder.status()
+    );
+
+    // Nothing pulses the worker and IDLE_TICK is 60s, so a probe inside the
+    // helper's deadline can only have come from the demotion.
+    until("the parked worker to re-probe", || probes() > before).await;
+    until("health to recover without a pulse", || {
+        rig.embedder.health().is_ready()
+    })
+    .await;
+
+    rig.cancel.cancel();
+    task.await.expect("the worker stops on cancellation");
+    rig.stub.shutdown().await;
+}

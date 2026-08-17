@@ -16,12 +16,20 @@
 //!                                               | 60s tick | cancel
 //! ```
 //!
-//! The probe request is [`Health::request_probe`], raised by a query embedding
-//! that timed out (#5). Such a query publishes no verdict of its own — a model
+//! The probe request is [`Health::request_probe`], raised by any query
+//! embedding that did not come back with a vector.
+//!
+//! A query that *timed out* publishes no verdict of its own — a model
 //! reloading after an idle timeout is indistinguishable from a dead server at
 //! that distance — so the worker goes and asks, now rather than at the next
-//! idle tick. It is the one wake-up that probes even while health says
+//! idle tick (#5). It is the one wake-up that probes even while health says
 //! `Ready`, because doubting a `Ready` is exactly what it is for.
+//!
+//! A query that *failed* publishes the demotion, and needs the wake-up just as
+//! much: nothing in this loop watches health, so a worker parked in the select
+//! below would sleep out its idle tick while `/v1/status` reports an endpoint
+//! nobody is re-probing. The end-of-pass `is_ready` check covers only the
+//! demotions that land while a pass is running.
 //!
 //! # Why it cannot starve search
 //!
