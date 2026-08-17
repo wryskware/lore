@@ -404,20 +404,20 @@ fn a_new_directory_is_expanded_into_its_files() {
 /// A file that is still on disk but has become ignored (new `.gitignore`
 /// rule, or moved under an excluded directory) must leave the index —
 /// otherwise the incremental path and a full rescan would disagree forever.
+///
+/// The file is deliberately *not* credential-shaped: the credential
+/// hard-excludes (D-0015) refuse those before any ignore rule is consulted, so
+/// a `*.key` fixture here would pass for the wrong reason.
 #[test]
 fn a_file_that_became_ignored_is_dropped_from_the_index() {
     let fixture = Fixture::new("demo");
-    fixture.write("secret.key", "shhh\n");
+    fixture.write("notes.txt", "shhh\n");
     fixture.write("README.md", "# demo\n");
     full_scan(&fixture.context(), &fixture.project);
-    assert!(fixture.indexed_paths().contains(&"secret.key".to_string()));
+    assert!(fixture.indexed_paths().contains(&"notes.txt".to_string()));
 
-    fixture.write(".gitignore", "*.key\n");
-    let summary = index_paths(
-        &fixture.context(),
-        &fixture.project,
-        &paths(&["secret.key"]),
-    );
+    fixture.write(".gitignore", "*.txt\n");
+    let summary = index_paths(&fixture.context(), &fixture.project, &paths(&["notes.txt"]));
 
     assert_eq!(summary.removed, 1, "{summary:?}");
     assert_eq!(fixture.indexed_paths(), ["README.md"]);

@@ -287,6 +287,10 @@ async fn status(
                 .profile
                 .map(|_| p.authority.behavior.as_str().to_string()),
             authority_config_error: p.authority.error,
+            // A degraded manifest basis (D-0017). Reported for the same reason
+            // the config error above is: the project still indexes, under
+            // different rules than it asked for.
+            manifest_basis_error: state.index.basis.of(p.project),
             decisions_active: p.decisions_active,
             decisions_total: p.decisions_total,
             decision_violations: p
@@ -535,6 +539,7 @@ async fn remove_project(
     let _ = state.watch.send(WatchCommand::Unwatch(id));
     state.watch_status.forget(id);
     state.index.guard.forget(id);
+    state.index.basis.forget(id);
     // A lease on a project that no longer exists cannot commit anything, so
     // its staged content goes with it rather than waiting for the reaper.
     if let Some(dir) = state.push.forget(id) {
@@ -1058,6 +1063,9 @@ async fn push_commit(
         // pusher declared it whole and the checksum agreed.
         complete: true,
         unreadable: BTreeSet::new(),
+        // The pusher took the basis; this daemon never saw the filesystem and
+        // has no degradation of its own to report.
+        basis_error: None,
         content: Box::new(plan.content),
     };
 

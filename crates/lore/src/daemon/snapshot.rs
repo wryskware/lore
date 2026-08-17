@@ -26,7 +26,8 @@ use tokio_util::sync::CancellationToken;
 
 use lore_core::snapshot::{Manifest, ManifestEntry};
 
-use super::walk;
+use super::{basis, paths, walk};
+use crate::repo_config;
 
 /// Where a snapshot's file content comes from.
 ///
@@ -88,6 +89,16 @@ pub struct Snapshot {
     /// (there is no hash for them) *and* from deletion: a file that could not
     /// be read is not evidence that it is gone. Counted as pass errors.
     pub unreadable: BTreeSet<Utf8PathBuf>,
+    /// Why this observation could not take the git-aware basis D-0017 asks for,
+    /// when the project is in a work tree and git would not answer. The pass
+    /// proceeds on the walker's own rules — a superset, so nothing is deleted
+    /// for want of an answer — and `lore status` reports the degradation
+    /// instead of the change of meaning being silent.
+    ///
+    /// Always `None` for an observation that had no filesystem to ask about: a
+    /// received push carries the *pusher's* basis, and this daemon is in no
+    /// position to have an opinion about it.
+    pub basis_error: Option<String>,
     pub content: Box<dyn ContentSource>,
 }
 
@@ -127,6 +138,69 @@ impl Snapshot {
     }
 }
 
+/// Everything the *observer* refuses to send, over and above the walk.
+///
+/// Two rules the walk cannot hold on its own, both from D-0015/D-0017 and both
+/// needing the project root's committed configuration:
+///
+/// - the credential hard-excludes ([`walk::CREDENTIAL_EXCLUDES`]), which no
+///   ignore file may re-include and only `[ingest] allow_secret_paths` may
+///   name past;
+/// - the git-aware manifest basis ([`basis`]), intersected with the walk.
+///
+/// Loaded once per observation, because both answers are properties of the
+/// project rather than of any one file, and asking git per file would be a
+/// process spawn per file.
+struct Screen {
+    basis: basis::Basis,
+    /// Exact project-relative paths the repository declared safe. See
+    /// [`repo_config::allow_secret_paths`] for why this is an *admission*
+    /// rather than a re-inclusion.
+    allowed: BTreeSet<Utf8PathBuf>,
+}
+
+impl Screen {
+    fn new(root: &Utf8Path, basis: basis::Basis) -> Self {
+        Self {
+            basis,
+            allowed: repo_config::allow_secret_paths(root),
+        }
+    }
+
+    /// Whether an observed path may be sent.
+    ///
+    /// [`walk::HARD_EXCLUDES`] is checked first and answers to nobody — not to
+    /// the allowlist either. `.git` is not an ecosystem opinion, it is the
+    /// mechanism every rule here is read from, and a key that could admit
+    /// `.git/config` would put the repository's remote credentials in the
+    /// index by way of the one file that is supposed to be beyond argument.
+    fn keep(&self, rel: &Utf8Path) -> bool {
+        if walk::hard_excluded_component(rel).is_some() {
+            return false;
+        }
+        if self.allowed.contains(rel) {
+            return true;
+        }
+        walk::credential_exclusion(rel).is_none() && self.basis.admits(rel)
+    }
+
+    /// The declared paths that exist but no listing would have produced —
+    /// `hidden(true)`, `.gitignore` and the git basis all drop a `.env` before
+    /// [`Self::keep`] ever sees it, so an escape hatch that only filtered would
+    /// never let anything through.
+    fn admissions(&self, root: &Utf8Path, data_dir: &Utf8Path) -> Vec<Utf8PathBuf> {
+        self.allowed
+            .iter()
+            .filter(|rel| walk::hard_excluded_component(rel).is_none())
+            .filter(|rel| {
+                let abs = root.join(rel);
+                !paths::is_within(data_dir, &abs) && abs.is_file()
+            })
+            .cloned()
+            .collect()
+    }
+}
+
 /// Observe a whole project: the D-0015 push unit, produced locally.
 ///
 /// `.loreignore` generation happens here rather than in the pipeline because
@@ -134,17 +208,29 @@ impl Snapshot {
 /// send. Before the walk, not after: the file this may create is what the walk
 /// immediately obeys. Never fatal — a root that cannot be written to falls
 /// back to the walker's built-in exclusions.
+///
+/// The walk's answer is then narrowed by the [`Screen`]: intersected with the
+/// git-aware basis (D-0017) and stripped of credential paths (D-0015). Both
+/// narrow, never widen — the one thing that adds is the repository's own
+/// `allow_secret_paths`.
 pub fn observe_project(
     root: &Utf8Path,
     data_dir: &Utf8Path,
     cancel: &CancellationToken,
 ) -> Snapshot {
     super::ignorefile::ensure(root);
-    let files = walk::walk_files(root, root, None, data_dir, Some(cancel));
+    let screen = Screen::new(root, basis::observe(root));
+    let mut files: BTreeSet<Utf8PathBuf> =
+        walk::walk_files(root, root, None, data_dir, Some(cancel))
+            .into_iter()
+            .filter(|rel| screen.keep(rel))
+            .collect();
+    files.extend(screen.admissions(root, data_dir));
     // A cancelled walk is partial: applying it would treat every unwalked file
     // as deleted.
     let complete = !cancel.is_cancelled();
-    hash_all(root, files, Scope::Project, complete, cancel)
+    let basis_error = screen.basis.unavailable().map(str::to_string);
+    hash_all(root, files, Scope::Project, complete, basis_error, cancel)
 }
 
 /// Observe exactly these project-relative paths — what a watcher batch turns
@@ -164,19 +250,31 @@ pub fn observe_project(
 ///   longer passes (a new `.gitignore` rule, a rename into an excluded tree)
 ///   is absent from the manifest, and therefore deleted rather than left
 ///   behind as an orphan.
+///
+/// The [`Screen`] then applies to the result exactly as it does to a full
+/// scan — same credential refusals, same git-aware basis — because a watcher
+/// event that indexed something a rescan would delete is the failure this
+/// whole seam exists to prevent. The basis half costs one `git check-ignore`
+/// per batch rather than the full listing a rescan takes; see
+/// [`basis::observe_paths`].
 pub fn observe_paths(
     root: &Utf8Path,
     data_dir: &Utf8Path,
     requested: &BTreeSet<Utf8PathBuf>,
     cancel: &CancellationToken,
 ) -> Snapshot {
+    let declared = repo_config::allow_secret_paths(root);
     let mut scope: BTreeSet<Utf8PathBuf> = BTreeSet::new();
     let mut files: BTreeSet<Utf8PathBuf> = BTreeSet::new();
     // Parent directory -> the files under it this batch mentions.
     let mut by_parent: BTreeMap<Utf8PathBuf, Vec<&Utf8Path>> = BTreeMap::new();
 
     for rel in requested {
-        if walk::is_excluded_rel(rel) {
+        // A declared path is exempt from the cheap name-level rejection too:
+        // every credential pattern worth naming in `allow_secret_paths` is
+        // dot-prefixed, so the hidden-file shortcut would drop it before the
+        // disk was ever consulted.
+        if walk::is_excluded_rel(rel) && !declared.contains(rel) {
             continue;
         }
         scope.insert(rel.to_owned());
@@ -185,6 +283,11 @@ pub fn observe_paths(
             Err(_) => {}
             Ok(meta) if meta.is_dir() => {
                 files.extend(walk::walk_files(root, &abs, None, data_dir, Some(cancel)));
+            }
+            // A declared path needs no confirmation from the walker: the
+            // walker is what it exists to overrule.
+            Ok(_) if declared.contains(rel) => {
+                files.insert(rel.to_owned());
             }
             Ok(_) => {
                 let parent = rel.parent().unwrap_or(Utf8Path::new("")).to_owned();
@@ -211,11 +314,24 @@ pub fn observe_paths(
         );
     }
 
+    // Asked once, about the paths this batch actually produced — which is what
+    // keeps the incremental path's basis the same basis a full scan applies.
+    let screen = Screen::new(root, basis::observe_paths(root, &files));
+    files.retain(|rel| screen.keep(rel));
+
     // A cancelled walk above may have classified a still-allowed file as
     // missing (its parent listing came back partial); deleting on partial
     // evidence deletes real index rows.
     let complete = !cancel.is_cancelled();
-    hash_all(root, files, Scope::Paths(scope), complete, cancel)
+    let basis_error = screen.basis.unavailable().map(str::to_string);
+    hash_all(
+        root,
+        files,
+        Scope::Paths(scope),
+        complete,
+        basis_error,
+        cancel,
+    )
 }
 
 /// Read and hash every observed file into a manifest.
@@ -231,6 +347,7 @@ fn hash_all(
     files: impl IntoIterator<Item = Utf8PathBuf>,
     scope: Scope,
     complete: bool,
+    basis_error: Option<String>,
     cancel: &CancellationToken,
 ) -> Snapshot {
     let mut entries = Vec::new();
@@ -263,6 +380,7 @@ fn hash_all(
         scope,
         complete,
         unreadable,
+        basis_error,
         content: Box::new(DiskContent::new(root)),
     }
 }

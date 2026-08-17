@@ -388,7 +388,7 @@ fn normalize_allowed(entry: &str) -> Option<Utf8PathBuf> {
         .map(|c| c.as_str())
         .filter(|part| *part != ".")
         .collect();
-    if clean.is_empty() || clean.iter().any(|part| *part == "..") {
+    if clean.is_empty() || clean.contains(&"..") {
         return None;
     }
     Some(clean.join("/").into())

@@ -912,6 +912,7 @@ fn render_status(status: &DaemonStatus) -> String {
         push_authority(&mut out, project);
         push_authority_violations(&mut out, project);
         push_mass_delete_guard(&mut out, project);
+        push_manifest_basis(&mut out, project);
         push_lease_state(&mut out, project);
     }
     out
@@ -929,6 +930,24 @@ fn push_mass_delete_guard(out: &mut String, project: &ProjectStatus) {
         "    INDEX BLOCKED: {trip}; re-run with `lore index {name} --allow-mass-delete` \
          if that is intended",
         name = project.name,
+    );
+}
+
+/// A git work tree whose git would not answer (D-0017). Silent in the normal
+/// case — for git and non-git projects alike — because a line on every project
+/// saying nothing is wrong is a line nobody reads.
+///
+/// Not "INDEX BLOCKED": nothing is blocked and nothing was deleted. What
+/// changed is that the fallback basis lets gitignored files into the index
+/// again, which is why the line says what to expect rather than what to fix.
+fn push_manifest_basis(out: &mut String, project: &ProjectStatus) {
+    let Some(error) = &project.manifest_basis_error else {
+        return;
+    };
+    let _ = writeln!(
+        out,
+        "    MANIFEST BASIS: {error}; this project indexed on lore's own ignore rules, so \
+         gitignored files may be indexed until git can answer again"
     );
 }
 

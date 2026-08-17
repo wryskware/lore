@@ -150,6 +150,19 @@ pub struct ProjectStatus {
     /// model, which is what this field is for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority_config_error: Option<String>,
+    /// This project is in a git work tree, but the last local observation
+    /// could not get the git-aware manifest basis D-0017 asks for — git is
+    /// missing, or refused to answer — so the pass fell back to the walker's
+    /// own ignore rules. Absent is the normal case, for a git project and a
+    /// non-git one alike.
+    ///
+    /// The fallback is a *superset* of the git basis, so nothing is deleted for
+    /// want of an answer; what it changes is that gitignored files can reach
+    /// the index again. That is a silent change of meaning unless it is
+    /// reported, which is the same reasoning behind
+    /// [`Self::authority_config_error`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_basis_error: Option<String>,
     /// Decisions that are accepted and not retired.
     #[serde(default)]
     pub decisions_active: u64,

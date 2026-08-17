@@ -18,9 +18,12 @@
 //! reusing it looks free. It cannot express this basis:
 //!
 //! - **The tracked half has no gitignore expression at all.** `--cached` lists
-//!   a file *because git tracks it*, gitignored or not (`git add -f`). The
-//!   `ignore` crate has no index to consult and would drop exactly those
-//!   files — and dropping a tracked file is a deletion from the index.
+//!   a file *because git tracks it*, gitignored or not (`git add -f`), and
+//!   there is no index for a gitignore evaluator to consult. This is not
+//!   academic: a repository whose `.loreignore` re-includes a gitignored
+//!   directory (which the walker honors — `.loreignore` outranks `.gitignore`)
+//!   gets exactly two kinds of file in it, and only git's index separates the
+//!   deliberately-versioned one from the scratch file beside it.
 //! - **`--exclude-standard` includes the user's global excludes**
 //!   (`core.excludesFile`), which [`super::walk`] deliberately does *not*
 //!   consult (`git_global(false)`) so that what Lore indexes cannot depend on
@@ -349,8 +352,11 @@ mod tests {
     }
 
     /// The half no gitignore evaluation can reach: `git add -f` makes a
-    /// gitignored file tracked, and a tracked file is in the basis. Getting
-    /// this wrong would *delete* it from the index.
+    /// gitignored file tracked, and a tracked file is in the basis. What that
+    /// is worth in a real manifest is
+    /// `daemon_observe::the_tracked_half_of_the_basis_separates_two_files_one_rule_admits`,
+    /// where lore's own rules admit the file and only git's index can tell it
+    /// from its untracked neighbour.
     #[test]
     fn a_tracked_file_stays_in_the_basis_even_when_gitignore_names_it() {
         let (_dir, root) = repo(&[(".gitignore", "build.log\n"), ("build.log", "kept")]);
