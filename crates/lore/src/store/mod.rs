@@ -2098,6 +2098,21 @@ mod tests {
             .collect()
     }
 
+    /// Row counts of every table keyed by a project id.
+    fn child_row_counts(store: &Store) -> (i64, i64, i64, i64) {
+        store
+            .conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM files),
+                        (SELECT COUNT(*) FROM chunks),
+                        (SELECT COUNT(*) FROM embeddings),
+                        (SELECT COUNT(*) FROM project_decisions)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+    }
+
     /// The structural half of the deregistration hazard: a removed project's id
     /// is retired, not recycled. Without it, every holder of a `ProjectId` — a
     /// push handle, the lease/queue/watch maps, a client that cached one — has
@@ -2171,6 +2186,21 @@ mod tests {
                 [],
             )
             .unwrap();
+            // Everything keyed by a project id, so the rebuild has to be shown
+            // not to strand it: files, chunks (keyed through files), the vector
+            // hanging off a chunk rowid, and the parsed decision set.
+            conn.execute_batch(
+                "INSERT INTO files (project_id, path, content_hash, indexed_at)
+                     VALUES (1, 'src/lib.rs', 'h', 0);
+                 INSERT INTO chunks (
+                     project_id, chunk_id, path, anchor, kind,
+                     byte_start, byte_end, line_start, line_end, text, authority_tier
+                 ) VALUES (1, 'c1', 'src/lib.rs', 'code:A', '\"Code\"', 0, 4, 1, 2, 'body', 1);
+                 INSERT INTO embeddings (chunk_rowid, project_id, dims, vector)
+                     SELECT id, 1, 1, x'0000803f' FROM chunks WHERE chunk_id = 'c1';
+                 INSERT INTO project_decisions (project_id, decision_id) VALUES (1, 'D-0001');",
+            )
+            .unwrap();
             let ids: Vec<i64> = conn
                 .prepare("SELECT id FROM projects ORDER BY id")
                 .unwrap()
@@ -2214,6 +2244,24 @@ mod tests {
                 )
                 .is_err(),
             "projects_by_key must survive the table rebuild"
+        );
+
+        // The rebuilt table is the same referent: nothing that named a project
+        // id was stranded, and the cascade off `files.project_id` still reaches
+        // chunks and their vectors.
+        let violations: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0, "every reference still resolves");
+        assert_eq!(child_row_counts(&store), (1, 1, 1, 1));
+        assert!(store.remove_project(1).unwrap());
+        assert_eq!(
+            child_row_counts(&store),
+            (0, 0, 0, 0),
+            "ON DELETE CASCADE still points at the rebuilt table"
         );
 
         // From here ids only ever climb, including past the id the pre-v5
