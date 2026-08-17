@@ -12,7 +12,7 @@
 //!
 //! 1. the user's own [`USER_IGNORE_FILE`], beside `config.toml` in the daemon's
 //!    data directory, applying to every project this machine indexes. Not
-//!    installed by default (`lore setup loreignore` writes a commented starting
+//!    installed by default (`lore setup ignore` writes a commented starting
 //!    point); absent is simply an empty source;
 //! 2. the repo's own **`.gitignore`**, through the same evaluator as a courtesy
 //!    to the user — no git subprocess, no tracked/untracked distinction, no

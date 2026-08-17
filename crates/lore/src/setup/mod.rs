@@ -14,7 +14,7 @@
 //! `lore setup` reports without writing anything — discovery must never be a
 //! mutation.
 //!
-//! One target is not a host: `lore setup loreignore` writes [`USER_IGNORE`] into
+//! One target is not a host: `lore setup ignore` writes [`USER_IGNORE`] into
 //! lore's own data directory. It lives here because it answers the same
 //! question — what does this machine need for lore to be useful — and because
 //! since D-0020 it is the *only* way lore excludes anything by default. The
@@ -67,7 +67,7 @@ pub const SKILLS: &[Skill] = &[Skill {
 
 /// The `lore setup` target that installs the user-level ignore rules. Not a
 /// host: it writes into lore's own data directory.
-pub const USER_IGNORE_TARGET: &str = "loreignore";
+pub const USER_IGNORE_TARGET: &str = "ignore";
 
 /// A commented starting point for `<data-dir>/loreignore` — the lowest of the
 /// three rule sources the walker evaluates (D-0020).
@@ -75,7 +75,7 @@ pub const USER_IGNORE_TARGET: &str = "loreignore";
 /// Shipped as an asset rather than compiled into the evaluator, which is the
 /// substance of the decision: lore applies no ignore rules of its own, so every
 /// exclusion is a line in a file a user can read, edit and delete. Installing it
-/// is an explicit act (`lore setup loreignore`), and an existing file at that
+/// is an explicit act (`lore setup ignore`), and an existing file at that
 /// path is never overwritten — the never-clobber rule above covers it, because
 /// a file lore did not stamp reads as the user's.
 const USER_IGNORE: Skill = Skill {

@@ -9,7 +9,7 @@ description: Tune a repository's .loreignore so Lore indexes authored content an
 exactly three sources, lowest precedence to highest:
 
 1. the user's machine-wide rules, `<lore-data-dir>/loreignore` — installed only
-   if they ran `lore setup loreignore`, and often absent;
+   if they ran `lore setup ignore`, and often absent;
 2. the repo's own `.gitignore`, honoured as a courtesy;
 3. the project's `.loreignore` — **sovereign**. It inherits everything below it
    by staying silent, and a `!` line in it overrides anything below it,

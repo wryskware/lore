@@ -323,7 +323,7 @@ pub fn setup(target: Option<String>, dry_run: bool, force: bool) -> Result<()> {
     Ok(())
 }
 
-/// `lore setup loreignore` — install the user-level ignore rules.
+/// `lore setup ignore` — install the user-level ignore rules.
 ///
 /// Separate from the host branch because the destination is lore's own data
 /// directory rather than an agent's, and because there is exactly one item: the

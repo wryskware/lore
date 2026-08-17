@@ -1,5 +1,5 @@
 # Lore's user-level ignore rules — a starting point, installed by
-# `lore setup loreignore` and never rewritten afterwards. This file is yours.
+# `lore setup ignore` and never rewritten afterwards. This file is yours.
 #
 # Lore evaluates exactly three rule sources, lowest to highest (D-0020):
 #

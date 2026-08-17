@@ -45,7 +45,7 @@ enum Command {
     /// Bare `lore setup` reports what is installed and writes nothing.
     Setup {
         /// What to install, as `lore setup` names it: an agent host
-        /// (`claude-code`), or `loreignore` for the machine-wide ignore rules.
+        /// (`claude-code`), or `ignore` for the machine-wide ignore rules.
         target: Option<String>,
         /// Print what would change without writing it.
         #[arg(long)]
