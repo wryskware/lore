@@ -3,6 +3,7 @@ design_status: decided
 last_reviewed: 2026-08-17
 decision_refs:
   - D-0021
+  - D-0022
 ---
 
 # Link traversal — decision brief
@@ -142,11 +143,11 @@ retrieve from the main `Lexomancy` project, which is registered in its own
 right) is now *decided policy* rather than a limitation awaiting a daemon-side
 fix, and `bench/README.md` is updated to say so.
 
-## The future shape, if external content is ever wanted
+## The shape external content takes instead
 
-> [!candidate]
-> If a project should genuinely include a tree that lives elsewhere, the way to
-> ask is an **explicit additional source root** — conceptually:
+> [!accepted] D-0022
+> A project that should genuinely include a tree living elsewhere says so with
+> an **explicit additional source root**:
 >
 > ```toml
 > [[sources]]
@@ -158,16 +159,19 @@ fix, and `bench/README.md` is updated to say so.
 > ```
 >
 > — and never a blanket `follow_symlinks`. A declared mount is auditable, has
-> one unambiguous logical path per file, can be watched deliberately, and does
-> not depend on what the filesystem happens to be wired up to on this machine.
+> one unambiguous logical path per file, and does not depend on what the
+> filesystem happens to be wired up to on this machine.
 
-This is a **leaning about direction, not a design and not scheduled.** It is
-recorded so that the next person who wants external content has somewhere
-better to go than re-proposing following.
+**Decided and built as D-0022** (2026-08-17), in the shape sketched above:
+`path` relative to the project root, `mount` naming the logical prefix, roots
+independent, a bad table refused whole and falling back to the root alone with
+the error in `lore status`. See that entry for the validation rules and for
+what is deliberately not yet built (a mounted root is not live-watched).
 
 > [!open]
-> **Whose ignore file governs a mounted tree?** Verified against the walker
-> 2026-08-17, because it is the first thing a mount implementation trips over.
+> **Whose ignore file governs a mounted tree?** Closed by D-0022; kept because
+> the walker facts below are what the answer rests on, and because this was the
+> first thing the implementation tripped over.
 >
 > Every boundary in `walk_files` is parameterized on the **walk root**, not on
 > any notion of "the registered project": the nested-repository check gates on
