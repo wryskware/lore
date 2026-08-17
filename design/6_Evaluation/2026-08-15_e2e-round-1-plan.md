@@ -9,6 +9,14 @@ decision_refs:
 
 First e2e runs at the M1 boundary. Scratch/process doc, not canon.
 
+> **Revision A (2026-08-17):** the grading keys in
+> § "Per-repo instantiations" and the T4 archetype in § "Task archetypes" are
+> amended by [[2026-08-17_e2e-round-1-key-addendum]] (gaps KG-1…KG-5: lore T3
+> scope, lore T5 `CHUNK_FORMAT_VERSION`, lexomancy T5 shield normalisation, the
+> T4 prose-source conjunct, lore T1's merge point). The text below is left
+> exactly as round 1 was graded against it; the addendum is the delta and wins
+> for round 2 and later.
+
 **Deviation from D-0009, noted deliberately:** D-0009's fixture corpora are
 established OSS repos (a Python lib, a JS/TS lib, a C# project). Round 1
 instead uses Wrysk's own three repos — they cover the same language spread

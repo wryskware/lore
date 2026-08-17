@@ -5,6 +5,13 @@ last_reviewed: 2026-08-15
 
 # E2E round 1 — frozen prompts and answer keys
 
+> **Revision A (2026-08-17):** grading criteria are amended by
+> [[2026-08-17_e2e-round-1-key-addendum]], which resolves the `key_gaps` the
+> blind graders logged. Read it alongside this doc and the plan doc; where they
+> disagree, the addendum wins for round 2 and later. Nothing here is rewritten
+> — the text below is what round 1 was actually graded against, and the
+> **prompts are unchanged and stay unchanged**.
+
 Companion to [[2026-08-15_e2e-round-1-plan]]. **Never shown to benchmark
 models.** Prompts are verbatim and hint-free (Wrysk lazy style); grading
 keys live in the plan doc's per-repo task bullets — this doc is the runner's
