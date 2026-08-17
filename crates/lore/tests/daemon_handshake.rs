@@ -188,6 +188,8 @@ async fn probe_believes_a_real_lore_status_body() {
                 embeddings: lore_core::EmbeddingStatus::Unconfigured,
                 latency: Vec::new(),
                 embed_abandoned: 0,
+                plugins: Vec::new(),
+                plugin_diagnostics: Vec::new(),
             })
         }),
     );

@@ -8,6 +8,7 @@
 //!   lore.db       SQLite: metadata + FTS5 + vectors (one transaction domain)
 //!   config.toml   optional, see crate::config
 //!   daemon.json   single-instance handshake, see super::handshake
+//!   plugins\      installed chunker plugins, one directory each
 //! ```
 //!
 //! `LORE_DATA_DIR` overrides the whole directory — that is how tests (and a
@@ -25,6 +26,15 @@ pub use lore_core::discovery::{DATA_DIR_ENV, data_dir, resolve_data_dir};
 
 /// SQLite database file name within the data directory.
 pub const DB_FILE: &str = "lore.db";
+
+/// Installed chunker plugins, one directory per plugin
+/// ([`crate::plugin::PluginRegistry::load`]).
+///
+/// Named here rather than derived at each call site because `lore plugin add`
+/// writes into the same directory the daemon reads, from a different process,
+/// and the two agreeing is the whole of the installation contract. Absent is
+/// normal: it is what a machine with no plugins looks like.
+pub const PLUGINS_DIR: &str = "plugins";
 
 /// Canonicalize a user-supplied project root and hand back a path the store
 /// can hold forever.

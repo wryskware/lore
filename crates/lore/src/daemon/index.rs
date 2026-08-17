@@ -37,7 +37,8 @@ use tokio_util::sync::CancellationToken;
 use lore_core::snapshot::{ManifestEntry, MassDeleteTrip, mass_delete_trip};
 
 use crate::authority::{DecisionIndex, Decisions, Demotion, is_decision_source, is_ledger_path};
-use crate::chunk::{FileChunks, chunk_file};
+use crate::chunk::{FileChunks, Route, chunk_file_with};
+use crate::plugin::PluginRegistry;
 use crate::repo_config::{Profile, RepoAuthority};
 use crate::sources::Sources;
 use crate::store::{FileWrite, Project, ProjectId, Recompute, StoreError};
@@ -61,6 +62,19 @@ pub struct IndexContext {
     pub embed_notify: Arc<Notify>,
     /// Where a refused apply is recorded for `lore status`.
     pub guard: GuardStatus,
+    /// Every chunker plugin this daemon has installed, loaded **once** at
+    /// startup ([`super::run`]). Shared, because a pass narrows it to the
+    /// project's opt-in rather than copying it.
+    ///
+    /// There is no hot reload in v1: installing, editing or removing a plugin
+    /// takes effect on the next daemon start. That is deliberate rather than
+    /// unfinished — a registry that changed under a running pass would chunk
+    /// half a project with one grammar and half with another, and the
+    /// fingerprint in the content stamp would be right about neither.
+    pub plugins: Arc<PluginRegistry>,
+    /// Where files that fell back for want of a working plugin are recorded
+    /// for `lore status`.
+    pub fallbacks: PluginFallbacks,
 }
 
 impl IndexContext {
@@ -71,7 +85,18 @@ impl IndexContext {
             cancel,
             embed_notify: Arc::new(Notify::new()),
             guard: GuardStatus::new(),
+            plugins: Arc::new(PluginRegistry::empty()),
+            fallbacks: PluginFallbacks::new(),
         }
+    }
+
+    /// Install the loaded plugin registry. Separate from [`Self::new`] because
+    /// a context with no plugins is the ordinary shape — it is what every test
+    /// that is not about plugins wants, and what a daemon with an empty
+    /// `plugins/` directory runs with.
+    pub fn with_plugins(mut self, plugins: Arc<PluginRegistry>) -> Self {
+        self.plugins = plugins;
+        self
     }
 }
 
@@ -127,6 +152,57 @@ impl GuardStatus {
     }
 }
 
+/// Per-project count of files that a chunker plugin claimed but could not
+/// chunk, so they took the built-in fallback path instead ([`Route::FellBack`]).
+///
+/// In memory only, exactly like [`GuardStatus`]: it describes what the last
+/// pass did, not what the index is. It is **replaced** by every completed pass
+/// rather than accumulated — the alternative double-counts a file every time it
+/// is re-indexed — so it reads as "as of the most recent pass over these
+/// files", which after a full scan is the whole project and after a watcher
+/// batch is that batch.
+///
+/// Reported because the contract's one quality-cliff requirement is that a file
+/// falling back for want of a working plugin is *visible*: an unavailable
+/// grammar otherwise produces line windows that look exactly like a file nobody
+/// ever claimed.
+#[derive(Clone, Debug, Default)]
+pub struct PluginFallbacks {
+    files: Arc<Mutex<BTreeMap<ProjectId, u64>>>,
+}
+
+impl PluginFallbacks {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn of(&self, project: ProjectId) -> u64 {
+        self.lock().get(&project).copied().unwrap_or(0)
+    }
+
+    /// Record what one completed pass saw. Zero removes the entry, so a
+    /// project that no longer falls back stops being reported at all.
+    fn record(&self, project: ProjectId, files: u64) {
+        let mut all = self.lock();
+        match files {
+            0 => all.remove(&project),
+            files => all.insert(project, files),
+        };
+    }
+
+    /// Drop a deregistered project's count, so it cannot attach itself to
+    /// whatever row later inherits its id.
+    pub fn forget(&self, project: ProjectId) {
+        self.lock().remove(&project);
+    }
+
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<ProjectId, u64>> {
+        self.files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 /// What one pass did. Logged verbatim; also the assertion surface for tests.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PassSummary {
@@ -150,6 +226,11 @@ pub struct PassSummary {
     pub chunks_deleted: usize,
     /// Files that could not be read or written; the pass continues.
     pub errors: usize,
+    /// Files a chunker plugin claimed but could not chunk, so they took the
+    /// built-in fallback ([`Route::FellBack`] — an unavailable grammar, a
+    /// build with no wasm engine). Not an error: the file is indexed, just not
+    /// the way the project asked for.
+    pub plugin_fallbacks: usize,
     /// Files whose effective authority was rewritten by the recompute pass
     /// (a ledger edit changed what `decided` is allowed to mean).
     pub authority_recomputed: usize,
@@ -244,24 +325,91 @@ pub fn apply_snapshot(
 /// The stored `files.content_hash` for content that hashed to `hash`.
 ///
 /// Not the bare content hash: the chunk format version rides in it so a
-/// chunking-policy bump invalidates every short-circuit, and the active
-/// authority profile rides along for Markdown so a `.lore.toml` change
-/// re-chunks the documents whose *metadata* it changed (D-0012).
+/// chunking-policy bump invalidates every short-circuit, the active authority
+/// profile rides along for Markdown so a `.lore.toml` change re-chunks the
+/// documents whose *metadata* it changed (D-0012), and the fingerprint of the
+/// chunker plugin that owns the path rides along for the files that plugin
+/// claims (2026-08-17 contract).
+///
+/// The plugin half is deliberately narrow. `plugins` is the project's
+/// **enabled** registry, and a file it does not claim contributes nothing at
+/// all — not an empty marker, nothing — so every file on every existing
+/// installation keeps the stamp it has today and no plugin work re-chunks a
+/// corpus that has no plugins. Conversely, enabling a plugin, disabling it, or
+/// editing one (its manifest or any asset it references, both of which move the
+/// fingerprint) changes the stamp of exactly the files it claims, which
+/// re-chunks those and only those. Chunk ids are content-addressed, so the
+/// chunks whose text did not move keep their vectors — the same property the
+/// profile flip has.
+///
+/// The claim is answered from the path alone, before content is read, which is
+/// what lets the diff below short-circuit without fetching anything. It is
+/// answered whether or not the plugin can actually *run*: a claim that falls
+/// back still chunked the file under that plugin's decision, and the reason it
+/// fell back (a missing asset, say) is itself part of the fingerprint.
 ///
 /// Public because the push manifest diff has to ask the same question the
 /// pipeline asks — "does the store already have this content?" — and a second,
 /// almost-identical stamping rule would present as a daemon that re-requests
 /// every file it already has after a format bump, or worse, one that skips
 /// files it should re-chunk.
-pub fn content_stamp(rel: &Utf8Path, hash: &str, profile: Option<Profile>) -> String {
+pub fn content_stamp(
+    rel: &Utf8Path,
+    hash: &str,
+    profile: Option<Profile>,
+    plugins: Option<&PluginRegistry>,
+) -> String {
     let profile_tag = match profile {
         Some(profile) if crate::chunk::is_markdown(rel) => profile.chunk_tag(),
         _ => "",
     };
+    let plugin_tag = match plugins.and_then(|plugins| plugins.claim(rel)) {
+        Some(claim) => format!("+{}@{}", claim.plugin, claim.fingerprint),
+        None => String::new(),
+    };
     format!(
-        "v{}{profile_tag}-{hash}",
+        "v{}{profile_tag}{plugin_tag}-{hash}",
         crate::chunk::CHUNK_FORMAT_VERSION
     )
+}
+
+/// How this pass chunks: everything the repository's `.lore.toml` decides
+/// about what its files become.
+///
+/// One value rather than two arguments because these two are read together at
+/// the top of a pass, travel together to every file in it, and both ride in the
+/// content stamp — a call site that could pass one pass's profile with another
+/// pass's plugins is a call site that could stamp a file with a policy it was
+/// not chunked under.
+struct ChunkPolicy<'a> {
+    profile: Option<Profile>,
+    plugins: &'a PluginRegistry,
+}
+
+impl ChunkPolicy<'_> {
+    fn stamp(&self, rel: &Utf8Path, hash: &str) -> String {
+        content_stamp(rel, hash, self.profile, Some(self.plugins))
+    }
+}
+
+/// The plugins in force for one project: the intersection of what this daemon
+/// has installed and what the repository's `.lore.toml` enables.
+///
+/// Resolved once per pass, from disk, exactly where and when the authority
+/// profile is — see [`refresh_profile`]. Under D-0015 that means a *pushed*
+/// project's opt-in is read from the receiver's own copy of `.lore.toml` at the
+/// registered root, because chunking is receiver-side permanently and the
+/// receiver's plugin set governs. A receiver with no such file enables nothing
+/// and every claimed file falls back, which the lease response makes visible to
+/// the pusher rather than leaving it to be discovered in the results.
+fn project_plugins(ctx: &IndexContext, project: &Project) -> PluginRegistry {
+    let enabled = crate::repo_config::enabled_plugins(&project.root);
+    if enabled.is_empty() {
+        // Not merely an optimization: an empty registry has to behave exactly
+        // like no registry, and the cheapest way to be sure is to build one.
+        return PluginRegistry::empty();
+    }
+    ctx.plugins.enabled_only(&enabled)
 }
 
 /// Reconcile the store with one snapshot.
@@ -284,6 +432,14 @@ fn apply(
         Scope::Paths(_) => "incremental",
     };
     let profile = refresh_profile(ctx, project, &mut summary);
+    // Read at the top of the pass, beside the profile and for the same reason:
+    // it decides how the files in this pass are chunked, and it must not move
+    // underneath them.
+    let plugins = project_plugins(ctx, project);
+    let policy = ChunkPolicy {
+        profile,
+        plugins: &plugins,
+    };
 
     summary.seen = snapshot.considered();
     summary.links_skipped = snapshot.links.len();
@@ -355,12 +511,17 @@ fn apply(
             entry,
             known.get(entry.path.as_str()).copied(),
             snapshot.content.as_ref(),
-            profile,
+            &policy,
             &mut summary,
         );
     }
 
     if !summary.cancelled {
+        // Recorded from the pass that actually looked at the files, so a pass
+        // refused before the loop (the mass-delete guard) leaves the previous
+        // report standing rather than reporting a clean project it never read.
+        ctx.fallbacks
+            .record(project.id, summary.plugin_fallbacks as u64);
         remove_all(ctx, project, &deletions, &mut summary);
         match snapshot.scope {
             // Unconditional on a full scan: this is also the migration/startup
@@ -648,15 +809,16 @@ fn index_one(
     entry: &ManifestEntry,
     stored_hash: Option<&str>,
     content_source: &dyn ContentSource,
-    profile: Option<Profile>,
+    policy: &ChunkPolicy<'_>,
     summary: &mut PassSummary,
 ) {
     let rel = Utf8Path::new(&entry.path);
 
-    // [`content_stamp`] carries the chunk format version and — for Markdown —
-    // the active authority profile, so a policy bump or a `.lore.toml` change
+    // [`content_stamp`] carries the chunk format version, the active authority
+    // profile for Markdown, and the fingerprint of the plugin that claims this
+    // path — so a policy bump, a `.lore.toml` change or a plugin edit
     // invalidates the short-circuit below and unchanged bytes re-chunk.
-    let stamp = |hash: &str| content_stamp(rel, hash, profile);
+    let stamp = |hash: &str| policy.stamp(rel, hash);
 
     // The manifest hash is what the diff is done against; nothing is fetched
     // for a file whose content the store already has.
@@ -685,7 +847,22 @@ fn index_one(
     // moved on since.
     let hash = stamp(&blake3::hash(&content).to_hex());
 
-    match chunk_file(rel, &content, profile) {
+    let outcome = chunk_file_with(rel, &content, policy.profile, Some(policy.plugins));
+    // Counted per pass, whatever the file then turns out to be: a plugin that
+    // could not run is the condition being reported, not the chunks it failed
+    // to produce.
+    if let Route::FellBack { plugin, reason } = &outcome.route {
+        summary.plugin_fallbacks += 1;
+        tracing::debug!(
+            project = %project.name,
+            path = %rel,
+            plugin = %plugin,
+            reason = %reason,
+            "plugin claimed this file but could not chunk it; using the built-in fallback"
+        );
+    }
+
+    match outcome.chunks {
         FileChunks::Chunked(chunks) => {
             let written = ctx
                 .store
@@ -814,6 +991,7 @@ fn finish(
         authority_recomputed = summary.authority_recomputed,
         authority_violations = summary.authority_violations,
         decision_violations = summary.decision_violations,
+        plugin_fallbacks = summary.plugin_fallbacks,
         profile_changed = summary.profile_changed,
         config_error = summary.config_error,
         mass_delete_blocked = summary.mass_delete_blocked.is_some(),

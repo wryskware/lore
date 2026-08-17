@@ -226,6 +226,21 @@ pub struct PushLeaseResponse {
     /// minimum push interval and rejects clients configured hotter").
     #[serde(default)]
     pub min_push_interval_secs: u64,
+    /// Chunker plugins the **receiving** daemon has installed, by name and
+    /// fingerprint.
+    ///
+    /// Advertised, never negotiated. Chunking is daemon-side permanently, so
+    /// the receiver's plugin set governs what a pushed project's files become;
+    /// the pusher's job is only to be able to *see* that the receiver has a
+    /// different set than it expected, instead of discovering it as results
+    /// that are subtly worse. Nothing in the protocol changes because of a
+    /// mismatch.
+    ///
+    /// The installed set, not the enabled one: enablement is per project and
+    /// comes from the receiver's own copy of that project's `.lore.toml`, and
+    /// `GET /v1/status?project=` is where the resolved answer lives.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugins: Vec<crate::PluginInfo>,
 }
 
 /// Heartbeat: keep an idle lease alive. Names its epoch like every other push

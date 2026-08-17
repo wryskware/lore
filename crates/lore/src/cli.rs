@@ -1696,6 +1696,8 @@ mod tests {
             embeddings: EmbeddingStatus::Unconfigured,
             latency: Vec::new(),
             embed_abandoned: 0,
+            plugins: Vec::new(),
+            plugin_diagnostics: Vec::new(),
         });
         assert!(rendered.contains("projects: none registered (run `lore add <path>`)"));
         assert!(rendered.starts_with("lore daemon 0.1.0  api v1  generation 0\n"));
@@ -1713,6 +1715,8 @@ mod tests {
             embeddings: EmbeddingStatus::Unconfigured,
             latency: Vec::new(),
             embed_abandoned: abandoned,
+            plugins: Vec::new(),
+            plugin_diagnostics: Vec::new(),
         };
         assert!(!render_status(&body(0)).contains("EMBEDDING"));
 
@@ -1758,6 +1762,8 @@ mod tests {
             embeddings: EmbeddingStatus::Unconfigured,
             latency: Vec::new(),
             embed_abandoned: 0,
+            plugins: Vec::new(),
+            plugin_diagnostics: Vec::new(),
         };
 
         // Clean vault: not a word about authority.

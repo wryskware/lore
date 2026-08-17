@@ -186,7 +186,28 @@ pub async fn run(options: DaemonOptions) -> Result<()> {
     let queue = queue::IndexQueue::new();
     let (watch_tx, watch_rx) = watch::channel();
 
-    let ctx = index::IndexContext::new(store.clone(), data_dir.clone(), cancel.clone());
+    // Chunker plugins, loaded once. A broken plugin is a diagnostic and never a
+    // failed start: it costs its own extensions and nothing else. The
+    // diagnostics are logged here *and* carried into `/v1/status`, because a
+    // line in a log a user never reads is how a plugin that silently does
+    // nothing stays silent.
+    let (plugins, diagnostics) =
+        crate::plugin::PluginRegistry::load(&data_dir.join(paths::PLUGINS_DIR));
+    for diagnostic in &diagnostics {
+        tracing::warn!(diagnostic = %diagnostic, "chunker plugin");
+    }
+    tracing::info!(
+        plugins = plugins.plugins().len(),
+        diagnostics = diagnostics.len(),
+        dir = %data_dir.join(paths::PLUGINS_DIR),
+        "chunker plugins loaded (a restart picks up changes; there is no hot reload)"
+    );
+    let plugins = Arc::new(plugins);
+    let plugin_diagnostics: Arc<Vec<String>> =
+        Arc::new(diagnostics.iter().map(ToString::to_string).collect());
+
+    let ctx = index::IndexContext::new(store.clone(), data_dir.clone(), cancel.clone())
+        .with_plugins(plugins.clone());
     let embed_notify = ctx.embed_notify.clone();
     // Shared with `/v1/status` and with the push commit route: an apply the
     // mass-delete guard refused is a project whose index has stopped tracking
@@ -243,6 +264,8 @@ pub async fn run(options: DaemonOptions) -> Result<()> {
         config,
         embeddings,
         latency: latency::LatencyRecorder::default(),
+        plugins,
+        plugin_diagnostics,
         data_dir: data_dir.clone(),
         // `POST /v1/shutdown` triggers exactly what ctrl-c does; there is one
         // shutdown signal in this process and this is it.

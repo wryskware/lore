@@ -50,6 +50,10 @@ fn harness_from(fixture: Fixture) -> Harness {
         // Hybrid ranking and health transitions live in `embed_search.rs`.
         embeddings: Embedder::disabled(),
         latency: lore::daemon::latency::LatencyRecorder::default(),
+        // No chunker plugins: this file is not about them, and an empty
+        // registry routes exactly as no registry at all does.
+        plugins: std::sync::Arc::new(lore::plugin::PluginRegistry::empty()),
+        plugin_diagnostics: std::sync::Arc::new(Vec::new()),
         data_dir: fixture.data_dir.clone(),
         // Nothing here drives a real shutdown; the token exists so the
         // route can cancel something rather than reach for a global.

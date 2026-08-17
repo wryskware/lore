@@ -109,6 +109,16 @@ fn populated_project_status() -> ProjectStatus {
             },
         ],
         sources_error: Some("source path `../gone` cannot be resolved".into()),
+        // The chunker-plugin trio, populated for the same "maximal shape"
+        // reason: what is in force, what this repo asked for and nobody
+        // installed, and what fell back for want of a working plugin.
+        plugins_enabled: vec![lore_core::PluginInfo {
+            name: "unity".into(),
+            fingerprint: "6f1d".into(),
+            extensions: vec!["uxml".into(), "uss".into()],
+        }],
+        plugins_missing: vec!["godot".into()],
+        plugin_fallback_files: 3,
     }
 }
 
@@ -188,6 +198,13 @@ fn every_pre_existing_wire_field_survives_and_the_additions_are_the_specified_on
                 // own root, which is nearly all of them.
                 "sources",
                 "sources_error",
+                // Chunker plugins (2026-08-17 contract): what this project
+                // enabled and the daemon has, what it enabled and the daemon
+                // has not, and how many files fell back for want of a working
+                // one. All three absent for a project that enabled none.
+                "plugin_fallback_files",
+                "plugins_enabled",
+                "plugins_missing",
             ],
         },
         Shape {
@@ -361,6 +378,11 @@ fn a_push_message_missing_its_additive_fields_still_parses() {
     assert_eq!(lease.session.0, "9f3a1c2b9f3a1c2b9f3a1c2b9f3a1c2b");
     assert_eq!(lease.epoch.0, 7);
     assert_eq!(lease.min_push_interval_secs, 0, "absent means no floor");
+    // A receiver that says nothing about plugins has none the pusher can see —
+    // which reads exactly like a receiver with none installed, and is the
+    // honest degradation: advertisement is one-way and never negotiated, so a
+    // pusher has nothing to do about it either way.
+    assert!(lease.plugins.is_empty(), "absent means nothing advertised");
 
     // Pusher → daemon: the mass-delete override is a per-invocation decision by
     // a human, so its absence is the answer "no", never a parse failure.

@@ -68,6 +68,41 @@ pub struct DaemonStatus {
     /// the wire in both directions).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub latency: Vec<EndpointLatency>,
+    /// Chunker plugins this daemon has **installed**, loaded once at startup.
+    ///
+    /// Machine-wide, like [`Self::embeddings`], because installation is: which
+    /// of these a given project actually uses is that project's
+    /// [`ProjectStatus::plugins_enabled`]. Omitted when empty, which is the
+    /// state of every daemon that has never had a plugin installed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugins: Vec<PluginInfo>,
+    /// What the plugin load refused, or accepted only partly: a manifest that
+    /// would not parse, two plugins claiming one extension, a grammar that
+    /// cannot run. One human-readable line each.
+    ///
+    /// Reported rather than only logged for the reason every other diagnostic
+    /// on this surface is: a plugin that quietly does nothing is
+    /// indistinguishable from one that is working.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugin_diagnostics: Vec<String>,
+}
+
+/// One chunker plugin, as `status` and the push lease report it.
+///
+/// The fingerprint is the plugin's whole version identity — a content hash over
+/// its manifest and every asset it references — because a plugin declares no
+/// version. Two daemons agree about a plugin exactly when these strings match.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginInfo {
+    /// Registry identity: a lowercase slug, unique among installed plugins.
+    pub name: String,
+    /// Lowercase hex content hash of the manifest plus every referenced asset.
+    pub fingerprint: String,
+    /// Extensions this plugin actually owns, after built-in and inter-plugin
+    /// conflicts are resolved — so an entry that lost `uxml` to another plugin
+    /// does not claim it here. Omitted when the plugin ended up owning nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<String>,
 }
 
 /// `skip_serializing_if` predicate for additive counters whose interesting
@@ -206,6 +241,24 @@ pub struct ProjectStatus {
     /// inert until the commit transaction publishes them.
     #[serde(default, skip_serializing_if = "is_false")]
     pub push_staged: bool,
+    /// Chunker plugins in force for this project: the intersection of what the
+    /// daemon has installed and what the repository's `.lore.toml` names in
+    /// `[plugins] enable`. Omitted when the repository opted into none, which
+    /// is every repository until someone says otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugins_enabled: Vec<PluginInfo>,
+    /// Plugins this repository enabled that the daemon does **not** have
+    /// installed. Not an error — the files chunk exactly as they would with no
+    /// plugin at all — but exactly the gap that otherwise presents as "the
+    /// plugin is not working", so it is named rather than inferred.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugins_missing: Vec<String>,
+    /// Files an enabled plugin claimed but could not chunk, as of this
+    /// project's most recent index pass, so they took the built-in fallback.
+    /// Zero (and absent) is the healthy case; the reason is in
+    /// [`DaemonStatus::plugin_diagnostics`].
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub plugin_fallback_files: u64,
 }
 
 /// One directory a project is made of, as `lore status` reports it.

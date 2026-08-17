@@ -239,6 +239,8 @@ fn canned_status() -> DaemonStatus {
         },
         latency: Vec::new(),
         embed_abandoned: 12,
+        plugins: Vec::new(),
+        plugin_diagnostics: Vec::new(),
     }
 }
 

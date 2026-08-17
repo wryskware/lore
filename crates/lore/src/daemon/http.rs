@@ -101,6 +101,14 @@ pub struct AppState {
     pub embeddings: Embedder,
     /// Query-surface latency windows, reported by `status`.
     pub latency: crate::daemon::latency::LatencyRecorder,
+    /// Chunker plugins this daemon loaded at startup. The same registry the
+    /// indexer routes through, shared so `status` and the push lease report
+    /// what is actually in force rather than re-reading the directory and
+    /// possibly disagreeing with it.
+    pub plugins: Arc<crate::plugin::PluginRegistry>,
+    /// What the plugin load refused, already rendered. Rendered rather than
+    /// typed because this surface only ever prints them.
+    pub plugin_diagnostics: Arc<Vec<String>>,
     pub data_dir: Utf8PathBuf,
     /// The daemon's shutdown token — the same one the workers and the server's
     /// own graceful-shutdown future watch. `POST /v1/shutdown` cancels it;
@@ -257,24 +265,32 @@ async fn status(
         .map_err(|err| ApiErr::internal("status", err))?
         .map_err(|err| ApiErr::internal("status", err))?;
 
-    // Resolved here rather than read from the store, because extent is not
-    // stored: every pass loads `.lore.toml` fresh, and status showing anything
-    // else would be showing the extent of some earlier pass. Off the async
-    // thread — it reads a file and canonicalizes a path per source.
+    // Resolved here rather than read from the store, because neither the extent
+    // nor the plugin opt-in is stored: every pass loads `.lore.toml` fresh, and
+    // status showing anything else would be showing the configuration of some
+    // earlier pass. Off the async thread — it reads a file and canonicalizes a
+    // path per source.
     let roots: Vec<(ProjectId, camino::Utf8PathBuf)> = status
         .projects
         .iter()
         .map(|p| (p.project, p.root.clone()))
         .collect();
-    let extents: BTreeMap<ProjectId, crate::sources::Sources> =
-        tokio::task::spawn_blocking(move || {
-            roots
-                .into_iter()
-                .map(|(id, root)| (id, crate::sources::Sources::load(&root)))
-                .collect()
-        })
-        .await
-        .map_err(|err| ApiErr::internal("status", err))?;
+    type RepoConfigs = BTreeMap<ProjectId, (crate::sources::Sources, BTreeSet<String>)>;
+    let configs: RepoConfigs = tokio::task::spawn_blocking(move || {
+        roots
+            .into_iter()
+            .map(|(id, root)| {
+                let extent = crate::sources::Sources::load(&root);
+                (id, (extent, crate::repo_config::enabled_plugins(&root)))
+            })
+            .collect()
+    })
+    .await
+    .map_err(|err| ApiErr::internal("status", err))?;
+    let extents: BTreeMap<ProjectId, &crate::sources::Sources> = configs
+        .iter()
+        .map(|(id, (extent, _))| (*id, extent))
+        .collect();
 
     let mut projects: Vec<lore_core::ProjectStatus> = status
         .projects
@@ -341,6 +357,30 @@ async fn status(
             // pusher contention looks like from outside.
             push_lease_epoch: state.push.state(p.project).map(|push| push.epoch.0),
             push_staged: state.push.state(p.project).is_some_and(|push| push.staged),
+            // Chunking for a project is the intersection of installed and
+            // enabled, so both halves of the gap are reported: the plugins in
+            // force, and the names this repo asked for that nobody installed.
+            plugins_enabled: configs
+                .get(&p.project)
+                .map(|(_, enabled)| {
+                    enabled
+                        .iter()
+                        .filter_map(|name| state.plugins.get(name))
+                        .map(plugin_info)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            plugins_missing: configs
+                .get(&p.project)
+                .map(|(_, enabled)| {
+                    enabled
+                        .iter()
+                        .filter(|name| state.plugins.get(name).is_none())
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
+            plugin_fallback_files: state.index.fallbacks.of(p.project),
         })
         .collect();
 
@@ -392,7 +432,36 @@ async fn status(
         // per project, and attributing its count to whichever project was
         // asked about would be a fabrication.
         embed_abandoned: state.embeddings.abandoned_chunks(),
+        // Also machine-wide, and for the same reason: plugins are *installed*
+        // per machine. What a scoped caller wants is the per-project pair
+        // above, which is already filtered with it.
+        plugins: installed_plugins(&state),
+        plugin_diagnostics: state.plugin_diagnostics.as_ref().clone(),
     }))
+}
+
+/// Every installed plugin, on the wire.
+fn installed_plugins(state: &AppState) -> Vec<lore_core::PluginInfo> {
+    state
+        .plugins
+        .plugins()
+        .iter()
+        .map(|plugin| plugin_info(plugin))
+        .collect()
+}
+
+/// One loaded plugin, on the wire. Shared by `status` and the push lease so a
+/// pusher and a local operator are told the same three things about a plugin.
+fn plugin_info(plugin: &crate::plugin::Plugin) -> lore_core::PluginInfo {
+    lore_core::PluginInfo {
+        name: plugin.name.clone(),
+        fingerprint: plugin.fingerprint.clone(),
+        extensions: plugin
+            .extensions()
+            .into_iter()
+            .map(ToString::to_string)
+            .collect(),
+    }
 }
 
 async fn list_projects(State(state): State<AppState>) -> ApiResult<ProjectList> {
@@ -577,6 +646,7 @@ async fn remove_project(
     let _ = state.watch.send(WatchCommand::Unwatch(id));
     state.watch_status.forget(id);
     state.index.guard.forget(id);
+    state.index.fallbacks.forget(id);
     // A lease on a project that no longer exists cannot commit anything, so
     // its staged content goes with it rather than waiting for the reaper.
     if let Some(dir) = state.push.forget(id) {
@@ -877,6 +947,13 @@ async fn discard_staging(dir: Utf8PathBuf) {
     let _ = tokio::task::spawn_blocking(move || push::discard(&dir)).await;
 }
 
+/// The lease, and everything about this receiver a pusher cannot infer.
+///
+/// The plugin set rides here rather than on a route of its own because a pusher
+/// already calls this before every push and never needs it at any other moment:
+/// chunking is receiver-side, so what the receiver has installed is a property
+/// of the session being opened. It is advertisement only — no negotiation, no
+/// refusal, nothing conditional on it (2026-08-17 contract, "Remote mode").
 fn lease_response(state: &AppState, session: PushSessionId, epoch: PushEpoch) -> PushLeaseResponse {
     PushLeaseResponse {
         session,
@@ -884,6 +961,7 @@ fn lease_response(state: &AppState, session: PushSessionId, epoch: PushEpoch) ->
         ttl_secs: state.push.ttl().as_secs(),
         heartbeat_secs: state.config.push.heartbeat().as_secs(),
         min_push_interval_secs: state.push.min_interval().as_secs(),
+        plugins: installed_plugins(state),
     }
 }
 
@@ -1026,6 +1104,17 @@ async fn push_manifest(
     // contains is the pusher's business.
     let manifest = request.manifest;
 
+    // The plugins in force for this project, resolved the same way the pass
+    // itself resolves them (receiver-side `.lore.toml` ∩ installed): a stamp
+    // carries the claiming plugin's fingerprint, so a diff that did not know
+    // about plugins would consider every claimed file unchanged and never ask
+    // for the content that has to be re-chunked.
+    let root = project.root.clone();
+    let enabled = tokio::task::spawn_blocking(move || crate::repo_config::enabled_plugins(&root))
+        .await
+        .map_err(|err| ApiErr::internal("push manifest", err))?;
+    let plugins = state.plugins.enabled_only(&enabled);
+
     let known: BTreeMap<&str, &str> = stored
         .iter()
         .map(|record| (record.path.as_str(), record.content_hash.as_str()))
@@ -1034,7 +1123,12 @@ async fn push_manifest(
         .entries
         .iter()
         .filter(|entry| {
-            let stamp = index::content_stamp(Utf8Path::new(&entry.path), &entry.hash, profile);
+            let stamp = index::content_stamp(
+                Utf8Path::new(&entry.path),
+                &entry.hash,
+                profile,
+                Some(&plugins),
+            );
             known.get(entry.path.as_str()).copied() != Some(stamp.as_str())
         })
         .map(|entry| entry.path.clone())

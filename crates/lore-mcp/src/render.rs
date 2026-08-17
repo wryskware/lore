@@ -621,6 +621,8 @@ mod tests {
             embeddings: EmbeddingStatus::Unconfigured,
             latency: Vec::new(),
             embed_abandoned: 0,
+            plugins: Vec::new(),
+            plugin_diagnostics: Vec::new(),
         };
         assert!(status(&base).contains("embeddings: UNCONFIGURED"));
         assert!(
@@ -686,6 +688,8 @@ mod tests {
             embeddings: EmbeddingStatus::Unconfigured,
             latency: Vec::new(),
             embed_abandoned: 0,
+            plugins: Vec::new(),
+            plugin_diagnostics: Vec::new(),
         });
         assert!(rendered.contains("  lexomancy  files 812  chunks 9134  embedded 0/9134 (0%)"));
         assert!(rendered.contains("  lore       files 96  chunks 1204  embedded 1204/1204 (100%)"));
@@ -717,6 +721,8 @@ mod tests {
             embeddings: EmbeddingStatus::Unconfigured,
             latency: Vec::new(),
             embed_abandoned: 0,
+            plugins: Vec::new(),
+            plugin_diagnostics: Vec::new(),
         };
         assert!(!status(&status_body).contains("WATCH RETRYING"));
 
@@ -742,6 +748,8 @@ mod tests {
             embeddings: EmbeddingStatus::Unconfigured,
             latency: Vec::new(),
             embed_abandoned: abandoned,
+            plugins: Vec::new(),
+            plugin_diagnostics: Vec::new(),
         };
         assert!(!status(&body(0)).contains("EMBEDDING"));
 
@@ -779,6 +787,8 @@ mod tests {
             embeddings: EmbeddingStatus::Unconfigured,
             latency: Vec::new(),
             embed_abandoned: 0,
+            plugins: Vec::new(),
+            plugin_diagnostics: Vec::new(),
         };
 
         assert!(!status(&body(0, Vec::new())).contains("AUTHORITY"));

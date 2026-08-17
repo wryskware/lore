@@ -709,6 +709,10 @@ async fn v1_status_reports_per_project_watcher_state() {
         config: Arc::new(Config::default()),
         embeddings: Embedder::disabled(),
         latency: lore::daemon::latency::LatencyRecorder::default(),
+        // No chunker plugins: this file is not about them, and an empty
+        // registry routes exactly as no registry at all does.
+        plugins: std::sync::Arc::new(lore::plugin::PluginRegistry::empty()),
+        plugin_diagnostics: std::sync::Arc::new(Vec::new()),
         data_dir: fixture.data_dir.clone(),
         // Nothing here drives a real shutdown; the token exists so the
         // route can cancel something rather than reach for a global.
