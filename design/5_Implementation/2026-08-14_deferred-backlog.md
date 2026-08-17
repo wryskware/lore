@@ -89,3 +89,35 @@ briefs; details in the cited docs.
 - **Authority multiplier dominance is only proven at fixture scale.** The
   ordering (0.7 scratch cap below neutral, etc.) is tested at the ranks the
   fixtures produce, not against arbitrary RRF gaps on large corpora.
+
+## Product questions parked (2026-08-17)
+
+- **Should an LLM be coupled to lore, and on which path?** Prompted by
+  Augment Code's context engine, so the premise was checked before parking it.
+  What their docs actually say: the Context Engine returns *ranked chunks* —
+  "results with file paths, line numbers, and snippets" — with no
+  answer-generation step; the prose answers come from the agent calling it
+  (Auggie CLI, or whatever agent the MCP is plugged into), not from the engine.
+  Their one shipped LLM coupling is on the **write** path: Context Lineage
+  detects new commits, has an LLM summarize each diff, and embeds the summary
+  alongside code chunks so "why was this renamed" retrieves the commit itself.
+  So lore is not missing a capability their engine has — lore's caller is
+  already an LLM, and that is the same place Augment's synthesis happens.
+  Three distinct proposals hide inside "couple an LLM", worth deciding
+  separately:
+  1. **Index-time enrichment** — LLM summaries of commits, files or modules,
+     embedded as retrievable chunks. Closest to what Augment demonstrably
+     ships; costs indexing time and GPU, no query-path latency.
+  2. **Query-time rewriting / reranking** — HyDE-style query expansion or a
+     cross-encoder/LLM rerank over the fused candidate list. Still returns
+     chunks; measurable directly by [[../6_Evaluation/2026-08-17_relevance-bench-proposal]].
+  3. **Query-time synthesis** — lore returns prose. The only real payoff is
+     saving the *caller's* context window, since the caller can already
+     synthesize. Weigh against the extra dependency and GPU contention with
+     embeddings.
+  Canon is silent: D-0003 constrains embedding *providers* to local-only and
+  says nothing about generation; D-0004 scopes v0.1 as "a grep/CCE
+  replacement, not a memory system". Nothing here is decided.
+  Sources: `docs.augmentcode.com/context-services/context-connectors/how-it-works`,
+  `augmentcode.com/blog/announcing-context-lineage`,
+  `docs.augmentcode.com/context-services/mcp/overview`.
