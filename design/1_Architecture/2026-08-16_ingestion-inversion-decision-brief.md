@@ -7,7 +7,7 @@ last_reviewed: 2026-08-16
 
 **Status: unclassified exploration.** Nothing here is decided. This brief
 proposes one design for the ingestion fork recorded in the project-scoping
-brief (`2026-08-16_project-scoping-decision-brief.md`, "The part that may
+brief (`../4_Interfaces/2026-08-16_project-scoping-decision-brief.md`, "The part that may
 dominate everything else") and in issue #18, states what that design refuses
 to build and why, and lists the questions the decision session still has to
 answer. It touches D-0003 and D-0007 directly; neither is amended by this
@@ -26,9 +26,13 @@ daemon and repo share a machine. The scoping brief named three exits:
 3. **Ingestion inverts.** The client pushes file content; the daemon never
    touches a filesystem it does not own.
 
-This brief develops option 3, on the argument that it is the only exit with a
-clean tenancy story, and that — with the design below — its concurrency
-hazards can be made structurally impossible rather than carefully avoided.
+This brief develops option 3, on the argument that it gives any shared or
+remote deployment the cleanest boundary, and that — with the design below —
+its concurrency hazards can be made structurally impossible rather than
+carefully avoided. Snapshot ingestion is not itself tenancy: it serializes
+writers and scopes index mutations, but it does not decide who a caller is or
+what that caller may read or change. Isolation between mutually untrusted
+callers is issue #18's scope and stays out of this brief.
 
 ## The reframe that bounds the lift
 
@@ -114,6 +118,13 @@ as epoch churn, reportable in status, and never corrupting, because each
 generation is wholly one pusher's view. This is D-0003's single-owner
 principle surviving the wire: races degrade to loud rejection.
 
+A lease is a consistency primitive, not an authorization grant. Any deployment
+that exposes the push surface beyond loopback must authorize lease acquisition
+before the daemon sees it, and the daemon-issued push-session handle must be
+unguessable and bound to both the project and epoch. Every upload and the final
+commit present that handle; the commit checks the epoch in the same transaction
+that publishes the generation.
+
 ### Topology: one filesystem observer per machine
 
 The walker and watcher live in the **local daemon** and nowhere else. Agent
@@ -128,6 +139,20 @@ agents cannot race to reindex.
 - **Remote mode:** the local daemon is a forwarder — it observes the
   filesystem and pushes snapshots to a remote daemon that owns the index.
   The inversion happens on the daemon→server hop, not the agent→daemon hop.
+
+### Trust boundary
+
+The daemon remains a trusted-local service: loopback-only by default, with no
+concept of users, roles, or authorization policy. Every data operation is
+nevertheless scoped to one resolved project; unscoped search, expand, status,
+ingestion, and lease acquisition are rejected, and machine-wide enumeration
+and registration remain an explicitly local/admin surface. Manifest
+validation, hashing, staging, epoch fencing, and atomic publication are
+mechanisms; deciding who a caller is and what that caller may touch is a
+deployment concern layered in front of the daemon (issue #18's scope), and a
+caller-supplied project name is never treated as proof of access there.
+Nothing in this brief makes the daemon safe or supported for direct Internet
+exposure.
 
 ### Storage in remote mode
 
@@ -183,13 +208,14 @@ residual risk to weigh.
 
 ## Interaction with held and existing decisions
 
-- **Scoping hold resolves as predicted.** The scoping brief held the identity
-  mechanism *because* this fork could overturn it. Inversion makes path-based
-  identity moot on the remote hop: the pusher must name its project, so
-  declared/registered identity is close to forced. The amended-B shape
-  reviewed in the scoping brief (registry binds declared keys, rejects
-  duplicates at `lore add`, containment as local-only convenience) is the
-  natural fit.
+- **The scoping hold narrows but does not disappear.** Inversion makes
+  path-based identity moot on the remote hop: every request must resolve to one
+  project. It does *not* make a repo-declared name an authorization identity.
+  Locally, the registry can bind the declared `.lore.toml` name and use
+  containment as a discovery convenience; a remote deployment must map caller
+  identity to project access by some means outside the declared name (issue
+  #18's scope). The wire requires a resolved project; how different
+  deployments obtain it can remain different.
 - **D-0003** (single authoritative owner of index state) is preserved, not
   weakened: one filesystem observer per machine, one index owner per
   deployment, and the lease/epoch mechanism makes multi-owner violation a
