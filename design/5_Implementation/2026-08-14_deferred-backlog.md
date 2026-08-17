@@ -16,14 +16,29 @@ briefs; details in the cited docs.
   `Store`; `StoreError` leaks rusqlite types. Define the trait + neutral
   error around what daemon/search/embed actually use; policy above the seam.
   Interface-level only — no second engine until M4 earns it.
-- **Embed worker parked via query-side health demotion.** Residual from the
-  embed fix wave (ef650a2): needs a proper wake/recovery path.
+- ~~Embed worker parked via query-side health demotion~~ — fixed 2026-08-17
+  (`0215a81`). The entry was accurate and the hazard was still live: issue
+  #5 had wired `Health::request_probe` to the query *timeout* branch, which
+  does not demote, while the branch that does demote (a hard failure, e.g. a
+  400) had no wake path at all. A worker parked in its select watches the
+  indexer pulse, the probe request, the idle tick and cancellation — a health
+  write wakes none of them — so the endpoint stayed reported unreachable and
+  every search stayed lexical-only for up to the 60s fallback tick. Both
+  query outcomes now converge on the same wake-up. Residual: `Embedder::
+  refresh()` demotes without a probe request on the same pattern; it has no
+  production callers today, so it was left alone.
 - **Loopback-without-auth, before M3 `session_log`.** A write endpoint
   changes the threat model; decide auth posture before it ships.
-- **BOM handling in code/text chunkers.** Markdown steps over the BOM;
-  code/plain-text chunkers leak it into the first chunk.
-- **ATX trailing-`#` trimming.** `scan_headings` trims unconditionally, so
-  `# Learning C#` loses its `#` in heading paths/anchors.
+- ~~BOM handling in code/text chunkers~~ — fixed 2026-08-17 (`da8bbbc`).
+  Stripped once in `common::trim_span`, the single function every chunker's
+  spans pass through, rather than per chunker. Measured aside: tree-sitter
+  symbol spans already started after the mark, so the real leak was the
+  window/text path — unknown extensions, `.txt`, and code that fails to parse
+  and degrades to windows.
+- ~~ATX trailing-`#` trimming~~ — fixed 2026-08-17 (`ae4ed6c`). `scan_headings`
+  now implements the CommonMark §4.2 rule (a trailing `#` run closes a heading
+  only when preceded by a space/tab, or when it is the whole content), so
+  `# Learning C#` keeps its `#` while `## Wrap-up ###` still trims.
 - **`path_glob` search filter — deferred until a need arises (low
   priority).** 4.1 was amended (S1#8) to document the implemented literal
   prefix; a real glob (`Assets/**/Tests/*.cs`, globset, SQL prefix pushdown,
