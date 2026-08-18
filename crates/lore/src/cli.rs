@@ -721,7 +721,7 @@ pub async fn index(project: Option<String>, allow_mass_delete: bool) -> Result<(
 
 /// `lore status` — daemon and index health. `project` additionally reports
 /// that project's per-corpus store-scan latency window.
-pub async fn status(json: bool, project: Option<String>) -> Result<()> {
+pub async fn status(json: bool, project: Option<String>, short: bool) -> Result<()> {
     let client = Client::connect()?;
     let route = match &project {
         Some(p) => format!("status?project={}", urlencode(p)),
@@ -732,7 +732,7 @@ pub async fn status(json: bool, project: Option<String>) -> Result<()> {
         println!("{body}");
         return Ok(());
     }
-    print!("{}", render_status(&parse::<DaemonStatus>(&body)?));
+    print!("{}", render_status(&parse::<DaemonStatus>(&body)?, short));
     Ok(())
 }
 
@@ -1111,7 +1111,7 @@ fn render_expand(project: &str, response: &ExpandResponse) -> String {
     )
 }
 
-fn render_status(status: &DaemonStatus) -> String {
+fn render_status(status: &DaemonStatus, short: bool) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
@@ -1122,6 +1122,17 @@ fn render_status(status: &DaemonStatus) -> String {
     );
     let _ = writeln!(out, "{}", render_embeddings(&status.embeddings));
     push_abandoned(&mut out, status.embed_abandoned);
+    if short {
+        // The whole point of --short: fleet coverage in three lines. Per-project
+        // detail, plugins, and latency all belong to the long form.
+        let _ = writeln!(
+            out,
+            "projects {}  {}",
+            status.projects.len(),
+            render_totals(status)
+        );
+        return out;
+    }
     push_installed_plugins(&mut out, status);
     for l in &status.latency {
         let _ = writeln!(
@@ -1142,7 +1153,12 @@ fn render_status(status: &DaemonStatus) -> String {
         return out;
     }
 
-    let _ = writeln!(out, "projects ({}):", status.projects.len());
+    let _ = writeln!(
+        out,
+        "projects ({}):  {}",
+        status.projects.len(),
+        render_totals(status)
+    );
     let width = status
         .projects
         .iter()
@@ -1427,6 +1443,22 @@ fn coverage(embedded: u64, chunks: u64) -> String {
     }
     let percent = (embedded as f64 / chunks as f64 * 100.0).round() as u64;
     format!("{embedded}/{chunks} ({percent}%)")
+}
+
+/// Embedding coverage summed across every registered project.
+///
+/// Chunk-weighted, not an average of per-project percentages: a 24-chunk
+/// design scratchpad at 100% must not offset an 18k-chunk Unity project at
+/// 0%. During a re-embed this is the only number that answers "how far in
+/// am I" without mentally summing nine rows.
+///
+/// Rounds like [`coverage`], which means a fleet one chunk short of complete
+/// reads as `(100%)`. The raw pair is right there beside it; a `99%` that
+/// never resolves would be the worse lie during a long drain.
+fn render_totals(status: &DaemonStatus) -> String {
+    let embedded = status.projects.iter().map(|p| p.embedded_chunks).sum();
+    let chunks = status.projects.iter().map(|p| p.chunks).sum();
+    format!("embedded {}", coverage(embedded, chunks))
 }
 
 fn render_embeddings(status: &EmbeddingStatus) -> String {
@@ -1997,19 +2029,111 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_empty_registry_points_at_the_command_that_fixes_it() {
-        let rendered = render_status(&DaemonStatus {
+    /// A daemon carrying exactly the projects described, everything else bare.
+    fn daemon_with(projects: Vec<(u64, u64)>) -> DaemonStatus {
+        DaemonStatus {
             api_version: 1,
             daemon_version: "0.1.0".into(),
             generation: 0,
-            projects: vec![],
-            embeddings: EmbeddingStatus::Unconfigured,
+            projects: projects
+                .into_iter()
+                .enumerate()
+                .map(|(i, (embedded, chunks))| ProjectStatus {
+                    name: format!("p{i}"),
+                    root: format!(r"C:\repos\p{i}"),
+                    chunks,
+                    embedded_chunks: embedded,
+                    ..ProjectStatus::default()
+                })
+                .collect(),
+            embeddings: EmbeddingStatus::Ready {
+                endpoint: "http://127.0.0.1:8000/v1".into(),
+                model: "Qwen/Qwen3-Embedding-4B".into(),
+            },
             latency: Vec::new(),
             embed_abandoned: 0,
             plugins: Vec::new(),
             plugin_diagnostics: Vec::new(),
-        });
+        }
+    }
+
+    #[test]
+    fn fleet_coverage_weights_by_chunk_not_by_project() {
+        // A tiny finished project must not drag a huge unfinished one upward:
+        // the mean of the percentages here is 50%, the honest figure is 1%.
+        let rendered = render_status(&daemon_with(vec![(24, 24), (0, 18_504)]), false);
+        assert!(rendered.contains("embedded 24/18528 (0%)"), "{rendered}");
+        assert!(!rendered.contains("(50%)"), "{rendered}");
+    }
+
+    #[test]
+    fn fleet_coverage_sums_every_project_on_the_header_line() {
+        let rendered = render_status(&daemon_with(vec![(10, 20), (30, 40)]), false);
+        assert!(
+            rendered.contains("projects (2):  embedded 40/60 (67%)"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_registry_with_no_projects_has_no_coverage_to_divide_by() {
+        // Must not panic or print NaN%: `coverage` short-circuits at zero.
+        let rendered = render_status(&daemon_with(Vec::new()), true);
+        assert!(rendered.contains("projects 0  embedded 0/0"), "{rendered}");
+        assert!(!rendered.contains("NaN"), "{rendered}");
+    }
+
+    #[test]
+    fn short_keeps_the_verdict_lines_and_drops_the_per_project_table() {
+        let full = daemon_with(vec![(10, 20), (30, 40)]);
+        let short = render_status(&full, true);
+
+        // Kept: is the daemon up, are embeddings working, how far along is it.
+        assert!(
+            short.starts_with("lore daemon 0.1.0  api v1  generation 0\n"),
+            "{short}"
+        );
+        assert!(
+            short.contains("ready - http://127.0.0.1:8000/v1"),
+            "{short}"
+        );
+        assert!(
+            short.contains("projects 2  embedded 40/60 (67%)"),
+            "{short}"
+        );
+
+        // Dropped: the per-project rows are the whole point of the long form.
+        assert!(!short.contains(r"C:\repos\p0"), "{short}");
+        assert!(!short.contains("files 0"), "{short}");
+        assert_eq!(short.lines().count(), 3, "{short}");
+    }
+
+    #[test]
+    fn short_still_reports_a_stalled_embedding_backlog() {
+        // --short is a summary, not a quieter failure mode: the abandoned-chunk
+        // warning outranks brevity.
+        let mut status = daemon_with(vec![(10, 20)]);
+        status.embed_abandoned = 19;
+        let short = render_status(&status, true);
+        assert!(short.contains("EMBEDDING: 19 chunk(s)"), "{short}");
+    }
+
+    #[test]
+    fn an_empty_registry_points_at_the_command_that_fixes_it() {
+        let rendered = render_status(
+            &DaemonStatus {
+                api_version: 1,
+                daemon_version: "0.1.0".into(),
+                generation: 0,
+                projects: vec![],
+                embeddings: EmbeddingStatus::Unconfigured,
+                latency: Vec::new(),
+                embed_abandoned: 0,
+                plugins: Vec::new(),
+                plugin_diagnostics: Vec::new(),
+            },
+            false,
+        );
         assert!(rendered.contains("projects: none registered (run `lore add <path>`)"));
         assert!(rendered.starts_with("lore daemon 0.1.0  api v1  generation 0\n"));
     }
@@ -2029,9 +2153,9 @@ mod tests {
             plugins: Vec::new(),
             plugin_diagnostics: Vec::new(),
         };
-        assert!(!render_status(&body(0)).contains("EMBEDDING"));
+        assert!(!render_status(&body(0), false).contains("EMBEDDING"));
 
-        let rendered = render_status(&body(19));
+        let rendered = render_status(&body(19), false);
         assert!(rendered.contains("EMBEDDING: 19 chunk(s)"), "{rendered}");
         assert!(rendered.contains("daemon log"), "{rendered}");
     }
@@ -2078,12 +2202,12 @@ mod tests {
         };
 
         // Clean vault: not a word about authority.
-        assert!(!render_status(&project(0, Vec::new())).contains("AUTHORITY"));
+        assert!(!render_status(&project(0, Vec::new()), false).contains("AUTHORITY"));
 
-        let rendered = render_status(&project(
-            2,
-            vec!["design/a.md".into(), "design/b.md".into()],
-        ));
+        let rendered = render_status(
+            &project(2, vec!["design/a.md".into(), "design/b.md".into()]),
+            false,
+        );
         assert!(rendered.contains("AUTHORITY: 2 file(s)"), "{rendered}");
         assert!(rendered.contains("\n      design/a.md\n"), "{rendered}");
         assert!(rendered.contains("\n      design/b.md\n"), "{rendered}");
@@ -2094,10 +2218,10 @@ mod tests {
 
         // The daemon caps the list; the count is the complete figure, so the
         // difference has to be stated rather than quietly dropped.
-        let truncated = render_status(&project(
-            9,
-            vec!["design/a.md".into(), "design/b.md".into()],
-        ));
+        let truncated = render_status(
+            &project(9, vec!["design/a.md".into(), "design/b.md".into()]),
+            false,
+        );
         assert!(truncated.contains("... and 7 more"), "{truncated}");
     }
 
@@ -2135,20 +2259,23 @@ mod tests {
         };
 
         // A machine with no plugins and a project that enabled none: silence.
-        let quiet = render_status(&daemon(Vec::new(), Vec::new(), bare.clone()));
+        let quiet = render_status(&daemon(Vec::new(), Vec::new(), bare.clone()), false);
         assert!(!quiet.contains("plugin"), "{quiet}");
         assert!(!quiet.contains("PLUGIN"), "{quiet}");
 
         // Installed and in force: named, with a fingerprint short enough to
         // compare by eye and long enough to be a handle.
-        let working = render_status(&daemon(
-            vec![unity()],
-            Vec::new(),
-            ProjectStatus {
-                plugins_enabled: vec![unity()],
-                ..bare.clone()
-            },
-        ));
+        let working = render_status(
+            &daemon(
+                vec![unity()],
+                Vec::new(),
+                ProjectStatus {
+                    plugins_enabled: vec![unity()],
+                    ..bare.clone()
+                },
+            ),
+            false,
+        );
         assert!(
             working.contains("plugins: unity 6f1d2a3b4c5d (uxml, uss)"),
             "{working}"
@@ -2161,14 +2288,17 @@ mod tests {
 
         // Enabled but never installed: the files are indexed, just not the way
         // the repository asked for, so the remedy is named.
-        let missing = render_status(&daemon(
-            Vec::new(),
-            Vec::new(),
-            ProjectStatus {
-                plugins_missing: vec!["unity".into()],
-                ..bare.clone()
-            },
-        ));
+        let missing = render_status(
+            &daemon(
+                Vec::new(),
+                Vec::new(),
+                ProjectStatus {
+                    plugins_missing: vec!["unity".into()],
+                    ..bare.clone()
+                },
+            ),
+            false,
+        );
         assert!(
             missing.contains("PLUGINS: unity enabled in .lore.toml but not installed"),
             "{missing}"
@@ -2177,15 +2307,18 @@ mod tests {
 
         // Installed, enabled, and unable to run: the count of what fell back,
         // plus the machine-wide diagnostic that says why.
-        let broken = render_status(&daemon(
-            vec![unity()],
-            vec!["plugin \"unity\" grammar `xml.wasm` is unavailable".into()],
-            ProjectStatus {
-                plugins_enabled: vec![unity()],
-                plugin_fallback_files: 12,
-                ..bare
-            },
-        ));
+        let broken = render_status(
+            &daemon(
+                vec![unity()],
+                vec!["plugin \"unity\" grammar `xml.wasm` is unavailable".into()],
+                ProjectStatus {
+                    plugins_enabled: vec![unity()],
+                    plugin_fallback_files: 12,
+                    ..bare
+                },
+            ),
+            false,
+        );
         assert!(
             broken.contains("PLUGIN: plugin \"unity\" grammar `xml.wasm` is unavailable"),
             "{broken}"

@@ -80,6 +80,9 @@ enum Command {
         /// Additionally report this project's store-scan latency window.
         #[arg(long)]
         project: Option<String>,
+        /// Collapse to the daemon, embedding, and fleet-coverage lines only.
+        #[arg(long)]
+        short: bool,
     },
     /// Search the index — the same surface agents get over MCP.
     Search(cli::SearchArgs),
@@ -111,7 +114,11 @@ fn main() -> anyhow::Result<()> {
             // plugin is often before anything is running.
             cli::PluginCommand::Add { path } => cli::plugin_add(path),
         },
-        Command::Status { json, project } => cli::run(cli::status(json, project)),
+        Command::Status {
+            json,
+            project,
+            short,
+        } => cli::run(cli::status(json, project, short)),
         Command::Search(search) => cli::run(cli::search(search)),
     }
 }
