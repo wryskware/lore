@@ -27,7 +27,7 @@
 #
 # Results land in bench\results\<stamp>-<model>-<repo>-<arm>-<task>\.
 param(
-    [ValidateSet('luna', 'lunamax', 'qwen')] [string]$Model,
+    [ValidateSet('luna', 'lunamax', 'qwen', 'qwenrp')] [string]$Model,
     [ValidateSet('lore', 'terrarium', 'lexomancy')] [string]$Repo,
     [ValidateSet('on', 'off')] [string]$Arm,
     [ValidateSet('T1', 'T2', 'T3', 'T4', 'T5')] [string]$Task,
@@ -36,7 +36,7 @@ param(
     # argued rather than observed. Runs both arms, luna only. See the § Pilot
     # block below for why it is four cells and not fifteen.
     [switch]$Pilot,
-    [ValidateSet('luna', 'lunamax', 'qwen')] [string[]]$Models = @('luna', 'qwen'),
+    [ValidateSet('luna', 'lunamax', 'qwen', 'qwenrp')] [string[]]$Models = @('luna', 'qwen'),
     # Round 2 is scoped on-arm-only (15 cells): `-Matrix -Arms on`.
     [ValidateSet('on', 'off')] [string[]]$Arms = @('off', 'on'),
     # Matrix scope filters. A two-arm round runs lore+terrarium through the
@@ -69,6 +69,9 @@ $modelMap = @{
     luna    = @{ id = 'openai/gpt-5.6-luna'; variant = 'high' }
     lunamax = @{ id = 'openai/gpt-5.6-luna'; variant = 'max' }
     qwen    = @{ id = 'ollama/qwen3.8:latest'; variant = $null }
+    # Remote vLLM, not the local GPU -- so it is NOT in $serialModels below
+    # and may run concurrently, subject to -Throttle.
+    qwenrp  = @{ id = 'runpod/qwen3.8-27b'; variant = 'medium' }
 }
 
 # One tree per (repo, slot). Slot 'a' is the round-1 tree, already registered

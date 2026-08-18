@@ -7,6 +7,23 @@
     "external_directory": "allow"
   },
   "provider": {
+    "runpod": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Qwen3.8-27B (RunPod vLLM)",
+      "options": {
+        "baseURL": "https://vctghawamdqfru-8000.proxy.runpod.net/v1",
+        "apiKey": "EMPTY"
+      },
+      "models": {
+        "qwen3.8-27b": {
+          "name": "qwen3.8-27b (RunPod)",
+          "limit": {
+            "context": 262144,
+            "output": 32768
+          }
+        }
+      }
+    },
     "ollama": {
       "npm": "@ai-sdk/openai-compatible",
       "name": "Ollama (local)",
