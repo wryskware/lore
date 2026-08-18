@@ -46,6 +46,26 @@ before the round — round 2 shipped the pin unverified. It returns
 mount-relative paths (`Lexomancy/Assets/…`, `tools/…`) that open through the
 junctions from the bench cwd.
 
+## Correction (round 4)
+
+**The central claim below is wrong as written.** This report states that the
+ledger "never entered the pool" for T2 and that `behavior = "rank"` cannot add
+to a pool it never entered. [[2026-08-17_e2e-round-4-lunamax]] re-ran these ten
+cells at luna `max` against the same index and the on-arm T2 cell reformulated
+its query and got `DECISIONS.md:125-143` — D-0006 — **at rank 1**. The decisive
+document was one query away, not absent.
+
+The arms tied 4.0/4.0 at `max`. So the 1.5-point gap reported here was the
+model failing, not retrieval costing correctness, and the headline "the first
+round in which retrieval costs correctness" does not survive.
+
+What survives: the naive phrasing of an authority question returns undeclared
+drafts above the ledger. That is a ranking problem worth fixing, and it is a
+smaller claim than the one this document makes.
+
+The text below is left as written, rather than edited, so the record shows what
+was claimed and on what evidence.
+
 ## Results
 
 | task | prompt | score off | score on | input off | input on | diff | tools off | tools on | sec off | sec on |
