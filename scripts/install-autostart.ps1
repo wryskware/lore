@@ -6,7 +6,8 @@
 #
 # Registers two current-user scheduled tasks (no admin required):
 #   Lore Daemon      -> %USERPROFILE%\.cargo\bin\lore.exe daemon
-#   Lore Embeddings  -> scripts\serve-embeddings.ps1 (D-0014 reference stack)
+#   Lore Embeddings  -> scripts\serve-embeddings-vllm.ps1 (vLLM FP8 in WSL2)
+#                       or scripts\serve-embeddings.ps1 with -LlamaCpp
 #
 # Both run hidden at logon with no execution time limit. The daemon's
 # single-owner handshake makes a double start harmless (the second instance
@@ -15,7 +16,9 @@
 # Re-running this script replaces the existing tasks (idempotent).
 # Remove both with: .\install-autostart.ps1 -Uninstall
 param(
-    [switch]$Uninstall
+    [switch]$Uninstall,
+    # Register the retired llama.cpp embedding stack instead of the vLLM one.
+    [switch]$LlamaCpp
 )
 $ErrorActionPreference = 'Stop'
 
@@ -38,7 +41,9 @@ $loreExe = Join-Path $env:USERPROFILE '.cargo\bin\lore.exe'
 if (-not (Test-Path $loreExe)) {
     throw "$loreExe not found - install it with: cargo install --path crates/lore"
 }
-$serveScript = Join-Path $PSScriptRoot 'serve-embeddings.ps1'
+# vLLM in WSL2 (FP8) replaced the llama.cpp Q8_0 stack on 2026-08-17: same
+# model, ~2.1x throughput. Pass -LlamaCpp to register the old stack instead.
+$serveScript = Join-Path $PSScriptRoot ($LlamaCpp ? 'serve-embeddings.ps1' : 'serve-embeddings-vllm.ps1')
 if (-not (Test-Path $serveScript)) { throw "$serveScript not found" }
 $pwshExe = (Get-Command pwsh).Source
 
