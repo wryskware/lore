@@ -27,7 +27,7 @@
 #
 # Results land in bench\results\<stamp>-<model>-<repo>-<arm>-<task>\.
 param(
-    [ValidateSet('luna', 'qwen')] [string]$Model,
+    [ValidateSet('luna', 'lunamax', 'qwen')] [string]$Model,
     [ValidateSet('lore', 'terrarium', 'lexomancy')] [string]$Repo,
     [ValidateSet('on', 'off')] [string]$Arm,
     [ValidateSet('T1', 'T2', 'T3', 'T4', 'T5')] [string]$Task,
@@ -36,7 +36,7 @@ param(
     # argued rather than observed. Runs both arms, luna only. See the § Pilot
     # block below for why it is four cells and not fifteen.
     [switch]$Pilot,
-    [ValidateSet('luna', 'qwen')] [string[]]$Models = @('luna', 'qwen'),
+    [ValidateSet('luna', 'lunamax', 'qwen')] [string[]]$Models = @('luna', 'qwen'),
     # Round 2 is scoped on-arm-only (15 cells): `-Matrix -Arms on`.
     [ValidateSet('on', 'off')] [string[]]$Arms = @('off', 'on'),
     # Matrix scope filters. A two-arm round runs lore+terrarium through the
@@ -66,8 +66,9 @@ $resultsRoot = Join-Path $benchRoot 'results'
 New-Item -ItemType Directory -Force $resultsRoot | Out-Null
 
 $modelMap = @{
-    luna = @{ id = 'openai/gpt-5.6-luna'; variant = 'high' }
-    qwen = @{ id = 'ollama/qwen3.8:latest'; variant = $null }
+    luna    = @{ id = 'openai/gpt-5.6-luna'; variant = 'high' }
+    lunamax = @{ id = 'openai/gpt-5.6-luna'; variant = 'max' }
+    qwen    = @{ id = 'ollama/qwen3.8:latest'; variant = $null }
 }
 
 # One tree per (repo, slot). Slot 'a' is the round-1 tree, already registered
@@ -472,9 +473,14 @@ if ($Matrix) {
     # every T5 cell has a distinct (repo, arm) and therefore a distinct tree,
     # but held out of wave 1 so no T5 write lands under a reading cell in the
     # same tree. Wave 3: qwen, serial (GPU).
-    $readOnly = @($cells | Where-Object { $_.Model -eq 'luna' -and $_.Task -ne 'T5' })
-    $writes = @($cells | Where-Object { $_.Model -eq 'luna' -and $_.Task -eq 'T5' })
-    $serial = @($cells | Where-Object { $_.Model -ne 'luna' })
+    # Which models must run one at a time. Local models contend for the one
+    # GPU; hosted ones do not. Testing this by name ('luna') silently demoted
+    # every hosted model added later -- `lunamax` ran its whole matrix serially
+    # before anyone noticed it was four times slower than it should have been.
+    $serialModels = @('qwen')
+    $readOnly = @($cells | Where-Object { $_.Model -notin $serialModels -and $_.Task -ne 'T5' })
+    $writes = @($cells | Where-Object { $_.Model -notin $serialModels -and $_.Task -eq 'T5' })
+    $serial = @($cells | Where-Object { $_.Model -in $serialModels })
 
     # Assert the invariant the parallel waves rest on, rather than trusting it.
     foreach ($wave in @($readOnly, $writes)) {

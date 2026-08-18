@@ -19,7 +19,7 @@
 param(
     [Parameter(Mandatory)] [string]$Round,
     [ValidateSet('A', 'B')] [string]$Pass = 'A',
-    [ValidateSet('luna', 'qwen')] [string]$Model = 'luna',
+    [ValidateSet('luna', 'lunamax', 'qwen')] [string]$Model = 'luna',
     # Grade one batch only, by name: 'lore-T3', or 'lore' for a pass-B repo.
     [string]$Batch,
     [ValidateRange(1, 16)] [int]$Throttle = 5,
@@ -34,8 +34,9 @@ $resultsRoot = Join-Path $benchRoot 'results'
 $repoRoot = Split-Path $benchRoot -Parent
 
 $modelMap = @{
-    luna = @{ id = 'openai/gpt-5.6-luna'; variant = 'high' }
-    qwen = @{ id = 'ollama/qwen3.8:latest'; variant = $null }
+    luna    = @{ id = 'openai/gpt-5.6-luna'; variant = 'high' }
+    lunamax = @{ id = 'openai/gpt-5.6-luna'; variant = 'max' }
+    qwen    = @{ id = 'ollama/qwen3.8:latest'; variant = $null }
 }
 $m = $modelMap[$Model]
 
