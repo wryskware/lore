@@ -24,6 +24,7 @@
 
 use std::fmt::Write as _;
 use std::future::Future;
+use std::io::IsTerminal as _;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -721,19 +722,74 @@ pub async fn index(project: Option<String>, allow_mass_delete: bool) -> Result<(
 
 /// `lore status` — daemon and index health. `project` additionally reports
 /// that project's per-corpus store-scan latency window.
-pub async fn status(json: bool, project: Option<String>, short: bool) -> Result<()> {
-    let client = Client::connect()?;
-    let route = match &project {
-        Some(p) => format!("status?project={}", urlencode(p)),
-        None => "status".to_string(),
-    };
-    let body = client.get(&route).await?;
+pub async fn status(
+    json: bool,
+    project: Option<String>,
+    short: bool,
+    watch: Option<u64>,
+) -> Result<()> {
+    if let Some(every) = watch {
+        return status_watch(project, short, every).await;
+    }
+    let body = fetch_status(&project).await?;
     if json {
         println!("{body}");
         return Ok(());
     }
-    print!("{}", render_status(&parse::<DaemonStatus>(&body)?, short));
+    print!(
+        "{}",
+        render_status_with(&parse::<DaemonStatus>(&body)?, short, Palette::detect())
+    );
     Ok(())
+}
+
+/// One `GET /status`, connection included: `--watch` reconnects every tick
+/// rather than holding a handle, so a daemon restarted underneath it is picked
+/// back up instead of ending the session.
+async fn fetch_status(project: &Option<String>) -> Result<String> {
+    let client = Client::connect()?;
+    let route = match project {
+        Some(p) => format!("status?project={}", urlencode(p)),
+        None => "status".to_string(),
+    };
+    client.get(&route).await
+}
+
+/// `lore status --watch` — redraw in place until interrupted.
+///
+/// Repaints from the home position and clears forward rather than clearing
+/// first, so the frame is replaced in one write instead of blinking through an
+/// empty screen at every tick.
+///
+/// A daemon that goes away is drawn as a problem and polled for, not treated
+/// as the end of the watch: restarting the daemon is the single most likely
+/// thing to happen while someone is watching it.
+async fn status_watch(project: Option<String>, short: bool, every: u64) -> Result<()> {
+    if !std::io::stdout().is_terminal() {
+        bail!("--watch repaints the screen and needs a terminal; use `lore status` for a pipe");
+    }
+    let p = Palette::detect();
+    let every = Duration::from_secs(every.max(1));
+    // Clear once on entry; every later frame overwrites in place.
+    print!("\x1b[2J\x1b[H");
+    loop {
+        let frame = match fetch_status(&project).await {
+            Ok(body) => match parse::<DaemonStatus>(&body) {
+                Ok(status) => render_status_with(&status, short, p),
+                Err(e) => format!("{}\n", warn(p, &format!("unreadable status: {e}"))),
+            },
+            Err(e) => format!("{}\n", warn(p, &format!("daemon unreachable: {e}"))),
+        };
+        print!(
+            "\x1b[H{frame}\n{}\x1b[J",
+            p.dim(&format!(
+                "  watching · every {}s · ctrl-c to stop",
+                every.as_secs()
+            )),
+        );
+        std::io::Write::flush(&mut std::io::stdout())?;
+        tokio::time::sleep(every).await;
+    }
 }
 
 /// `lore search <query>` — the same query surface agents get over MCP, so a
@@ -1111,110 +1167,438 @@ fn render_expand(project: &str, response: &ExpandResponse) -> String {
     )
 }
 
-fn render_status(status: &DaemonStatus, short: bool) -> String {
+/// Terminal styling, resolved once per invocation.
+///
+/// Colour is dropped wholesale when stdout is not a terminal or `NO_COLOR` is
+/// set (https://no-color.org). `lore status` gets piped into logs and grepped
+/// often enough that escape sequences in a redirect would be a regression —
+/// and the layout carries every distinction on its own, so a plain render
+/// loses decoration and no meaning.
+///
+/// Box glyphs and bars are *not* gated: they are ordinary UTF-8, they survive
+/// a redirect into a file, and gating them would give the piped form a
+/// different shape rather than the same shape without colour.
+#[derive(Clone, Copy)]
+pub struct Palette {
+    color: bool,
+}
+
+impl Palette {
+    fn detect() -> Self {
+        Palette {
+            color: std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
+        }
+    }
+
+    /// The palette every test renders through, and the one a pipe gets.
+    #[cfg(test)]
+    fn plain() -> Self {
+        Palette { color: false }
+    }
+
+    /// Deliberately non-nesting: each call closes with a full reset, so
+    /// wrapping already-painted text would end the outer style early. Compose
+    /// by painting the pieces, never by painting a painted string.
+    fn paint(self, code: &str, text: &str) -> String {
+        if !self.color || text.is_empty() {
+            return text.to_string();
+        }
+        format!("\x1b[{code}m{text}\x1b[0m")
+    }
+
+    fn dim(self, text: &str) -> String {
+        self.paint("2", text)
+    }
+    fn bold(self, text: &str) -> String {
+        self.paint("1", text)
+    }
+    fn green(self, text: &str) -> String {
+        self.paint("32", text)
+    }
+    fn yellow(self, text: &str) -> String {
+        self.paint("33", text)
+    }
+    fn red(self, text: &str) -> String {
+        self.paint("31", text)
+    }
+}
+
+/// Display width, ignoring ANSI escapes because they occupy no columns.
+///
+/// Counts `char`s, so it is wrong for east-asian-wide and combining
+/// characters. Everything measured here is a project name, a number, or a
+/// path; the failure mode is a frame one column out of true, not a panic.
+fn vis_len(text: &str) -> usize {
+    let mut width = 0;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // A CSI sequence is ESC '[' then parameter/intermediate bytes then
+            // a final byte in 0x40..=0x7E. The '[' is itself inside that range,
+            // so it has to be consumed before the scan for the final byte
+            // starts — otherwise the sequence "ends" immediately and its
+            // parameters get counted as visible text.
+            if chars.next() != Some('[') {
+                continue;
+            }
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        } else {
+            width += 1;
+        }
+    }
+    width
+}
+
+/// `55931` as `55,931`. Nine projects' chunk counts are the numbers a reader
+/// actually compares, and unseparated six-digit figures do not compare by eye.
+fn commas(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Cells in a coverage bar. Twelve divides into halves, thirds, and quarters,
+/// which is what makes a partial bar readable at a glance.
+const BAR_CELLS: usize = 12;
+
+/// A coverage bar that is full only at genuinely complete.
+///
+/// The fill floors, and a project one chunk short renders eleven cells rather
+/// than twelve. During a 53k-chunk re-embed the whole value of this surface is
+/// the difference between "nearly done" and "done"; a bar that saturates early
+/// erases exactly that.
+fn bar(p: Palette, embedded: u64, chunks: u64) -> String {
+    let filled = if chunks == 0 {
+        0
+    } else if embedded >= chunks {
+        BAR_CELLS
+    } else {
+        let cells = (embedded as f64 / chunks as f64 * BAR_CELLS as f64).floor() as usize;
+        cells.min(BAR_CELLS - 1)
+    };
+    let done: String = "█".repeat(filled);
+    let rest: String = "░".repeat(BAR_CELLS - filled);
+    let done = if filled == BAR_CELLS {
+        p.green(&done)
+    } else {
+        p.yellow(&done)
+    };
+    format!("{done}{}", p.dim(&rest))
+}
+
+/// The percentage beside the bar, floored on the same reasoning: `100%` is a
+/// claim of completeness, so it is reserved for actual completeness.
+fn percent(embedded: u64, chunks: u64) -> u64 {
+    if chunks == 0 {
+        return 0;
+    }
+    if embedded >= chunks {
+        return 100;
+    }
+    (embedded as f64 / chunks as f64 * 100.0).floor() as u64
+}
+
+/// Embedding coverage summed across every registered project.
+///
+/// Chunk-weighted, not an average of per-project percentages: a 24-chunk
+/// design scratchpad at 100% must not offset an 18k-chunk Unity project at
+/// 0%. During a re-embed this is the only number that answers "how far in am
+/// I" without mentally summing nine rows.
+fn totals(status: &DaemonStatus) -> (u64, u64) {
+    (
+        status.projects.iter().map(|p| p.embedded_chunks).sum(),
+        status.projects.iter().map(|p| p.chunks).sum(),
+    )
+}
+
+/// The fleet line: project count, corpus size, and how much of it is embedded.
+///
+/// Carries the raw `embedded/total` pair and not just the percentage. The
+/// percentage answers "am I nearly done"; the pair answers "how much is left",
+/// which is the question during the ~6 minutes a full re-embed takes.
+fn fleet_line(p: Palette, status: &DaemonStatus) -> String {
+    let (embedded, chunks) = totals(status);
+    format!(
+        "{} {} {} {} {} {} {}% {}",
+        p.bold(&status.projects.len().to_string()),
+        p.dim(if status.projects.len() == 1 {
+            "project"
+        } else {
+            "projects"
+        }),
+        p.dim("·"),
+        p.bold(&format!("{}/{}", commas(embedded), commas(chunks))),
+        p.dim("chunks ·"),
+        bar(p, embedded, chunks),
+        percent(embedded, chunks),
+        p.dim("embedded"),
+    )
+}
+
+/// A rounded frame around the daemon-identity rows.
+///
+/// Sized to its own content rather than to the terminal: there is no terminal
+/// width available here without a dependency, and a frame that is narrower
+/// than the window is merely modest, while one that is wider wraps and looks
+/// broken. `rows` are pre-styled, so every measurement goes through
+/// [`vis_len`].
+fn panel(title: &str, right: &str, rows: &[String]) -> String {
+    let content = rows.iter().map(|r| vis_len(r)).max().unwrap_or(0);
+    // A row costs its own width plus two spaces of padding on each side; the
+    // top rule costs title + right + the six literal chars around them, and
+    // needs at least one fill dash between the two.
+    let header = vis_len(title) + vis_len(right) + 7;
+    let inner = content.saturating_add(4).max(header);
+
     let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "lore daemon {version}  api v{api}  generation {generation}",
-        version = status.daemon_version,
-        api = status.api_version,
-        generation = status.generation,
-    );
-    let _ = writeln!(out, "{}", render_embeddings(&status.embeddings));
-    push_abandoned(&mut out, status.embed_abandoned);
+    let fill = inner - vis_len(title) - vis_len(right) - 6;
+    let _ = writeln!(out, "╭─ {title} {} {right} ─╮", "─".repeat(fill));
+    for row in rows {
+        let pad = inner.saturating_sub(vis_len(row) + 4);
+        let _ = writeln!(out, "│  {row}{}  │", " ".repeat(pad));
+    }
+    let _ = writeln!(out, "╰{}╯", "─".repeat(inner));
+    out
+}
+
+/// The wordmark, in the block-shadow style figlet calls ANSI Shadow.
+///
+/// Long form only. `--short` exists precisely for the reader who wants the
+/// verdict without the ceremony, and `--json` has no room for ceremony at all.
+fn banner(p: Palette) -> String {
+    const ROWS: [&str; 6] = [
+        r"██╗      ██████╗ ██████╗ ███████╗",
+        r"██║     ██╔═══██╗██╔══██╗██╔════╝",
+        r"██║     ██║   ██║██████╔╝█████╗  ",
+        r"██║     ██║   ██║██╔══██╗██╔══╝  ",
+        r"███████╗╚██████╔╝██║  ██║███████╗",
+        r"╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝",
+    ];
+    let mut out = String::new();
+    for (i, row) in ROWS.iter().enumerate() {
+        // The shadow rows read as shadow: dimming the last two keeps the
+        // wordmark from competing with the status it introduces.
+        let painted = if i >= 4 { p.dim(row) } else { p.bold(row) };
+        let _ = writeln!(out, "{painted}");
+    }
+    out
+}
+
+/// A status dot: the one glyph that says whether this line is good news.
+fn dot(p: Palette, ok: bool) -> String {
+    if ok { p.green("●") } else { p.red("●") }
+}
+
+/// The warning marker every problem line carries.
+///
+/// The UPPERCASE keyword that follows it is load-bearing and deliberately
+/// kept: it is what the existing surface trained readers (and greps) to look
+/// for, and the glyph is an addition to that signal rather than a replacement
+/// for it.
+fn warn(p: Palette, text: &str) -> String {
+    format!("{} {}", p.yellow("⚠"), p.yellow(text))
+}
+
+/// A hard stop rather than a degradation — the index is frozen, not merely
+/// imperfect — so it gets the colour that means stop.
+fn blocked(p: Palette, text: &str) -> String {
+    format!("{} {}", p.red("⚠"), p.red(text))
+}
+
+/// Tests render through the plain palette: escape sequences in an assertion
+/// would pin the decoration rather than the content, and the content is what
+/// these tests are about.
+#[cfg(test)]
+fn render_status(status: &DaemonStatus, short: bool) -> String {
+    render_status_with(status, short, Palette::plain())
+}
+
+fn render_status_with(status: &DaemonStatus, short: bool, p: Palette) -> String {
+    let mut out = String::new();
+    let title = p.bold(&format!("lore {}", status.daemon_version));
+    let right = p.dim(&format!(
+        "api v{} · gen {}",
+        status.api_version, status.generation
+    ));
+
     if short {
-        // The whole point of --short: fleet coverage in three lines. Per-project
-        // detail, plugins, and latency all belong to the long form.
-        let _ = writeln!(
-            out,
-            "projects {}  {}",
-            status.projects.len(),
-            render_totals(status)
-        );
+        // --short is a glance, not a smaller frame: no panel, three lines, the
+        // same three verdicts. Per-project detail belongs to the long form.
+        let _ = writeln!(out, "{title} {right}");
+        let _ = writeln!(out, "{}", embedding_row(p, &status.embeddings));
+        push_abandoned(&mut out, p, status.embed_abandoned);
+        let _ = writeln!(out, "{}", fleet_line(p, status));
         return out;
     }
-    push_installed_plugins(&mut out, status);
-    for l in &status.latency {
-        let _ = writeln!(
-            out,
-            "latency {endpoint}: p50 {p50}ms  p90 {p90}ms  p95 {p95}ms  p99 {p99}ms  max {max}ms  ({n} requests)",
-            endpoint = l.endpoint,
-            p50 = l.p50_ms,
-            p90 = l.p90_ms,
-            p95 = l.p95_ms,
-            p99 = l.p99_ms,
-            max = l.max_ms,
-            n = l.samples,
-        );
+
+    out.push_str(&banner(p));
+    out.push('\n');
+    let mut rows = vec![embedding_row(p, &status.embeddings)];
+    if let Some(row) = plugin_row(p, status) {
+        rows.push(row);
     }
+    out.push_str(&panel(&title, &right, &rows));
+    for diagnostic in &status.plugin_diagnostics {
+        let _ = writeln!(out, "{}", warn(p, &format!("PLUGIN: {diagnostic}")));
+    }
+    push_abandoned(&mut out, p, status.embed_abandoned);
+    out.push('\n');
 
     if status.projects.is_empty() {
-        out.push_str("projects: none registered (run `lore add <path>`)\n");
+        let _ = writeln!(
+            out,
+            "  {}",
+            p.dim("no projects registered — add one with `lore add <path>`")
+        );
         return out;
     }
 
-    let _ = writeln!(
-        out,
-        "projects ({}):  {}",
-        status.projects.len(),
-        render_totals(status)
-    );
+    let _ = writeln!(out, "  {}", fleet_line(p, status));
+    out.push('\n');
+
     let width = status
         .projects
         .iter()
         .map(|project| project.name.chars().count())
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .min(28);
     for project in &status.projects {
-        let pad = width - project.name.chars().count();
+        let name = truncate(&project.name, width);
+        let pad = width.saturating_sub(vis_len(&name));
         let _ = writeln!(
             out,
-            "  {name}{blank}  files {files}  chunks {chunks}  embedded {embedded}  {root}{watch}",
-            name = project.name,
+            "  {name}{blank}  {bar} {pct:>3}%  {chunks:>9} {chunks_label} {files:>6} {files_label}",
+            name = p.bold(&name),
             blank = " ".repeat(pad),
-            files = project.files,
-            chunks = project.chunks,
-            embedded = coverage(project.embedded_chunks, project.chunks),
-            root = project.root,
-            watch = watch_note(project.watch),
+            bar = bar(p, project.embedded_chunks, project.chunks),
+            pct = percent(project.embedded_chunks, project.chunks),
+            chunks = commas(project.chunks),
+            chunks_label = p.dim("chunks"),
+            files = commas(project.files),
+            files_label = p.dim("files"),
         );
-        push_sources(&mut out, project);
-        push_plugins(&mut out, project);
-        push_authority(&mut out, project);
-        push_authority_violations(&mut out, project);
-        push_mass_delete_guard(&mut out, project);
-        push_lease_state(&mut out, project);
+        let _ = writeln!(out, "    {}", p.dim(&project.root));
+        push_watch(&mut out, p, project.watch);
+        push_sources(&mut out, p, project);
+        push_plugins(&mut out, p, project);
+        push_authority(&mut out, p, project);
+        push_authority_violations(&mut out, p, project);
+        push_mass_delete_guard(&mut out, p, project);
+        push_lease_state(&mut out, p, project);
+        out.push('\n');
+    }
+
+    for l in &status.latency {
+        let _ = writeln!(
+            out,
+            "  {} {}",
+            p.dim(&format!("latency {}", l.endpoint)),
+            p.dim(&format!(
+                "p50 {}ms · p90 {}ms · p95 {}ms · p99 {}ms · max {}ms ({} requests)",
+                l.p50_ms, l.p90_ms, l.p95_ms, l.p99_ms, l.max_ms, l.samples
+            )),
+        );
     }
     out
 }
 
-/// The chunker plugins this daemon has installed, and what the load refused.
-///
-/// Silent on a machine with no plugins and nothing to complain about, which is
-/// every machine until someone installs one — the same silent-when-clean rule
-/// the abandoned-chunk line follows. A diagnostic is never silent: a plugin
-/// that half-loaded is indistinguishable from one that is working, and this is
-/// the only place that difference surfaces.
-fn push_installed_plugins(out: &mut String, status: &DaemonStatus) {
-    if !status.plugins.is_empty() {
-        let _ = writeln!(
-            out,
-            "plugins: {}",
-            status
-                .plugins
-                .iter()
-                .map(|plugin| format!(
-                    "{} {} ({})",
-                    plugin.name,
-                    short_fingerprint(&plugin.fingerprint),
-                    extension_list(&plugin.extensions)
-                ))
-                .collect::<Vec<_>>()
-                .join("  ")
-        );
+/// A name too long for its column, cut with an ellipsis rather than allowed to
+/// shove every number on its row out of alignment.
+fn truncate(name: &str, width: usize) -> String {
+    if name.chars().count() <= width {
+        return name.to_string();
     }
-    for diagnostic in &status.plugin_diagnostics {
-        let _ = writeln!(out, "PLUGIN: {diagnostic}");
+    let keep = width.saturating_sub(1);
+    format!("{}…", name.chars().take(keep).collect::<String>())
+}
+
+/// The embedding verdict, as a panel row: the one line that decides whether
+/// search is semantic or lexical-only.
+fn embedding_row(p: Palette, status: &EmbeddingStatus) -> String {
+    match status {
+        EmbeddingStatus::Unconfigured => format!(
+            "{} {}   {}",
+            dot(p, false),
+            p.dim("embeddings"),
+            p.yellow("UNCONFIGURED — no endpoint set; search is lexical-only"),
+        ),
+        EmbeddingStatus::Unreachable { endpoint, error } => format!(
+            "{} {}   {}",
+            dot(p, false),
+            p.dim("embeddings"),
+            p.red(&format!(
+                "UNREACHABLE — {endpoint} ({error}); search is lexical-only until it answers"
+            )),
+        ),
+        EmbeddingStatus::Ready { endpoint, model } => format!(
+            "{} {}   {} {} {} {} {}",
+            dot(p, true),
+            p.dim("embeddings"),
+            p.green("ready"),
+            p.dim("·"),
+            p.bold(model),
+            p.dim("·"),
+            p.dim(endpoint),
+        ),
+    }
+}
+
+/// The chunker plugins this daemon has installed.
+///
+/// Absent on a machine with no plugins, which is every machine until someone
+/// installs one — the same silent-when-clean rule the abandoned-chunk line
+/// follows. What the load *refused* is never silent, but that is a diagnostic
+/// line outside the panel, not a row inside it: a plugin that half-loaded is
+/// indistinguishable from one that is working, and this is the only place that
+/// difference surfaces.
+fn plugin_row(p: Palette, status: &DaemonStatus) -> Option<String> {
+    if status.plugins.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} {}      {}",
+        dot(p, status.plugin_diagnostics.is_empty()),
+        p.dim("plugins"),
+        status
+            .plugins
+            .iter()
+            .map(|plugin| format!(
+                "{} {} {}",
+                p.bold(&plugin.name),
+                p.dim(&short_fingerprint(&plugin.fingerprint)),
+                p.dim(&format!("({})", extension_list(&plugin.extensions))),
+            ))
+            .collect::<Vec<_>>()
+            .join("  ")
+    ))
+}
+
+/// Silent when the watch is armed — the common case should not add noise —
+/// and loud when it is not, because the failure is otherwise invisible: the
+/// index simply stops keeping up.
+fn push_watch(out: &mut String, p: Palette, state: WatchState) {
+    match state {
+        // `Unknown` means an older daemon that cannot report; saying nothing
+        // is more honest than claiming either state.
+        WatchState::Armed | WatchState::Unknown => {}
+        WatchState::Retrying => {
+            let _ = writeln!(
+                out,
+                "    {}",
+                warn(p, "WATCH RETRYING — not indexing live; use `lore index`")
+            );
+        }
     }
 }
 
@@ -1225,11 +1609,12 @@ fn push_installed_plugins(out: &mut String, status: &DaemonStatus) {
 /// about a name enabled but not installed, and about files that fell back:
 /// both produce a perfectly ordinary index of plain line windows, which is
 /// exactly why neither is discoverable from the results.
-fn push_plugins(out: &mut String, project: &ProjectStatus) {
+fn push_plugins(out: &mut String, p: Palette, project: &ProjectStatus) {
     if !project.plugins_enabled.is_empty() {
         let _ = writeln!(
             out,
-            "    plugins: {}",
+            "    {} {}",
+            p.dim("plugins"),
             project
                 .plugins_enabled
                 .iter()
@@ -1241,17 +1626,30 @@ fn push_plugins(out: &mut String, project: &ProjectStatus) {
     if !project.plugins_missing.is_empty() {
         let _ = writeln!(
             out,
-            "    PLUGINS: {names} enabled in .lore.toml but not installed; the files they would \
-             claim are chunked as plain text (install with `lore plugin add <path>`)",
-            names = project.plugins_missing.join(", "),
+            "    {}",
+            warn(
+                p,
+                &format!(
+                    "PLUGINS: {names} enabled in .lore.toml but not installed; the files they \
+                     would claim are chunked as plain text (install with `lore plugin add <path>`)",
+                    names = project.plugins_missing.join(", "),
+                )
+            )
         );
     }
     if project.plugin_fallback_files > 0 {
         let _ = writeln!(
             out,
-            "    PLUGINS: {files} file(s) fell back to the built-in chunker in the last index \
-             pass because a plugin claimed them and could not run (see the PLUGIN line above)",
-            files = project.plugin_fallback_files,
+            "    {}",
+            warn(
+                p,
+                &format!(
+                    "PLUGINS: {files} file(s) fell back to the built-in chunker in the last \
+                     index pass because a plugin claimed them and could not run (see the PLUGIN \
+                     line above)",
+                    files = project.plugin_fallback_files,
+                )
+            )
         );
     }
 }
@@ -1259,15 +1657,21 @@ fn push_plugins(out: &mut String, project: &ProjectStatus) {
 /// An apply the mass-delete guard refused (D-0015). Loud, and naming the one
 /// command that overrides it: until someone does, this project's index is
 /// frozen against a filesystem it no longer matches.
-fn push_mass_delete_guard(out: &mut String, project: &ProjectStatus) {
+fn push_mass_delete_guard(out: &mut String, p: Palette, project: &ProjectStatus) {
     let Some(trip) = project.mass_delete_guard else {
         return;
     };
     let _ = writeln!(
         out,
-        "    INDEX BLOCKED: {trip}; re-run with `lore index {name} --allow-mass-delete` \
-         if that is intended",
-        name = project.name,
+        "    {}",
+        blocked(
+            p,
+            &format!(
+                "INDEX BLOCKED: {trip}; re-run with `lore index {name} --allow-mass-delete` if \
+                 that is intended",
+                name = project.name,
+            )
+        )
     );
 }
 
@@ -1275,20 +1679,22 @@ fn push_mass_delete_guard(out: &mut String, project: &ProjectStatus) {
 ///
 /// Silent for a project nobody has a lease on, which is every purely local
 /// project: local indexing never takes a lease, and a line saying so on every
-/// project would be noise. Loud when a lease exists, because takeover
-/// degrades sustained contention into epoch churn — and churn is only
-/// diagnosable if the epoch is visible.
-fn push_lease_state(out: &mut String, project: &ProjectStatus) {
+/// project would be noise. Loud when a lease exists, because takeover degrades
+/// sustained contention into epoch churn — and churn is only diagnosable if
+/// the epoch is visible.
+fn push_lease_state(out: &mut String, p: Palette, project: &ProjectStatus) {
     let Some(epoch) = project.push_lease_epoch else {
         return;
     };
     let _ = writeln!(
         out,
-        "    push: lease held at epoch {epoch}{staged}",
-        staged = if project.push_staged {
-            "  (content staged, not yet committed)"
+        "    {} {}{}",
+        p.dim("push"),
+        p.dim(&format!("lease held at epoch {epoch}")),
+        if project.push_staged {
+            p.dim("  (content staged, not yet committed)")
         } else {
-            ""
+            String::new()
         },
     );
 }
@@ -1298,25 +1704,25 @@ fn push_lease_state(out: &mut String, project: &ProjectStatus) {
 /// a corpus missing some of its vectors is invisible in the results.
 ///
 /// The remedy is the daemon log, which names what the endpoint actually said;
-/// nothing on this surface can.
-fn push_abandoned(out: &mut String, abandoned: u64) {
+/// nothing on this surface can. Printed in both the long and short forms:
+/// `--short` is a summary, not a quieter failure mode.
+fn push_abandoned(out: &mut String, p: Palette, abandoned: u64) {
     if abandoned == 0 {
         return;
     }
     let _ = writeln!(
         out,
-        "EMBEDDING: {abandoned} chunk(s) refused by the endpoint this daemon run and not \
-         embedded; they are retried periodically - see the daemon log for what it said"
+        "{}",
+        warn(
+            p,
+            &format!(
+                "EMBEDDING: {abandoned} chunk(s) refused by the endpoint this daemon run and not \
+                 embedded; they are retried periodically — see the daemon log for what it said"
+            )
+        )
     );
 }
 
-/// The repository's authority profile, its health, and its decision corpus.
-///
-/// Always printed, including the "none" case: which repositories participate
-/// in authority semantics at all is now a per-repository choice (D-0012), and
-/// a reader who cannot see the choice cannot tell an opted-out repo from a
-/// broken one. A config error is shouted about on its own line, because the
-/// repo is indexing under a *different model* than its file asked for.
 /// Where this project's files actually come from (D-0022).
 ///
 /// Silent for a project that is simply its own root, which is nearly all of
@@ -1329,17 +1735,26 @@ fn push_abandoned(out: &mut String, abandoned: u64) {
 /// A refused table is shouted about on its own line for the same reason a
 /// broken `.lore.toml` profile is: the project indexed as its root alone,
 /// which is a different project from the one the file described.
-fn push_sources(out: &mut String, project: &ProjectStatus) {
+fn push_sources(out: &mut String, p: Palette, project: &ProjectStatus) {
     if let Some(error) = &project.sources_error {
         let _ = writeln!(
             out,
-            "    SOURCES: {error}; this project indexed as its root alone"
+            "    {}",
+            warn(
+                p,
+                &format!("SOURCES: {error}; this project indexed as its root alone")
+            )
         );
     }
     if project.sources.is_empty() {
         return;
     }
-    let _ = writeln!(out, "    sources: {}", project.sources.len());
+    let _ = writeln!(
+        out,
+        "    {} {}",
+        p.dim("sources"),
+        p.dim(&project.sources.len().to_string())
+    );
     let width = project
         .sources
         .iter()
@@ -1352,8 +1767,9 @@ fn push_sources(out: &mut String, project: &ProjectStatus) {
         let _ = writeln!(
             out,
             "      {label}{blank}  {root}",
+            label = p.dim(&label),
             blank = " ".repeat(pad),
-            root = source.root,
+            root = p.dim(&source.root),
         );
     }
 }
@@ -1369,32 +1785,55 @@ fn mount_label(source: &lore_core::SourceInfo) -> String {
     }
 }
 
-fn push_authority(out: &mut String, project: &ProjectStatus) {
+/// The repository's authority profile, its health, and its decision corpus.
+///
+/// Always printed, including the "none" case: which repositories participate
+/// in authority semantics at all is a per-repository choice (D-0012), and a
+/// reader who cannot see the choice cannot tell an opted-out repo from a
+/// broken one. A config error is shouted about on its own line, because the
+/// repo is indexing under a *different model* than its file asked for.
+fn push_authority(out: &mut String, p: Palette, project: &ProjectStatus) {
     if let Some(error) = &project.authority_config_error {
         let _ = writeln!(
             out,
-            "    AUTHORITY CONFIG: {error}; this project indexes with no authority semantics"
+            "    {}",
+            warn(
+                p,
+                &format!(
+                    "AUTHORITY CONFIG: {error}; this project indexes with no authority semantics"
+                )
+            )
         );
     }
     let Some(profile) = &project.authority_profile else {
         if project.authority_config_error.is_none() {
-            let _ = writeln!(out, "    authority: none (no .lore.toml profile)");
+            let _ = writeln!(
+                out,
+                "    {} {}",
+                p.dim("authority"),
+                p.dim("none (no .lore.toml profile)")
+            );
         }
         return;
     };
     let behavior = project.authority_behavior.as_deref().unwrap_or("annotate");
     let _ = writeln!(
         out,
-        "    authority: {profile} ({behavior})  decisions {active}/{total} active{violations}",
-        active = project.decisions_active,
-        total = project.decisions_total,
-        violations = match project.decision_violations.len() {
+        "    {} {} {} {}{}",
+        p.dim("authority"),
+        p.dim(&format!("{profile} ({behavior})")),
+        p.dim("· decisions"),
+        p.dim(&format!(
+            "{}/{} active",
+            project.decisions_active, project.decisions_total
+        )),
+        match project.decision_violations.len() {
             0 => String::new(),
-            n => format!("  {n} record violation(s)"),
+            n => format!("  {}", p.yellow(&format!("{n} record violation(s)"))),
         },
     );
     for violation in &project.decision_violations {
-        let _ = writeln!(out, "      {violation}");
+        let _ = writeln!(out, "      {}", p.dim(violation));
     }
 }
 
@@ -1402,76 +1841,35 @@ fn push_authority(out: &mut String, project: &ProjectStatus) {
 /// are none; loud when there are, on the same reasoning as the watch note:
 /// otherwise the demotion is invisible and the author keeps believing those
 /// files are canon.
-fn push_authority_violations(out: &mut String, project: &ProjectStatus) {
+fn push_authority_violations(out: &mut String, p: Palette, project: &ProjectStatus) {
     if project.authority_violations == 0 {
         return;
     }
     let _ = writeln!(
         out,
-        "    AUTHORITY: {n} file(s) declare `decided` without citing an active decision; \
-         they rank as neutral",
-        n = project.authority_violations,
+        "    {}",
+        warn(
+            p,
+            &format!(
+                "AUTHORITY: {n} file(s) declare `decided` without citing an active decision; \
+                 they rank as neutral",
+                n = project.authority_violations,
+            )
+        )
     );
     for path in &project.authority_violation_paths {
-        let _ = writeln!(out, "      {path}");
+        let _ = writeln!(out, "      {}", p.dim(path));
     }
     let listed = project.authority_violation_paths.len() as u64;
     if project.authority_violations > listed {
         let _ = writeln!(
             out,
-            "      ... and {} more",
-            project.authority_violations - listed
+            "      {}",
+            p.dim(&format!(
+                "... and {} more",
+                project.authority_violations - listed
+            ))
         );
-    }
-}
-
-/// Silent when the watch is armed — the common case should not add noise —
-/// and loud when it is not, because the failure is otherwise invisible: the
-/// index simply stops keeping up.
-fn watch_note(state: WatchState) -> &'static str {
-    match state {
-        // `Unknown` means an older daemon that cannot report; saying nothing
-        // is more honest than claiming either state.
-        WatchState::Armed | WatchState::Unknown => "",
-        WatchState::Retrying => "  WATCH RETRYING - not indexing live; use `lore index`",
-    }
-}
-
-fn coverage(embedded: u64, chunks: u64) -> String {
-    if chunks == 0 {
-        return format!("{embedded}/0");
-    }
-    let percent = (embedded as f64 / chunks as f64 * 100.0).round() as u64;
-    format!("{embedded}/{chunks} ({percent}%)")
-}
-
-/// Embedding coverage summed across every registered project.
-///
-/// Chunk-weighted, not an average of per-project percentages: a 24-chunk
-/// design scratchpad at 100% must not offset an 18k-chunk Unity project at
-/// 0%. During a re-embed this is the only number that answers "how far in
-/// am I" without mentally summing nine rows.
-///
-/// Rounds like [`coverage`], which means a fleet one chunk short of complete
-/// reads as `(100%)`. The raw pair is right there beside it; a `99%` that
-/// never resolves would be the worse lie during a long drain.
-fn render_totals(status: &DaemonStatus) -> String {
-    let embedded = status.projects.iter().map(|p| p.embedded_chunks).sum();
-    let chunks = status.projects.iter().map(|p| p.chunks).sum();
-    format!("embedded {}", coverage(embedded, chunks))
-}
-
-fn render_embeddings(status: &EmbeddingStatus) -> String {
-    match status {
-        EmbeddingStatus::Unconfigured => {
-            "embeddings: UNCONFIGURED - no endpoint set; search is lexical-only".to_string()
-        }
-        EmbeddingStatus::Unreachable { endpoint, error } => format!(
-            "embeddings: UNREACHABLE - {endpoint} ({error}); search is lexical-only until it answers"
-        ),
-        EmbeddingStatus::Ready { endpoint, model } => {
-            format!("embeddings: ready - {endpoint} model {model}")
-        }
     }
 }
 
@@ -2012,21 +2410,37 @@ mod tests {
 
     #[test]
     fn status_names_all_three_embedding_states_distinctly() {
-        assert!(render_embeddings(&EmbeddingStatus::Unconfigured).contains("UNCONFIGURED"));
-        assert!(
-            render_embeddings(&EmbeddingStatus::Unreachable {
+        let p = Palette::plain();
+        assert!(embedding_row(p, &EmbeddingStatus::Unconfigured).contains("UNCONFIGURED"));
+        let unreachable = embedding_row(
+            p,
+            &EmbeddingStatus::Unreachable {
                 endpoint: "http://127.0.0.1:11434".into(),
                 error: "connection refused".into(),
-            })
-            .contains("UNREACHABLE - http://127.0.0.1:11434 (connection refused)")
+            },
+        );
+        assert!(unreachable.contains("UNREACHABLE"), "{unreachable}");
+        assert!(
+            unreachable.contains("http://127.0.0.1:11434"),
+            "{unreachable}"
         );
         assert!(
-            render_embeddings(&EmbeddingStatus::Ready {
+            unreachable.contains("(connection refused)"),
+            "{unreachable}"
+        );
+
+        let ready = embedding_row(
+            p,
+            &EmbeddingStatus::Ready {
                 endpoint: "http://127.0.0.1:11434".into(),
                 model: "nomic-embed-text".into(),
-            })
-            .contains("ready - http://127.0.0.1:11434 model nomic-embed-text")
+            },
         );
+        assert!(ready.contains("ready"), "{ready}");
+        assert!(ready.contains("nomic-embed-text"), "{ready}");
+        // The three states must not be distinguishable only by colour: a
+        // NO_COLOR reader gets exactly this string.
+        assert!(!ready.contains("UNREACHABLE"), "{ready}");
     }
 
     /// A daemon carrying exactly the projects described, everything else bare.
@@ -2062,24 +2476,28 @@ mod tests {
         // A tiny finished project must not drag a huge unfinished one upward:
         // the mean of the percentages here is 50%, the honest figure is 1%.
         let rendered = render_status(&daemon_with(vec![(24, 24), (0, 18_504)]), false);
-        assert!(rendered.contains("embedded 24/18528 (0%)"), "{rendered}");
-        assert!(!rendered.contains("(50%)"), "{rendered}");
+        assert!(rendered.contains("24/18,528 chunks"), "{rendered}");
+        assert!(rendered.contains("0% embedded"), "{rendered}");
+        assert!(!rendered.contains("50%"), "{rendered}");
     }
 
     #[test]
     fn fleet_coverage_sums_every_project_on_the_header_line() {
         let rendered = render_status(&daemon_with(vec![(10, 20), (30, 40)]), false);
+        // Floored, not rounded: 66.67% is not yet 67% of the way done.
         assert!(
-            rendered.contains("projects (2):  embedded 40/60 (67%)"),
+            rendered.contains("2 projects · 40/60 chunks ·"),
             "{rendered}"
         );
+        assert!(rendered.contains("66% embedded"), "{rendered}");
     }
 
     #[test]
     fn a_registry_with_no_projects_has_no_coverage_to_divide_by() {
         // Must not panic or print NaN%: `coverage` short-circuits at zero.
         let rendered = render_status(&daemon_with(Vec::new()), true);
-        assert!(rendered.contains("projects 0  embedded 0/0"), "{rendered}");
+        assert!(rendered.contains("0 projects · 0/0 chunks"), "{rendered}");
+        assert!(rendered.contains("0% embedded"), "{rendered}");
         assert!(!rendered.contains("NaN"), "{rendered}");
     }
 
@@ -2089,23 +2507,19 @@ mod tests {
         let short = render_status(&full, true);
 
         // Kept: is the daemon up, are embeddings working, how far along is it.
-        assert!(
-            short.starts_with("lore daemon 0.1.0  api v1  generation 0\n"),
-            "{short}"
-        );
-        assert!(
-            short.contains("ready - http://127.0.0.1:8000/v1"),
-            "{short}"
-        );
-        assert!(
-            short.contains("projects 2  embedded 40/60 (67%)"),
-            "{short}"
-        );
+        assert!(short.starts_with("lore 0.1.0 api v1 · gen 0\n"), "{short}");
+        assert!(short.contains("http://127.0.0.1:8000/v1"), "{short}");
+        assert!(short.contains("2 projects · 40/60 chunks ·"), "{short}");
 
         // Dropped: the per-project rows are the whole point of the long form.
         assert!(!short.contains(r"C:\repos\p0"), "{short}");
         assert!(!short.contains("files 0"), "{short}");
         assert_eq!(short.lines().count(), 3, "{short}");
+
+        // No banner and no frame either: --short is for the reader who wants
+        // the verdict without the ceremony.
+        assert!(!short.contains('╭'), "{short}");
+        assert!(!short.contains("██╗"), "{short}");
     }
 
     #[test]
@@ -2134,8 +2548,13 @@ mod tests {
             },
             false,
         );
-        assert!(rendered.contains("projects: none registered (run `lore add <path>`)"));
-        assert!(rendered.starts_with("lore daemon 0.1.0  api v1  generation 0\n"));
+        assert!(rendered.contains("no projects registered"), "{rendered}");
+        assert!(rendered.contains("lore add <path>"), "{rendered}");
+        // The long form opens with the wordmark; the daemon's identity moved
+        // into the frame's title and right rule.
+        assert!(rendered.starts_with("██╗"), "{rendered}");
+        assert!(rendered.contains("╭─ lore 0.1.0 "), "{rendered}");
+        assert!(rendered.contains("api v1 · gen 0 ─╮"), "{rendered}");
     }
 
     /// The CLI half of the same rule as `lore-mcp`'s renderer: silent when the
@@ -2161,10 +2580,76 @@ mod tests {
     }
 
     #[test]
-    fn coverage_reports_a_ratio_and_survives_an_unindexed_project() {
-        assert_eq!(coverage(0, 0), "0/0");
-        assert_eq!(coverage(0, 9134), "0/9134 (0%)");
-        assert_eq!(coverage(1204, 1204), "1204/1204 (100%)");
+    fn coverage_floors_so_that_a_hundred_percent_means_complete() {
+        assert_eq!(percent(0, 0), 0);
+        assert_eq!(percent(0, 9134), 0);
+        assert_eq!(percent(1204, 1204), 100);
+        // The case the whole rule exists for: one chunk short of done must not
+        // round up into a claim of completeness.
+        assert_eq!(percent(9133, 9134), 99);
+        assert_eq!(percent(55_930, 55_931), 99);
+    }
+
+    #[test]
+    fn the_bar_fills_completely_only_when_the_corpus_is_complete() {
+        let p = Palette::plain();
+        assert_eq!(bar(p, 9134, 9134), "████████████");
+        // 99.99% still shows an unfilled cell, matching the floored percentage.
+        assert!(bar(p, 9133, 9134).ends_with('░'), "{}", bar(p, 9133, 9134));
+        assert_eq!(bar(p, 0, 9134), "░░░░░░░░░░░░");
+        // An empty project has nothing to be a fraction of.
+        assert_eq!(bar(p, 0, 0), "░░░░░░░░░░░░");
+    }
+
+    #[test]
+    fn counts_over_a_thousand_are_separated() {
+        assert_eq!(commas(0), "0");
+        assert_eq!(commas(999), "999");
+        assert_eq!(commas(1_204), "1,204");
+        assert_eq!(commas(55_931), "55,931");
+        assert_eq!(commas(1_000_000), "1,000,000");
+    }
+
+    #[test]
+    fn escape_sequences_take_no_columns() {
+        let p = Palette { color: true };
+        let painted = p.green("ready");
+        assert!(painted.len() > "ready".len(), "not actually painted");
+        assert_eq!(vis_len(&painted), 5);
+        assert_eq!(vis_len("plain"), 5);
+    }
+
+    #[test]
+    fn a_frame_is_square_whether_or_not_its_rows_are_painted() {
+        // The panel measures pre-styled rows, so a mis-measure here shows up as
+        // a ragged right edge only when colour is on — the case tests miss.
+        for color in [false, true] {
+            let p = Palette { color };
+            let rows = vec![
+                embedding_row(
+                    p,
+                    &EmbeddingStatus::Ready {
+                        endpoint: "http://127.0.0.1:8000/v1".into(),
+                        model: "Qwen/Qwen3-Embedding-4B".into(),
+                    },
+                ),
+                p.dim("a shorter row"),
+            ];
+            let framed = panel(&p.bold("lore 0.1.0"), &p.dim("api v1 · gen 7"), &rows);
+            let widths: Vec<usize> = framed.lines().map(vis_len).collect();
+            assert!(
+                widths.windows(2).all(|w| w[0] == w[1]),
+                "ragged frame at color={color}: {widths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_palette_obeys_no_color() {
+        let plain = Palette { color: false };
+        assert_eq!(plain.green("ready"), "ready");
+        assert_eq!(plain.dim("quiet"), "quiet");
+        assert!(!render_status(&daemon_with(vec![(1, 2)]), false).contains(''));
     }
 
     /// The `status` half of "degradation is never silent" (1d). A refused
@@ -2277,11 +2762,11 @@ mod tests {
             false,
         );
         assert!(
-            working.contains("plugins: unity 6f1d2a3b4c5d (uxml, uss)"),
+            working.contains("plugins      unity 6f1d2a3b4c5d (uxml, uss)"),
             "{working}"
         );
         assert!(
-            working.contains("    plugins: unity 6f1d2a3b4c5d\n"),
+            working.contains("    plugins unity 6f1d2a3b4c5d\n"),
             "{working}"
         );
         assert!(!working.contains("PLUGIN"), "nothing is wrong: {working}");

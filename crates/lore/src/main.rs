@@ -83,6 +83,19 @@ enum Command {
         /// Collapse to the daemon, embedding, and fleet-coverage lines only.
         #[arg(long)]
         short: bool,
+        /// Redraw in place every N seconds until interrupted (default 2).
+        ///
+        /// Refuses `--json` rather than quietly winning over it: a watch emits
+        /// escape sequences and never terminates, which is not what anything
+        /// asking for JSON wants.
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            num_args = 0..=1,
+            default_missing_value = "2",
+            conflicts_with = "json",
+        )]
+        watch: Option<u64>,
     },
     /// Search the index — the same surface agents get over MCP.
     Search(cli::SearchArgs),
@@ -118,7 +131,8 @@ fn main() -> anyhow::Result<()> {
             json,
             project,
             short,
-        } => cli::run(cli::status(json, project, short)),
+            watch,
+        } => cli::run(cli::status(json, project, short, watch)),
         Command::Search(search) => cli::run(cli::search(search)),
     }
 }
