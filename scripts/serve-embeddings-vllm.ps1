@@ -28,10 +28,16 @@
 # config.toml.bak-d0014-llamacpp in %LOCALAPPDATA%\lore.
 param(
     [string]$Distro = 'Ubuntu',
-    [string]$ServeScript = '~/lmt/vllm-embed/serve.sh'
+    [string]$ServeScript = (Join-Path $PSScriptRoot 'serve-embeddings-vllm.sh')
 )
 $ErrorActionPreference = 'Stop'
 
-# -u: run as the distro's default user, not root — the venv and HF cache live
+if (-not (Test-Path $ServeScript)) { throw "$ServeScript not found" }
+# The serve flags used to live only in ~/lmt/vllm-embed/serve.sh, outside this
+# repo, so a retune left no diff behind. WSL runs the repo copy in place off
+# /mnt/c instead; the venv and HF cache stay in the WSL home (VLLM_EMBED_HOME).
+$wslPath = (& wsl.exe -d $Distro -e wslpath -a "$ServeScript").Trim()
+
+# bash -lc as the distro's default user, not root - the venv and HF cache live
 # under that user's home.
-& wsl.exe -d $Distro -e bash -lc "exec $ServeScript"
+& wsl.exe -d $Distro -e bash -lc "exec bash '$wslPath'"
