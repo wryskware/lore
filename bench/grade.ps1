@@ -1,4 +1,4 @@
-# Bench grading runner. Protocol and rationale:
+﻿# Bench grading runner. Protocol and rationale:
 # design/6_Evaluation/2026-08-17_grading-protocol.md. Criteria live in the
 # round's task set; this script only applies them.
 #
@@ -23,6 +23,8 @@ param(
     # Grade one batch only, by name: 'lore-T3', or 'lore' for a pass-B repo.
     [string]$Batch,
     [ValidateRange(1, 16)] [int]$Throttle = 5,
+    # Seconds between grader launches. See the launch loop for why it is not 0.
+    [ValidateRange(0, 60)] [int]$LaunchStaggerSeconds = 6,
     [switch]$DryRun
 )
 
@@ -368,6 +370,10 @@ foreach ($t in $threads) {
                 "`$env:OPENCODE_CONFIG='$(Join-Path $benchRoot 'opencode-off.jsonc')'; " +
                 "& opencode $(($ocArgs | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ' ')")
     }
+    # Same cold-start stagger the cell runner needs: opencode's shared SQLite
+    # store loses a same-second race with `database is locked`, which is how a
+    # round-2 pass-B thread died and how three round-3 cells died.
+    Start-Sleep -Seconds $LaunchStaggerSeconds
 }
 $procs | ForEach-Object { $_.p.WaitForExit() }
 Remove-Item Env:OPENCODE_CONFIG -ErrorAction SilentlyContinue

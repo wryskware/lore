@@ -50,6 +50,8 @@ HIT_RE = re.compile(
     r"\s+score\s+(?P<score>[\d.]+)"
 )
 SYMBOL_RE = re.compile(r"^\s+(?:symbol|heading):\s*(?P<name>.+?)\s*$")
+# `    project_key: lexomancy-bench  chunk_id: a51edc03203c`
+CHUNK_RE = re.compile(r"chunk_id:\s*(?P<cid>[0-9a-f]+)")
 
 
 def events(events_path: Path):
@@ -92,13 +94,19 @@ def parse_hits(output: str) -> list[dict]:
                 "span": f"{m.group('start')}-{m.group('end')}",
                 "score": float(m.group("score")),
                 "symbol": None,
+                "chunk_id": None,
             }
             hits.append(current)
             continue
-        if current is not None and current["symbol"] is None:
-            s = SYMBOL_RE.match(line)
-            if s:
-                current["symbol"] = s.group("name")
+        if current is not None:
+            if current["chunk_id"] is None:
+                c = CHUNK_RE.search(line)
+                if c:
+                    current["chunk_id"] = c.group("cid")
+            if current["symbol"] is None:
+                sym = SYMBOL_RE.match(line)
+                if sym:
+                    current["symbol"] = sym.group("name")
     return hits
 
 
@@ -164,6 +172,19 @@ def retrieval_report(parts: list[dict], answer: str) -> tuple[list[str], dict]:
     answer_norm = (answer or "").replace("\\", "/")
     calls, lines = [], []
 
+    # Where each chunk_id was later expanded. `lore_expand` on a chunk a search
+    # just returned IS uptake -- the strongest kind, because the agent went
+    # deeper without leaving the index -- and counting only `read` of a path
+    # misses it entirely. Round-2's corpora barely used expand; on Lexomancy it
+    # is 8 of 22 lore calls, which would have understated uptake by a third.
+    expanded_at: dict[str, list[int]] = {}
+    for idx, part in enumerate(parts):
+        if part.get("tool") != "lore_expand":
+            continue
+        cid = ((part.get("state") or {}).get("input") or {}).get("chunk_id")
+        if cid:
+            expanded_at.setdefault(cid, []).append(idx)
+
     for idx, part in enumerate(parts):
         tool = part.get("tool", "")
         if tool not in LORE_TOOLS:
@@ -175,7 +196,12 @@ def retrieval_report(parts: list[dict], answer: str) -> tuple[list[str], dict]:
         paths = list(dict.fromkeys(h["path"] for h in hits))
 
         after = later_tool_text(parts, idx)
-        opened = [p for p in paths if p in after]
+        read_paths = [p for p in paths if p in after]
+        expanded = [
+            h["path"] for h in hits
+            if h["chunk_id"] and any(j > idx for j in expanded_at.get(h["chunk_id"], []))
+        ]
+        opened = list(dict.fromkeys(read_paths + expanded))
         cited = [p for p in paths if p in answer_norm]
 
         query = raw_in.get("query") or json.dumps(raw_in, ensure_ascii=False)
@@ -190,7 +216,10 @@ def retrieval_report(parts: list[dict], answer: str) -> tuple[list[str], dict]:
             "args": {k: v for k, v in raw_in.items() if k != "query"},
             "hit_count": len(hits),
             "paths": paths,
+            "chunk_ids": [h["chunk_id"] for h in hits if h["chunk_id"]],
             "opened_after": opened,
+            "read_after": read_paths,
+            "expanded_after": list(dict.fromkeys(expanded)),
             "cited_in_answer": cited,
             "top_score": hits[0]["score"] if hits else None,
         }
@@ -209,10 +238,27 @@ def retrieval_report(parts: list[dict], answer: str) -> tuple[list[str], dict]:
                 f"    uptake: agent later opened {len(opened)}/{len(paths)} returned path(s)"
                 + (f" — {', '.join(opened)}" if opened else "")
             )
+            if expanded:
+                lines.append(
+                    f"    ...of which {len(expanded)} via lore_expand on a returned chunk: "
+                    + ", ".join(expanded)
+                )
             lines.append(
                 f"    answer overlap: {len(cited)}/{len(paths)} returned path(s) appear in the final answer"
             )
         else:
+            if tool == "lore_expand":
+                cid = raw_in.get("chunk_id")
+                src = next(
+                    (c for c in reversed(calls[:-1])
+                     if cid and cid in (c.get("chunk_ids") or [])),
+                    None,
+                )
+                lines.append(
+                    f"    expands a chunk returned by call {src['position']}"
+                    if src else
+                    "    chunk was NOT returned by an earlier call in this cell"
+                )
             head = output.strip().splitlines()[:6]
             lines.append("    output (first lines):")
             lines += [f"      {h}" for h in head]
