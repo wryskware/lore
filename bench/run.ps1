@@ -1,4 +1,4 @@
-# E2E bench runner. See bench/README.md,
+﻿# E2E bench runner. See bench/README.md,
 # design/6_Evaluation/2026-08-15_e2e-round-1-answer-key.md (prompts/pins/
 # protocol) and .../2026-08-17_e2e-round-1-key-addendum.md (grading Rev A).
 #
@@ -83,17 +83,21 @@ $repoMap = @{
             b = @{ dir = 'C:\Users\perag\bench-e2e\terrarium-bench-b'; project = 'terrarium-bench-b' }
         }
     }
-    # Lexomancy retrieval targets the main `Lexomancy` root for BOTH slots (the
-    # walker does not follow the junctions, so the bench roots index ~nothing).
-    # The main root is frozen at the pin and read-only during runs, so sharing
-    # it is safe. What must not be shared is the cm workspace the T5 cell edits
-    # — hence a second one per slot.
+    # Lexomancy retrieval targets the bench root's OWN project, one per slot.
+    # This replaces the round-2 arrangement, where both slots retrieved from the
+    # main `Lexomancy` root because the walker does not follow the junctions and
+    # the bench roots indexed three loose files. Under D-0022 the junction
+    # targets are declared as `[[sources]]` in the bench root's `.lore.toml`, so
+    # `Lexomancy-bench` now indexes the corpus under test directly — including
+    # `Lexomancy-alt`, the cm checkout the T5 cell actually edits, rather than
+    # the live tree, which drifts. Result paths are mount-relative and therefore
+    # openable from the bench tree through the junctions.
     lexomancy = @{
         vcs   = 'cm'
         cmPin = 'cs:134'
         slots = @{
-            a = @{ dir = 'C:\Users\perag\Unity\Lexomancy-bench'; project = 'Lexomancy'; cmDir = 'C:\Users\perag\Unity\Lexomancy-alt' }
-            b = @{ dir = 'C:\Users\perag\Unity\Lexomancy-bench-b'; project = 'Lexomancy'; cmDir = 'C:\Users\perag\Unity\Lexomancy-alt-b' }
+            a = @{ dir = 'C:\Users\perag\Unity\Lexomancy-bench'; project = 'Lexomancy-bench'; cmDir = 'C:\Users\perag\Unity\Lexomancy-alt' }
+            b = @{ dir = 'C:\Users\perag\Unity\Lexomancy-bench-b'; project = 'Lexomancy-bench-b'; cmDir = 'C:\Users\perag\Unity\Lexomancy-alt-b' }
         }
     }
 }
@@ -185,15 +189,14 @@ function Invoke-Cell([string]$model, [string]$repo, [string]$arm, [string]$task)
 
     $env:OPENCODE_CONFIG = Join-Path $benchRoot "opencode-$arm.jsonc"
     # Pin the MCP server's scope to the project this cell claims to retrieve
-    # from, instead of letting it resolve from the cwd. The two differ for
-    # Lexomancy on purpose: the bench tree reaches the corpus through junctions,
-    # the walker does not follow them, so the bench root indexes three loose
-    # files while the corpus under test lives in the main `Lexomancy` root.
-    # Since lore-mcp dropped the agent-supplied `project` parameter and began
-    # resolving from cwd, an unpinned Lexomancy cell would search those three
-    # files. `$s.project` was already being recorded into metrics.json as the
-    # cell's project; this makes the record true. Harmless on the off arm,
-    # which has no MCP server at all.
+    # from, instead of letting it resolve from the cwd. For lore and terrarium
+    # the two agree; pinning makes the record true rather than incidental, and
+    # keeps a cell from silently retrieving from a neighbouring registration if
+    # cwd resolution ever changes again.
+    # It matters most for Lexomancy, whose cwd is a junction tree: cwd
+    # resolution would land on whichever registration owns that path, while the
+    # cell means the bench project that declares the mounts as sources.
+    # Harmless on the off arm, which has no MCP server at all.
     $env:LORE_PROJECT = $s.project
     # Not `$args`: that is an automatic variable, and shadowing it inside a
     # function is the kind of quiet weirdness this harness has already been
