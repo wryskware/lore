@@ -51,10 +51,16 @@ param(
     # both arms read the round-1 tree and slot 'b' need not exist; the matrix
     # never sets it and keeps the fixed mapping. Not for general use.
     [ValidateSet('a', 'b')] [string]$Slot,
-    [ValidateRange(1, 16)] [int]$Throttle = 5
+    [ValidateRange(1, 16)] [int]$Throttle = 5,
+    # Seconds between child launches. See Start-Wave for why this is not zero.
+    [ValidateRange(0, 60)] [int]$LaunchStaggerSeconds = 6
 )
 
 $ErrorActionPreference = 'Stop'
+# Exit code of the cell this process ran, surfaced to the parent wave.
+$script:cellExit = 0
+# Cells that exited non-zero across every wave of a matrix run.
+$script:waveFailures = 0
 $benchRoot = $PSScriptRoot
 $resultsRoot = Join-Path $benchRoot 'results'
 New-Item -ItemType Directory -Force $resultsRoot | Out-Null
@@ -368,6 +374,11 @@ function Invoke-Cell([string]$model, [string]$repo, [string]$arm, [string]$task)
         score = $null  # graded by hand against the answer key
     }
     $metrics | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $outDir 'metrics.json')
+    # A child process must exit non-zero when its cell did, or Start-Wave's
+    # ExitCode check silently passes a wave in which cells died. Round-3
+    # Lexomancy wave 1 lost three cells to an opencode lock and still reported
+    # exit 0.
+    $script:cellExit = $exit
     Write-Host ("[$cell] done in {0:n0}s  tokens in/out {1}/{2}  tools {3} (lore {4})" -f
         ($sw.ElapsedMilliseconds / 1000), $tokens.input, $tokens.output, $toolCalls, $loreCalls)
 }
@@ -389,10 +400,20 @@ function Start-Wave([object[]]$wave, [string]$label, [string[]]$extraArgs = @())
         $procs += Start-Process pwsh -PassThru -WindowStyle Hidden -RedirectStandardOutput $log `
             -ArgumentList (@('-NoProfile', '-File', $PSCommandPath,
                 '-Model', $c.Model, '-Repo', $c.Repo, '-Arm', $c.Arm, '-Task', $c.Task) + $extraArgs)
+        # Stagger cold starts. opencode opens a shared SQLite store on launch;
+        # several processes racing for it in the same second lose the race with
+        # `Error: Unexpected error / database is locked` and the cell dies at
+        # ~1s having spent nothing. Three of eight cells went that way in
+        # round-3 Lexomancy wave 1. The wait is per-launch, not per-cell, so a
+        # throttled wave pays it only while it is filling slots.
+        Start-Sleep -Seconds $LaunchStaggerSeconds
     }
     $procs | ForEach-Object { $_.WaitForExit() }
     $failed = @($procs | Where-Object { $_.ExitCode -ne 0 }).Count
-    if ($failed) { Write-Warning "[wave] '$label': $failed cell(s) exited non-zero — check launch-*.log" }
+    if ($failed) {
+        $script:waveFailures += $failed
+        Write-Warning "[wave] '$label': $failed cell(s) exited non-zero — check launch-*.log"
+    }
 }
 
 # § Pilot — difficulty calibration before the round-2 keys freeze.
@@ -478,14 +499,24 @@ if ($Matrix) {
 
     foreach ($c in $serial) {
         Invoke-Cell $c.Model $c.Repo $c.Arm $c.Task
+        if ($script:cellExit -ne 0) { $script:waveFailures++ }
     }
     $total.Stop()
     Write-Host ("[matrix] {0} cells in {1:n1} min ({2} read-only + {3} T5 parallel @ {4}, {5} serial)" -f
         $cells.Count, $total.Elapsed.TotalMinutes, $readOnly.Count, $writes.Count,
         $Throttle, $serial.Count) -ForegroundColor Green
+    # A matrix that lost cells must not look like a clean run. Re-run the named
+    # cells individually; a failed cell leaves a results directory with
+    # exit_code non-zero and zero tokens, which must be quarantined (prefix
+    # `x-`) before packing so it is not read as an empty answer.
+    if ($script:waveFailures) {
+        Write-Host ("[matrix] {0} cell(s) FAILED — this run is incomplete" -f $script:waveFailures) -ForegroundColor Red
+        exit 1
+    }
 } else {
     if (-not ($Model -and $Repo -and $Arm -and $Task)) {
         throw 'Provide -Model -Repo -Arm -Task, or -Matrix.'
     }
     Invoke-Cell $Model $Repo $Arm $Task
+    exit $script:cellExit
 }
