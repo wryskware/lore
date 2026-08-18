@@ -14,8 +14,15 @@
 #   llama.cpp Q8_0    9,794 tok/s   <- the stack this replaces
 # Cosine similarities track bf16 within ~0.007 on a 3-sentence probe.
 #
-# Resident cost: ~19 GB VRAM (gpu-memory-utilization 0.60 of a 32 GB card).
+# Resident cost: ~6.9 GB VRAM (gpu-memory-utilization 0.20 of a 32 GB card).
 # Weights are ~4 GB at FP8; the rest is KV cache vLLM reserves up front.
+#
+# Retuned 2026-08-18 from 0.60 (~20.1 GB measured) to 0.20. This is a pooling
+# embed runner with no decode loop, so the large reservation bought nothing:
+# on the same 256-chunk / 210,650-token probe, 39,177 tok/s at 0.60 vs 42,106
+# and 41,820 tok/s at 0.20. Cold start to /health 200 is ~40 s either way, so
+# an idle stop/start supervisor would trade 13 GB for a 40 s stall on the first
+# search after any idle gap; shrinking the reservation was the cheaper trade.
 #
 # Rollback: serve-embeddings.ps1 (llama.cpp Q8_0) plus the matching
 # config.toml.bak-d0014-llamacpp in %LOCALAPPDATA%\lore.
