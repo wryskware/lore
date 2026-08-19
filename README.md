@@ -124,20 +124,27 @@ Changing the model or its dimensions re-embeds the index.
 ### Wiring an agent to it
 
 Lore speaks MCP through the `lore-mcp` binary, which offers three tools:
-`search`, `expand` (pull more context around a result), and `status`. For Claude
-Code, a `.mcp.json` at the repo root:
+`search`, `expand` (pull more context around a result), and `status`. Run this
+from the repo you want indexed:
 
-```json
-{
-  "mcpServers": {
-    "lore": { "command": "lore-mcp" }
-  }
-}
+```console
+$ lore setup mcp
+project scope   C:\path	oepo\.mcp.json
+  registered lore -> C:\path	o\lore-mcp.exe
 ```
+
+It writes a `.mcp.json` at the repo root naming the `lore-mcp` that shipped
+beside the `lore` you ran, which is how a stale server binary left on `PATH`
+stops being a way to lose an afternoon. `--global` registers in
+`~/.claude.json` instead, for every session on the machine — off by default,
+because most directories on a machine are not Lore projects and a server with
+nothing to serve is just a process. An entry lore did not write is never
+replaced without `--force`, and nothing else in the file is touched.
 
 The server scopes itself to the project containing the working directory, so
 agents never have to name a project or reach into a repo they are not working
-in. `lore setup claude-code` installs the agent-side assets.
+in. `lore setup claude-code` installs the agent-side skills, and bare
+`lore setup` reports on all of it without writing anything.
 
 ## How it works
 

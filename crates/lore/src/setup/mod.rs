@@ -45,6 +45,8 @@ use std::fmt;
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 
+pub mod mcp;
+
 /// One installable prompt asset.
 ///
 /// `body` is embedded in the binary rather than read from disk at run time:

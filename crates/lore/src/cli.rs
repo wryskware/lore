@@ -524,17 +524,34 @@ fn extension_list(extensions: &[String]) -> String {
 /// Bare `lore setup` never writes. Discovery that mutates is a trap: the
 /// command a user runs to find out what a command does must be the safe one.
 ///
-/// A target is an agent host (`claude-code`) or [`setup::USER_IGNORE_TARGET`],
-/// which is not a host at all: it installs the user-level `loreignore` starting
-/// point beside the daemon's own `config.toml`. Both live here because both
-/// answer "what does lore need on this machine to be useful", and neither is
-/// ever written without being asked for.
-pub fn setup(target: Option<String>, dry_run: bool, force: bool) -> Result<()> {
+/// A target is an agent host (`claude-code`), [`setup::USER_IGNORE_TARGET`],
+/// which installs the user-level `loreignore` starting point beside the
+/// daemon's own `config.toml`, or [`setup::mcp::MCP_TARGET`], which registers
+/// the MCP server with the host's client. Neither of the last two is a host;
+/// all three live here because all three answer "what does lore need on this
+/// machine to be useful", and none is ever written without being asked for.
+///
+/// The host branch deliberately does *not* also wire MCP. Installing skills is
+/// a machine-level act a user may run from anywhere, and the MCP registration
+/// defaults to the current project: silently writing a `.mcp.json` into
+/// whatever directory `lore setup claude-code` happened to run in would be a
+/// surprise, and an unwanted one in the common case where that directory is
+/// not a Lore project at all.
+pub fn setup(target: Option<String>, dry_run: bool, force: bool, global: bool) -> Result<()> {
     let Some(target) = target else {
         return setup_report();
     };
     if target == setup::USER_IGNORE_TARGET {
         return setup_user_ignore(dry_run, force);
+    }
+    if target == setup::mcp::MCP_TARGET {
+        return setup_mcp(dry_run, force, global);
+    }
+    if global {
+        bail!(
+            "--global applies only to `lore setup {}`",
+            setup::mcp::MCP_TARGET
+        );
     }
     let host = setup::Host::parse(&target)?;
     let dir = host.skills_dir()?;
@@ -563,6 +580,70 @@ pub fn setup(target: Option<String>, dry_run: bool, force: bool) -> Result<()> {
         println!("\nstart a new agent session to pick them up");
     }
     Ok(())
+}
+
+/// `lore setup mcp` — register Lore's MCP server with the agent host.
+///
+/// Scoped to the current directory unless `--global`, so a machine full of
+/// folders that are not Lore projects does not gain a server with nothing to
+/// serve. The registration is repairable on its own, which is why this is a
+/// target and not a step inside the host install: losing MCP wiring is a thing
+/// that happens by itself, and reinstalling skills to fix it is a detour.
+fn setup_mcp(dry_run: bool, force: bool, global: bool) -> Result<()> {
+    let server = setup::mcp::server_binary()?;
+    let scope = match global {
+        true => setup::mcp::Scope::User,
+        false => setup::mcp::Scope::Project,
+    };
+    let root = cwd()?;
+    let registration = setup::mcp::plan(scope, &root, &server)?;
+    let key = setup::mcp::SERVER_KEY;
+
+    println!("{} scope   {}", scope.label(), registration.path);
+    if dry_run {
+        println!(
+            "  would register {key} -> {server} ({})",
+            registration.state.label()
+        );
+        return Ok(());
+    }
+
+    match setup::mcp::apply(&registration, force)? {
+        setup::Outcome::Installed => println!("  registered {key} -> {server}"),
+        setup::Outcome::Updated => println!(
+            "  repointed  {key} -> {server}\n  was {}",
+            registration.current.as_deref().unwrap_or("(nothing)")
+        ),
+        setup::Outcome::Overwrote => println!("  replaced   {key} -> {server}"),
+        setup::Outcome::Unchanged => {
+            println!("  {key} already points at {server}");
+            return Ok(());
+        }
+        setup::Outcome::Kept => {
+            println!(
+                "  kept       {key} -> {} (lore did not write this; --force replaces it)",
+                registration.current.as_deref().unwrap_or("(nothing)")
+            );
+            return Ok(());
+        }
+    }
+
+    // The registration points at an index that may not exist yet. Better to say
+    // so here than to let the first search come back empty with no explanation.
+    if scope == setup::mcp::Scope::Project
+        && !root.join(lore::repo_config::REPO_CONFIG_FILE).is_file()
+    {
+        println!("\nnote: {root} is not a registered Lore project yet — run `lore add .`");
+    }
+    println!("\nstart a new agent session to pick it up");
+    Ok(())
+}
+
+/// The current directory, as the UTF-8 path everything else here speaks.
+fn cwd() -> Result<Utf8PathBuf> {
+    let dir = std::env::current_dir().context("reading the current directory")?;
+    Utf8PathBuf::from_path_buf(dir)
+        .map_err(|path| anyhow::anyhow!("path is not valid UTF-8: {}", path.display()))
 }
 
 /// `lore setup ignore` — install the user-level ignore rules.
@@ -629,9 +710,30 @@ fn setup_report() -> Result<()> {
         user.state.label(),
         user.summary
     );
+    // Both scopes, always: which one is in play is the question a user comes
+    // here with, and someone who registered globally months ago has no other
+    // way to remember that.
+    match setup::mcp::server_binary() {
+        Ok(server) => {
+            let root = cwd()?;
+            for scope in [setup::mcp::Scope::Project, setup::mcp::Scope::User] {
+                match setup::mcp::plan(scope, &root, &server) {
+                    Ok(registration) => println!(
+                        "mcp {:<9} {:<18}{}",
+                        scope.label(),
+                        registration.state.label(),
+                        registration.path
+                    ),
+                    Err(err) => println!("mcp {:<9} unreadable ({err})", scope.label()),
+                }
+            }
+        }
+        Err(err) => println!("mcp           unavailable ({err})"),
+    }
     println!(
-        "\nrun `lore setup <host|{}>` to install; nothing above was written",
-        setup::USER_IGNORE_TARGET
+        "\nrun `lore setup <host|{}|{}>` to install; nothing above was written",
+        setup::USER_IGNORE_TARGET,
+        setup::mcp::MCP_TARGET
     );
     Ok(())
 }

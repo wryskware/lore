@@ -45,7 +45,8 @@ enum Command {
     /// Bare `lore setup` reports what is installed and writes nothing.
     Setup {
         /// What to install, as `lore setup` names it: an agent host
-        /// (`claude-code`), or `ignore` for the machine-wide ignore rules.
+        /// (`claude-code`), `ignore` for the machine-wide ignore rules, or
+        /// `mcp` to register the MCP server with the host.
         target: Option<String>,
         /// Print what would change without writing it.
         #[arg(long)]
@@ -53,6 +54,10 @@ enum Command {
         /// Replace assets that have been edited since they were installed.
         #[arg(long)]
         force: bool,
+        /// `mcp` only: register for every project on this machine rather than
+        /// for the current one.
+        #[arg(short, long)]
+        global: bool,
     },
     /// Trigger (re)indexing of a registered project.
     Index {
@@ -115,7 +120,8 @@ fn main() -> anyhow::Result<()> {
             target,
             dry_run,
             force,
-        } => cli::setup(target, dry_run, force),
+            global,
+        } => cli::setup(target, dry_run, force, global),
         Command::Index {
             project,
             allow_mass_delete,
