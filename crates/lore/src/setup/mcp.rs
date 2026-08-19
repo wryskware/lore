@@ -93,10 +93,18 @@ pub fn server_binary() -> Result<Utf8PathBuf> {
 /// Compared by file stem rather than by full path, which is exactly the
 /// distinction that lets a stale registration be repaired silently while a
 /// hand-written entry under the same key is protected.
+///
+/// The last path segment is taken by splitting on both `/` and `\` rather
+/// than through [`Utf8Path`]'s own separator handling, because a config file
+/// travels with the project and may have been written by a `lore` on a
+/// different platform: `Utf8Path` only recognises `\` as a separator on
+/// Windows, so a Linux process reading a Windows-written entry would
+/// otherwise see the whole string as one opaque stem and never recognise its
+/// own binary.
 fn is_ours(command: &str) -> bool {
-    Utf8Path::new(command)
-        .file_stem()
-        .is_some_and(|stem| stem.eq_ignore_ascii_case("lore-mcp"))
+    let name = command.rsplit(['/', '\\']).next().unwrap_or(command);
+    let stem = name.rsplit_once('.').map_or(name, |(stem, _ext)| stem);
+    stem.eq_ignore_ascii_case("lore-mcp")
 }
 
 /// One planned registration: what the host's config says now, and what it would
@@ -373,5 +381,16 @@ mod tests {
         assert!(!is_ours("lore"));
         assert!(!is_ours("my-own-proxy"));
         assert!(!is_ours("npx"));
+    }
+
+    /// A registration written on one platform must still be recognised as
+    /// ours when read back on the other — a POSIX path on Windows, a
+    /// Windows path on Linux — because a project config travels with the
+    /// repo, not with the machine that wrote it.
+    #[test]
+    fn ours_is_recognised_across_the_other_platforms_path_separator_too() {
+        assert!(is_ours("/usr/local/bin/lore-mcp"));
+        assert!(!is_ours(r"C:\tools\not-lore-mcp.exe"));
+        assert!(!is_ours("/opt/bin/npx"));
     }
 }
