@@ -20,10 +20,10 @@ cannot be filled honestly say so.
 | round | RCB-W 1 |
 | ran | 2026-08-19 |
 | question | Does lore change what a coding agent spends, and whether it lands correct fixes, on real post-pin bugs it must locate from behavioral symptoms? |
-| model | `claude-sonnet-5` @ high (Claude Code CLI) — sole answerer this round |
+| model(s) | `claude-sonnet-5` @ high (stamp `rcbw1-0819`); `claude-opus-5` @ medium (stamp `rcbw1o-0819`, added same day at Wrysk's request) — both via Claude Code CLI, model ids verified in the event streams |
 | arms | off, on (on = lore MCP + the same three steering lines as RCB round 1, verified by prompt diff) |
 | repo / task set | `microsoft/agent-framework` @ `47fa59f8` / RCB-W W1–W5 (draft, unfrozen — see Deviations) |
-| cells | 10 planned, 10 ran, 10 graded, 0 excluded |
+| cells | 20 planned, 20 ran, 20 graded, 0 excluded |
 | grading | deterministic (authored regression tests + collateral suites + diff overlap); qualitative labels via arm-blind Sonnet 5 batch judge, tertiary only |
 | gates before round | gate 1 (fail@pin / pass@golden / collateral, by execution) passed on all five tasks; W5 tests rewritten to public behavior; W3 smoke both arms |
 | comparable to | nothing yet; first round of this program |
@@ -31,8 +31,16 @@ cannot be filled honestly say so.
 
 ## Headline
 
-- **Both arms fixed exactly 1 of 5 tasks cleanly** (off: W5; on: W3). Two of
-  the eight failures are task-design artifacts, not ability signals (below).
+- **Sonnet 5 @ high: both arms fixed exactly 1 of 5 tasks cleanly** (off: W5;
+  on: W3). Two of the eight failures are task-design artifacts, not ability
+  signals (below).
+- **Opus 5 @ medium: both arms fixed 3 of 5 — at roughly a third of Sonnet's
+  token spend.** Every Opus cell put its edit in the golden file, including
+  the Python compaction file on W4 where Sonnet chose the .NET port in all
+  four attempts. On this task shape, model capability dominates anything the
+  retrieval arm contributes.
+- **The on arm cost more for both answerers and fixed nothing extra for
+  either** (Sonnet +54% tokens, Opus +107%; identical fixed-counts per arm).
 - **The QA round's efficiency result does not transfer.** The on arm spent
   **+54% total tokens** (on better 1/5) and +7% wall. The QA mechanism —
   off-arm subagent fan-out that lore displaced — is entirely absent here:
@@ -143,6 +151,52 @@ the same model). No pass-B-style relevance grading exists in this program
 either; nothing here says the returned pointers were good, only that they
 were requested — same gap as RCB, carried again.
 
+## Second answerer: Opus 5 @ medium (`rcbw1o-0819`)
+
+Run at Wrysk's request after the Sonnet cells completed; same prompts, same
+arms, same grading.
+
+| task | arm | grade | wall s | turns | tools | lore | total tok | recall | lines vs golden |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| W1 | off | not_fixed | 42.0 | 11 | 10 | 0 | 328,508 | 1.0 | 9/15 |
+| W1 | on | not_fixed | 39.2 | 12 | 11 | 0 | 363,030 | 1.0 | 9/15 |
+| W2 | off | not_fixed | 108.5 | 11 | 10 | 0 | 394,019 | 1.0 | 46/53 |
+| W2 | on | not_fixed | 105.0 | 11 | 10 | 1 | 521,653 | 1.0 | 49/53 |
+| W3 | off | **fixed** | 65.8 | 11 | 10 | 0 | 350,552 | 1.0 | 5/6 |
+| W3 | on | **fixed** | 62.7 | 12 | 11 | 1 | 580,760 | 1.0 | 6/6 |
+| W4 | off | **fixed** | 32.2 | 10 | 9 | 0 | 347,501 | 1.0 | 5/4 |
+| W4 | on | **fixed** | 73.0 | 22 | 21 | 1 | 854,965 | 1.0 | 4/4 |
+| W5 | off | **fixed** | 58.6 | 11 | 10 | 0 | 460,160 | 1.0 | 34/62 |
+| W5 | on | **fixed** | 191.5 | 29 | 28 | 0 | 1,574,100 | 1.0 | 34/62 |
+
+| | off | on | delta | on better | off better |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| mean total tokens | 376,148 | 778,902 | **+107%** | 0 | 5 |
+| mean wall s | 61.4 | 94.3 | +54% | 3 | 2 |
+| mean tool calls | 9.8 | 16.2 | +65% | 0 | 4 |
+| fixed (clean) | 3/5 | 3/5 | — | — | — |
+
+Notes, per task:
+
+- **W1**: both arms landed one guard-test away from golden — early return
+  *before* serialization (unlike Sonnet's write-then-delete) and `ValueError`
+  on negatives, but `delete(key)` on the zero path. Three of four W1 cells
+  across both models chose delete semantics; the prompt ambiguity is
+  confirmed as the dominant failure mode of this task.
+- **W2**: same partial shape as Sonnet (46–49/53 lines, `additionalProperties`
+  omitted). Four of four cells across both models missed the same clause —
+  W2's difficulty is real and specific.
+- **W4**: Opus found `_compaction.py` in both arms without difficulty —
+  including off-arm in 32s and 10 turns, the round's cheapest fixed cell —
+  where Sonnet went to the .NET port in all four of its attempts. The
+  stack-ambiguity artifact is model-dependent, which makes it worse as a
+  benchmark property: it grades model priors, not the intended skill.
+- **W5**: both arms produced the same lean 34-line correct fix. On-arm spent
+  3.4x the off-arm tokens on it while calling lore zero times — the premium
+  was pure extra deliberation, not retrieval.
+- Lore adoption: 3 calls across all five on-cells (0/1/1/1/0) — shallower
+  still than Sonnet's 11.
+
 ## Qualitative verdicts
 
 Arm-blind Sonnet 5 batch judge (Anthropic Batches API), tertiary only.
@@ -182,7 +236,19 @@ the locating phase.
 **The efficiency premium is real and explainable.** The on arm pays for MCP
 context and search results in every turn's cache reads without the offsetting
 fan-out collapse that made lore cheap in the QA round. On this task shape,
-lore is currently a cost, not a saving — with n=5, one answerer, no repeats.
+lore is currently a cost, not a saving — in both answerers (+54% Sonnet,
++107% Opus), with n=5 per answerer and no repeats.
+
+**The cross-model result reframes the program's question.** Opus @ medium
+beat Sonnet @ high 3/5-vs-1/5 on both arms at roughly a third of the tokens,
+and located the golden file in 10/10 cells. Where the QA round's value story
+was "retrieval rescues a model that cannot find the code", the write tasks
+say: a model strong enough to fix the bug is also strong enough to find it,
+and a model that cannot fix it is not rescued by finding it. If lore is to
+earn its keep on write tasks, the mechanism to look for in round 2 is not
+location but *understanding* — whether searches during the diagnosis phase
+change contract/completeness failures (W1, W2, W5-Sonnet) into fixes. Round
+1's adoption was too shallow (14 calls across 10 on-cells) to test that.
 
 ## Deviations from the task-set draft, stated explicitly
 
@@ -222,9 +288,11 @@ lore is currently a cost, not a saving — with n=5, one answerer, no repeats.
 3. **Freeze the task set** (with the two prompt fixes) before round 2:
    `_task_set` id + prompt hashes, per bench convention. Needs Wrysk.
 4. **Round 2 questions**: do the artifacts-removed patterns hold on repeats?
-   Does W5-on's zero-adoption repeat, and does adoption correlate with fix
-   completeness? Consider 2–3 repeats of this same round before adding
-   answerers.
+   Does on-arm zero-adoption (W5 both models, W1 Opus) repeat, and does
+   adoption correlate with fix completeness? The Opus result also asks
+   whether steering that *requires* a diagnosis-phase search would change
+   W1/W2-class contract failures — a stronger-steer arm is a candidate for a
+   future round, disclosed as such.
 5. **Retrieval relevance grading** — carried from RCB, still absent.
 6. **Judge verdicts**: fold `verdicts.jsonl` in when the batch completes;
    audit the W1 cells' labels against the known contract-artifact reading.
