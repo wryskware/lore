@@ -1,0 +1,594 @@
+[
+ {
+  "additions": 49,
+  "changedFiles": 2,
+  "deletions": 0,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-08-19T10:05:28Z",
+  "number": 7755,
+  "title": "Python: fix: preserve Agent additional_properties in HandoffBuilder clones",
+  "url": "https://github.com/microsoft/agent-framework/pull/7755"
+ },
+ {
+  "additions": 1,
+  "changedFiles": 1,
+  "deletions": 1,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAAB_HMEDw",
+    "name": "documentation",
+    "description": "Usage: [Issues, PRs], Target: documentation in the code base and learn docs",
+    "color": "0075ca"
+   },
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   },
+   {
+    "id": "LA_kwDOOhTcGM8AAAACnzAIkQ",
+    "name": "lab",
+    "description": "Usage: [Issues, PRs], Target: lab packages",
+    "color": "ededed"
+   }
+  ],
+  "mergedAt": "2026-08-17T16:53:19Z",
+  "number": 7693,
+  "title": "Python: Fix Agent Lightning installation link",
+  "url": "https://github.com/microsoft/agent-framework/pull/7693"
+ },
+ {
+  "additions": 41,
+  "changedFiles": 2,
+  "deletions": 4,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-08-16T16:15:31Z",
+  "number": 7655,
+  "title": "Python: Fix AG-UI url source dropping attachments when the URL is in source.value",
+  "url": "https://github.com/microsoft/agent-framework/pull/7655"
+ },
+ {
+  "additions": 33,
+  "changedFiles": 2,
+  "deletions": 3,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-08-16T16:14:33Z",
+  "number": 7652,
+  "title": "Python: Fix duplicate streamed tool calls in DevUI",
+  "url": "https://github.com/microsoft/agent-framework/pull/7652"
+ },
+ {
+  "additions": 39,
+  "changedFiles": 3,
+  "deletions": 14,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-08-13T21:29:19Z",
+  "number": 7635,
+  "title": "Python: Fix Cosmos memory provider calling renamed add_cosmos toolkit API",
+  "url": "https://github.com/microsoft/agent-framework/pull/7635"
+ },
+ {
+  "additions": 106,
+  "changedFiles": 2,
+  "deletions": 3,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-08-18T04:29:47Z",
+  "number": 7557,
+  "title": "Python: fix(workflows): preserve all trace contexts in FanInEdgeRunner aggregation",
+  "url": "https://github.com/microsoft/agent-framework/pull/7557"
+ },
+ {
+  "additions": 53,
+  "changedFiles": 2,
+  "deletions": 1,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-08-13T00:47:28Z",
+  "number": 7470,
+  "title": "Python: fix(redis): honour a max_messages retention limit of zero",
+  "url": "https://github.com/microsoft/agent-framework/pull/7470"
+ },
+ {
+  "additions": 53,
+  "changedFiles": 6,
+  "deletions": 9,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   },
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb6-Q",
+    "name": ".NET",
+    "description": "Usage: [Issues, PRs], Target: .Net",
+    "color": "5319e7"
+   }
+  ],
+  "mergedAt": "2026-07-30T09:57:24Z",
+  "number": 7427,
+  "title": "Python: Fix Actions token environment",
+  "url": "https://github.com/microsoft/agent-framework/pull/7427"
+ },
+ {
+  "additions": 101,
+  "changedFiles": 7,
+  "deletions": 16,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAAB_HMEDw",
+    "name": "documentation",
+    "description": "Usage: [Issues, PRs], Target: documentation in the code base and learn docs",
+    "color": "0075ca"
+   },
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-08-07T03:12:03Z",
+  "number": 7417,
+  "title": "Python: fix CopilotStudioAgent LineTooLong on large activities",
+  "url": "https://github.com/microsoft/agent-framework/pull/7417"
+ },
+ {
+  "additions": 18,
+  "changedFiles": 2,
+  "deletions": 4,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-08-04T00:26:47Z",
+  "number": 7399,
+  "title": "Python: fix LocalEvaluator reporting zero-check items as passed",
+  "url": "https://github.com/microsoft/agent-framework/pull/7399"
+ },
+ {
+  "additions": 57,
+  "changedFiles": 2,
+  "deletions": 4,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-07-27T20:00:29Z",
+  "number": 7333,
+  "title": "Python: fix(python): handle callable class middleware safely in _determine_middleware_type (#6697)",
+  "url": "https://github.com/microsoft/agent-framework/pull/7333"
+ },
+ {
+  "additions": 111,
+  "changedFiles": 2,
+  "deletions": 3,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-07-28T17:52:34Z",
+  "number": 7322,
+  "title": "Python: Fix Gemini harness tool declarations",
+  "url": "https://github.com/microsoft/agent-framework/pull/7322"
+ },
+ {
+  "additions": 5,
+  "changedFiles": 2,
+  "deletions": 5,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-07-23T16:03:00Z",
+  "number": 7281,
+  "title": "Python: Fix stale agent.json reference in A2A sample docstring",
+  "url": "https://github.com/microsoft/agent-framework/pull/7281"
+ },
+ {
+  "additions": 68,
+  "changedFiles": 2,
+  "deletions": 11,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-07-23T21:34:50Z",
+  "number": 7271,
+  "title": "Python: Fix duplicate function call on approval round-trip (#7267)",
+  "url": "https://github.com/microsoft/agent-framework/pull/7271"
+ },
+ {
+  "additions": 127,
+  "changedFiles": 3,
+  "deletions": 5,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-07-30T00:38:11Z",
+  "number": 7220,
+  "title": "Python: fix(foundry-hosting): root hosted checkpoints under durable home dire\u00e2\u20ac\u00a6",
+  "url": "https://github.com/microsoft/agent-framework/pull/7220"
+ },
+ {
+  "additions": 95,
+  "changedFiles": 2,
+  "deletions": 16,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-07-23T17:18:57Z",
+  "number": 7202,
+  "title": "Python: fix(foundry_hosting): preserve auth credentials across FoundryToolbox reconnections",
+  "url": "https://github.com/microsoft/agent-framework/pull/7202"
+ },
+ {
+  "additions": 170,
+  "changedFiles": 3,
+  "deletions": 5,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAAB_HMEDw",
+    "name": "documentation",
+    "description": "Usage: [Issues, PRs], Target: documentation in the code base and learn docs",
+    "color": "0075ca"
+   },
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   },
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb6-Q",
+    "name": ".NET",
+    "description": "Usage: [Issues, PRs], Target: .Net",
+    "color": "5319e7"
+   }
+  ],
+  "mergedAt": "2026-07-21T15:42:23Z",
+  "number": 7200,
+  "title": "Python: Fix PropertySchema.to_json_schema() not recursing into nested array items / object properties",
+  "url": "https://github.com/microsoft/agent-framework/pull/7200"
+ },
+ {
+  "additions": 127,
+  "changedFiles": 3,
+  "deletions": 1,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAAB_HMEDw",
+    "name": "documentation",
+    "description": "Usage: [Issues, PRs], Target: documentation in the code base and learn docs",
+    "color": "0075ca"
+   },
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   },
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb6-Q",
+    "name": ".NET",
+    "description": "Usage: [Issues, PRs], Target: .Net",
+    "color": "5319e7"
+   }
+  ],
+  "mergedAt": "2026-07-29T16:38:26Z",
+  "number": 7199,
+  "title": "Python: Fix OpenAIChatCompletionClient passing raw JSON-Schema dict response_format through unwrapped",
+  "url": "https://github.com/microsoft/agent-framework/pull/7199"
+ },
+ {
+  "additions": 137,
+  "changedFiles": 2,
+  "deletions": 4,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-07-30T09:50:01Z",
+  "number": 7162,
+  "title": "Python: fix Anthropic streaming double-counting token usage",
+  "url": "https://github.com/microsoft/agent-framework/pull/7162"
+ },
+ {
+  "additions": 20,
+  "changedFiles": 2,
+  "deletions": 1,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-07-19T12:50:31Z",
+  "number": 7124,
+  "title": "Python: fix compaction token count inflating non-ASCII text",
+  "url": "https://github.com/microsoft/agent-framework/pull/7124"
+ },
+ {
+  "additions": 48,
+  "changedFiles": 2,
+  "deletions": 2,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-07-14T23:06:37Z",
+  "number": 7060,
+  "title": "Python: fix per-run additional_beta_flags leaking into Anthropic request kwargs",
+  "url": "https://github.com/microsoft/agent-framework/pull/7060"
+ },
+ {
+  "additions": 1,
+  "changedFiles": 1,
+  "deletions": 1,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-07-10T00:12:15Z",
+  "number": 7031,
+  "title": "Python: Fix read_skill_resource instruction dropping .md extension",
+  "url": "https://github.com/microsoft/agent-framework/pull/7031"
+ },
+ {
+  "additions": 31,
+  "changedFiles": 2,
+  "deletions": 1,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-07-14T08:46:21Z",
+  "number": 6990,
+  "title": "Python: Fix structured value parsing for split text chunks",
+  "url": "https://github.com/microsoft/agent-framework/pull/6990"
+ },
+ {
+  "additions": 7,
+  "changedFiles": 1,
+  "deletions": 0,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-07-08T09:26:46Z",
+  "number": 6969,
+  "title": "Python: fix mypy with NumPy 2.5 stubs",
+  "url": "https://github.com/microsoft/agent-framework/pull/6969"
+ },
+ {
+  "additions": 27,
+  "changedFiles": 1,
+  "deletions": 23,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-07-09T10:23:29Z",
+  "number": 6924,
+  "title": "Python: docs: fix removed ChatAgent references in _clients.py docstrings",
+  "url": "https://github.com/microsoft/agent-framework/pull/6924"
+ },
+ {
+  "additions": 148,
+  "changedFiles": 2,
+  "deletions": 14,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-07-10T00:54:52Z",
+  "number": 6908,
+  "title": "Python: Fix AG-UI approval thread aliases",
+  "url": "https://github.com/microsoft/agent-framework/pull/6908"
+ },
+ {
+  "additions": 73,
+  "changedFiles": 2,
+  "deletions": 4,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-07-13T21:22:51Z",
+  "number": 6822,
+  "title": "Python: Fix: Ollama parallel tool calls collide on same call_id",
+  "url": "https://github.com/microsoft/agent-framework/pull/6822"
+ },
+ {
+  "additions": 16,
+  "changedFiles": 2,
+  "deletions": 1,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-07-14T06:46:50Z",
+  "number": 6809,
+  "title": "Python: fix: preserve function-call name when merging streaming deltas",
+  "url": "https://github.com/microsoft/agent-framework/pull/6809"
+ },
+ {
+  "additions": 63,
+  "changedFiles": 2,
+  "deletions": 1,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-07-13T21:35:50Z",
+  "number": 6804,
+  "title": "Python: Fix: coalesce reasoning deltas into single block when content.id is None",
+  "url": "https://github.com/microsoft/agent-framework/pull/6804"
+ },
+ {
+  "additions": 186,
+  "changedFiles": 2,
+  "deletions": 0,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-06-30T21:04:18Z",
+  "number": 6751,
+  "title": "Python: Fix GeminiChatClient dropping image/file content",
+  "url": "https://github.com/microsoft/agent-framework/pull/6751"
+ },
+ {
+  "additions": 92,
+  "changedFiles": 2,
+  "deletions": 3,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-06-25T05:54:06Z",
+  "number": 6712,
+  "title": "Python: Fix Hyperlight CodeAct span parenting",
+  "url": "https://github.com/microsoft/agent-framework/pull/6712"
+ },
+ {
+  "additions": 7,
+  "changedFiles": 2,
+  "deletions": 2,
+  "labels": [
+   {
+    "id": "LA_kwDOOhTcGM8AAAACBeb4lA",
+    "name": "python",
+    "description": "Usage: [Issues, PRs], Target: Python",
+    "color": "fbca04"
+   }
+  ],
+  "mergedAt": "2026-06-23T23:14:17Z",
+  "number": 6691,
+  "title": "Python: Add load_dotenv to get-started samples and fix chat_response_\u00e2\u20ac\u00a6",
+  "url": "https://github.com/microsoft/agent-framework/pull/6691"
+ }
+]
