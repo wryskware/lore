@@ -146,8 +146,20 @@ were requested — same gap as RCB, carried again.
 ## Qualitative verdicts
 
 Arm-blind Sonnet 5 batch judge (Anthropic Batches API), tertiary only.
-*Pending at time of writing — this section is filled by `verdicts.jsonl` when
-the batch lands; the deterministic grades above are unaffected either way.*
+
+| task | off | on |
+| --- | --- | --- |
+| W1 | incorrect (write-then-delete; replica/AOF still sees writes) | partial (fixes growth, still writes before deleting) |
+| W2 | incorrect (plausible recursion, misses `additionalProperties`) | partial (same approach, closer, same omission) |
+| W3 | incorrect (frontend symptom patch, backend still wrong) | **equivalent** (line-for-line the golden gate) |
+| W4 | incorrect (.NET port fixed — "conceptually the same fix as golden", wrong stack) | incorrect (same, wrong stack) |
+| W5 | **equivalent** (same accumulator strategy, implemented inline) | incorrect (drops `message_start` usage entirely, loses input tokens) |
+
+The judge's readings converge with the deterministic grades and the parent
+analysis on every cell: both W4 verdicts independently describe the candidate
+as the right fix on the wrong stack, and on-W5 is identified as exactly the
+suppress-the-seed non-fix the W5 test author designed against. No cell where
+the judge and the regression outcome disagree in direction.
 
 ## What this round says
 
@@ -190,6 +202,15 @@ lore is currently a cost, not a saving — with n=5, one answerer, no repeats.
   Round cells are unaffected (`smoke2-0819` and `rcbw1-0819` ran after).
 - RCB-W machinery moved into the bench subrepo mid-round
   (`bench/rcb/rcbw/` @ `748b63b`); WSL-side deployed copies unchanged.
+- **Grading bug found and fixed after first grading pass** (`822db52`): the
+  authored regression file was counted again inside the collateral sweep, so
+  6 of 10 cells reported phantom collateral breakage. Re-graded with the
+  regression file excluded: **no candidate broke any collateral suite.**
+  fixed/not_fixed verdicts were unaffected. The first judge batch saw the
+  contaminated collateral flags and was re-dispatched on corrected grades;
+  only the corrected verdicts are reported here.
+- `judge_batch.py` content parsing hardened (thinking blocks can precede the
+  structured output block); the two affected W4 verdicts re-ran cleanly.
 
 ## Carried over and next
 
