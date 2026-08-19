@@ -14,9 +14,19 @@ This document is a draft for Wrysk's review: nothing here is frozen, and per
 vault rules it must not be treated as decided until Wrysk approves the
 selection, the prompts, and the grading scheme.
 
-Provenance of the vetting evidence: `bench/rcbw/candidates/vet-reports.md`
+Provenance of the vetting evidence: `bench/rcb/rcbw/candidates/vet-reports.md`
 (three Opus worker reports, verbatim, with the parent spot-checks listed at the
-top). Harvest data and the twelve candidate diffs: `bench/rcbw/candidates/`.
+top). Harvest data and the twelve candidate diffs: `bench/rcb/rcbw/candidates/`.
+(RCB-W lives in the bench subrepo since 2026-08-19; `bench/rcbw/` paths in
+older history refer to the same content pre-move.)
+
+**Status update, 2026-08-19 (post-round-1):** gates 1–3 executed and passed
+(execution validation on all five tasks, W5 test rewrite, W3 smoke); round 1
+ran on this draft with Wrysk's go-ahead — see
+[[2026-08-19_rcb-w-round-1-report]]. The round surfaced two prompt defects to
+fix before freezing: W1's symptom underdetermines the merged never-write
+contract, and W4's symptom does not name the Python stack in a dual-stack
+corpus. The pytest question is resolved: **allowed** (Wrysk, 2026-08-19).
 
 ## Why post-pin PRs
 
