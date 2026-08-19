@@ -61,11 +61,18 @@ pub struct Skill {
     pub body: &'static str,
 }
 
-pub const SKILLS: &[Skill] = &[Skill {
-    name: "lore-ignore",
-    summary: "tune a project's .loreignore by measuring the repo",
-    body: include_str!("assets/lore-ignore.md"),
-}];
+pub const SKILLS: &[Skill] = &[
+    Skill {
+        name: "lore-search",
+        summary: "how to actually use lore's index: search, expand, authority, when to grep",
+        body: include_str!("assets/lore-search.md"),
+    },
+    Skill {
+        name: "lore-ignore",
+        summary: "tune a project's .loreignore by measuring the repo",
+        body: include_str!("assets/lore-ignore.md"),
+    },
+];
 
 /// The `lore setup` target that installs the user-level ignore rules. Not a
 /// host: it writes into lore's own data directory.
@@ -546,13 +553,17 @@ mod tests {
     #[test]
     fn installing_twice_changes_nothing_the_second_time() {
         let (_dir, root) = temp();
-        assert_eq!(apply(&plan(&root)[0], false).unwrap(), Outcome::Installed);
+        for item in &plan(&root) {
+            assert_eq!(apply(item, false).unwrap(), Outcome::Installed);
+        }
 
         let after = plan(&root);
-        assert_eq!(after[0].state, State::UpToDate);
-        let before_bytes = std::fs::read(&after[0].path).unwrap();
-        assert_eq!(apply(&after[0], false).unwrap(), Outcome::Unchanged);
-        assert_eq!(std::fs::read(&after[0].path).unwrap(), before_bytes);
+        for item in &after {
+            assert_eq!(item.state, State::UpToDate);
+            let before_bytes = std::fs::read(&item.path).unwrap();
+            assert_eq!(apply(item, false).unwrap(), Outcome::Unchanged);
+            assert_eq!(std::fs::read(&item.path).unwrap(), before_bytes);
+        }
         assert!(!pending(&after, false));
         assert!(!pending(&after, true));
     }
@@ -602,6 +613,9 @@ mod tests {
     fn the_planned_path_is_the_one_the_host_actually_reads() {
         let (_dir, root) = temp();
         let items = plan(&root);
-        assert_eq!(items[0].path, root.join("lore-ignore").join("SKILL.md"));
+        for item in &items {
+            assert_eq!(item.path, root.join(item.name).join("SKILL.md"));
+        }
+        assert!(items.iter().any(|item| item.name == "lore-ignore"));
     }
 }
