@@ -121,6 +121,59 @@ regardless of quality.
 Precision (judged-pool) metrics are deferred: the pool has no labels for card
 paths, and judging them is only worth the labels if recall shows a margin.
 
+## Results — run 20260818-212430 (qwen3-4b, 25 queries, n=1 run)
+
+16 cards generated (local qwen3.8 via Ollama, ~25 min wall); every card
+survived chunking as exactly one chunk (+16 chunks on a 1,636-chunk corpus).
+Cards were retrieved 23 times across the 25 queries' recorded top-20 and
+appeared in the top-10 of 14 queries — the layer is not dead weight.
+
+| arm | hit@5 | hit@10 | MRR@10 | nDCG@10 | semantic hit@10 |
+|---|---|---|---|---|---|
+| control (lore-bench) | 0.92 | 0.92 | 0.761 | 0.771 | 0.8 |
+| cards, raw (pessimistic) | 0.88 | 0.92 | 0.740 | 0.755 | 0.8 |
+| cards, card-credit (optimistic) | 0.92 | **0.96** | 0.741 | 0.765 | **0.9** |
+
+Per-query key ranks: **22/25 queries unchanged in all three arms.** The
+entire aggregate movement is three queries:
+
+- **LB-01** (semantic: "what stops two copies of the background service
+  from both writing to the same index at once") — the control arm's hardest
+  miss: key absent from top-10. With cards, two cards land in the top-10 and
+  anchor-following surfaces the key at rank 6. Miss → hit is the one real
+  win, and it is exactly the query shape the concept targeted.
+- **LB-13** (lexical, FTS5 tokenizer) — rank 1 → 2 raw (one card displaced
+  the source) → 3 under card-credit (naive expansion inserts *all* of a
+  card's anchors above the source). The one real cost.
+- **LB-07** (semantic) — 5 → 6 raw (crosses the hit@5 boundary; the whole
+  hit@5 dip), back to 5 under credit.
+- **LB-03** stays missed in every arm: the cards covering the walker did not
+  describe the exclusion behavior in matching vocabulary — card coverage is
+  only as good as the distiller's read of the area.
+
+Reading, with the n=25 / single-corpus / single-run caveat stated plainly
+(every delta above is one or two queries):
+
+1. **Displacement is real but tiny** — two queries slipped one rank each.
+   The colonization fear is not borne out at this card density (16 cards /
+   1,636 chunks), even with cards interleaved in the main ranking with no
+   authority cap.
+2. **The gain shows up exactly where predicted** and only via
+   anchor-following: raw ranking alone gains nothing (cards can only match;
+   the key path still has to be reached through them). The value of the
+   layer is contingent on the anchor hop being cheap and visible.
+3. Both observations together are the empirical case for the **lane
+   design**: keep cards out of the main ranking (removes LB-07/LB-13-style
+   displacement entirely), present them beside it with their anchors
+   (keeps the LB-01-style win). LB-13's extra drop under card-credit is an
+   artifact of flat expansion that a lane presentation would not have.
+
+What would make the evidence decision-grade rather than suggestive: repeat
+on terrarium-bench and lexomancy (different languages, bigger corpus),
+a stronger distiller model for coverage (LB-03), and a judged-pool pass to
+price the noise cards add below rank-10. None of that is worth doing before
+deciding whether the lane surface is wanted at all.
+
 ## Generator
 
 `bench/distill/distill.py` — standalone, no daemon involvement. Walks the
