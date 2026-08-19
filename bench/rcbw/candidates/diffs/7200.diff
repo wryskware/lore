@@ -1,0 +1,225 @@
+diff --git a/python/packages/declarative/agent_framework_declarative/_models.py b/python/packages/declarative/agent_framework_declarative/_models.py
+index 9a23560f99..d748dd6586 100644
+--- a/python/packages/declarative/agent_framework_declarative/_models.py
++++ b/python/packages/declarative/agent_framework_declarative/_models.py
+@@ -5,7 +5,7 @@
+ import os
+ from collections.abc import MutableMapping
+ from contextvars import ContextVar
+-from typing import TYPE_CHECKING, Any, Literal, TypeVar, Union, overload
++from typing import TYPE_CHECKING, Any, Literal, TypeVar, Union, cast, overload
+ 
+ from agent_framework._serialization import SerializationMixin
+ 
+@@ -203,6 +203,52 @@ def __init__(
+         self.properties = converted_properties
+ 
+ 
++def _normalize_nested_schemas(node: dict[str, Any]) -> None:
++    """Recursively convert a node's nested schemas to JSON Schema form.
++
++    Nested schemas (array ``items``, object ``properties``) keep the declarative
++    shape after serialization: ``kind`` instead of ``type``, empty ``enum``
++    placeholders, and object properties as a list of ``{"name": ..., ...}``
++    entries. OpenAI rejects schemas whose nested nodes lack a ``type`` key, so
++    apply the same conversion the top-level properties loop performs.
++    """
++    items = node.get("items")
++    if isinstance(items, dict):
++        _normalize_schema_node(cast("dict[str, Any]", items))
++    props = node.get("properties")
++    if not isinstance(props, list):
++        return
++    # Serialized PropertySchema shape: [{"name": ..., "kind": ..., ...}, ...].
++    # Validate every element BEFORE mutating any, so an unexpected shape
++    # leaves the node fully untouched rather than half-converted.
++    if not all(isinstance(prop, dict) and "name" in prop for prop in cast("list[Any]", props)):
++        return
++    new_props: dict[str, Any] = {}
++    required_fields: list[str] = []
++    for prop in cast("list[dict[str, Any]]", props):
++        prop_name = prop.pop("name")
++        if prop.pop("required", False):
++            required_fields.append(prop_name)
++        _normalize_schema_node(prop)
++        new_props[prop_name] = prop
++    node["properties"] = new_props
++    if required_fields:
++        node["required"] = required_fields
++
++
++def _normalize_schema_node(node: dict[str, Any]) -> None:
++    """Rename ``kind`` -> ``type``, drop empty ``enum``, and recurse into children."""
++    if "kind" in node:
++        node["type"] = node.pop("kind")
++    if not node.get("enum"):
++        node.pop("enum", None)
++    if node.get("type") == "object":
++        # OpenAI strict structured outputs require additionalProperties: false on
++        # every object node; chat clients only inject it at the schema root.
++        node.setdefault("additionalProperties", False)
++    _normalize_nested_schemas(node)
++
++
+ class PropertySchema(SerializationMixin):
+     """Object representing a property schema."""
+ 
+@@ -244,13 +290,10 @@ def to_json_schema(self) -> dict[str, Any]:
+         required_fields: list[str] = []
+         for prop in json_schema.get("properties", []):
+             prop_name = prop.pop("name")
+-            prop["type"] = prop.pop("kind", None)
+             # Convert property-level 'required' boolean to a top-level 'required' array
+             if prop.pop("required", False):
+                 required_fields.append(prop_name)
+-            # Remove empty enum arrays
+-            if not prop.get("enum"):
+-                prop.pop("enum", None)
++            _normalize_schema_node(prop)
+             new_props[prop_name] = prop
+         json_schema["type"] = "object"
+         json_schema["properties"] = new_props
+diff --git a/python/packages/declarative/tests/test_declarative_models.py b/python/packages/declarative/tests/test_declarative_models.py
+index 85fa58a32f..043fb37279 100644
+--- a/python/packages/declarative/tests/test_declarative_models.py
++++ b/python/packages/declarative/tests/test_declarative_models.py
+@@ -302,6 +302,80 @@ def test_property_schema_with_type_field_produces_correct_json_schema(self):
+         assert "required" not in json_schema["properties"]["language"]
+         assert "required" not in json_schema["properties"]["answer"]
+ 
++    def test_property_schema_array_items_kind_renamed_recursively(self):
++        """Nested array 'items' schemas get kind -> type renamed and empty enums dropped."""
++        schema = PropertySchema.from_dict({
++            "properties": {
++                "issues": {"kind": "array", "items": {"kind": "string"}},
++            },
++        })
++
++        json_schema = schema.to_json_schema()
++
++        assert json_schema["properties"]["issues"]["type"] == "array"
++        assert json_schema["properties"]["issues"]["items"] == {"type": "string"}
++
++    def test_property_schema_nested_object_properties_kind_renamed_recursively(self):
++        """Nested object 'properties' (including arrays of objects) are converted at every depth."""
++        schema = PropertySchema.from_dict({
++            "properties": {
++                "picks": {
++                    "kind": "array",
++                    "items": {
++                        "kind": "object",
++                        "properties": {"ref": {"kind": "number"}},
++                    },
++                },
++            },
++        })
++
++        json_schema = schema.to_json_schema()
++
++        items = json_schema["properties"]["picks"]["items"]
++        assert items["type"] == "object"
++        assert items["properties"]["ref"] == {"type": "number"}
++        assert items["additionalProperties"] is False
++
++    def test_property_schema_object_nodes_get_additional_properties_false(self):
++        """Every object node below the root carries additionalProperties: false.
++
++        OpenAI strict structured outputs reject object nodes without it; chat
++        clients only inject it at the schema root.
++        """
++        schema = PropertySchema.from_dict({
++            "properties": {
++                "meta": {
++                    "kind": "object",
++                    "properties": {
++                        "inner": {"kind": "object", "properties": {"leaf": {"kind": "string"}}},
++                    },
++                },
++            },
++        })
++
++        json_schema = schema.to_json_schema()
++
++        meta = json_schema["properties"]["meta"]
++        assert meta["additionalProperties"] is False
++        assert meta["properties"]["inner"]["additionalProperties"] is False
++
++    def test_property_schema_unexpected_nested_properties_left_untouched(self):
++        """A nested properties list with an unexpected element is left fully unmodified."""
++        from agent_framework_declarative._models import _normalize_nested_schemas
++
++        node = {
++            "type": "object",
++            "properties": [
++                {"name": "ok", "kind": "string"},
++                "not-a-dict",
++            ],
++        }
++
++        _normalize_nested_schemas(node)
++
++        # No partial mutation: the well-formed first element keeps its original shape too.
++        assert node["properties"] == [{"name": "ok", "kind": "string"}, "not-a-dict"]
++
+ 
+ class TestConnection:
+     """Tests for Connection base class."""
+diff --git a/python/packages/openai/tests/openai/test_openai_chat_client.py b/python/packages/openai/tests/openai/test_openai_chat_client.py
+index 8cc7fb737a..0497d3ddf0 100644
+--- a/python/packages/openai/tests/openai/test_openai_chat_client.py
++++ b/python/packages/openai/tests/openai/test_openai_chat_client.py
+@@ -5632,6 +5632,54 @@ async def test_integration_options(
+                 assert "seattle" in response.value["location"].lower()
+ 
+ 
++@pytest.mark.flaky
++@pytest.mark.integration
++@skip_if_openai_integration_tests_disabled
++async def test_integration_response_format_nested_object_schema() -> None:
++    """A raw response_format dict with array-of-object items must round-trip in strict mode.
++
++    The schema literal mirrors what agent_framework_declarative's
++    PropertySchema.to_json_schema() emits for an array-of-objects output schema,
++    so this package needs no declarative dependency. OpenAI strict mode requires
++    additionalProperties: false on every object node, not just the root.
++    """
++    response_format: dict[str, Any] = {
++        "type": "object",
++        "properties": {
++            "issues": {
++                "type": "array",
++                "items": {
++                    "type": "object",
++                    "properties": {
++                        "title": {"type": "string"},
++                        "severity": {"type": "string"},
++                    },
++                    "required": ["title", "severity"],
++                    "additionalProperties": False,
++                },
++            },
++        },
++        "required": ["issues"],
++    }
++    client = OpenAIChatClient()
++    messages = [
++        Message(
++            role="user",
++            contents=["List two code issues: a null pointer in parser.py (high) and a typo in README.md (low)."],
++        )
++    ]
++    response = await client.get_response(messages=messages, options={"response_format": response_format})
++
++    assert response.value is not None
++    assert isinstance(response.value, dict)
++    issues = response.value["issues"]
++    assert isinstance(issues, list)
++    assert issues
++    for issue in issues:
++        assert "title" in issue
++        assert "severity" in issue
++
++
+ @pytest.mark.timeout(300)
+ @pytest.mark.flaky
+ @pytest.mark.integration

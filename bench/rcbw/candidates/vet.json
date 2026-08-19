@@ -1,0 +1,467 @@
+[
+ {
+  "pr": "6691",
+  "src_files": [
+   "python/samples/01-get-started/05_functional_workflow_with_agents.py",
+   "python/samples/02-agents/chat_client/chat_response_cancellation.py"
+  ],
+  "src_at_pin": [
+   "python/samples/01-get-started/05_functional_workflow_with_agents.py",
+   "python/samples/02-agents/chat_client/chat_response_cancellation.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [],
+  "preimage_match": 1.0,
+  "preimage_counts": "2/2"
+ },
+ {
+  "pr": "6712",
+  "src_files": [
+   "python/packages/hyperlight/agent_framework_hyperlight/_execute_code_tool.py"
+  ],
+  "src_at_pin": [
+   "python/packages/hyperlight/agent_framework_hyperlight/_execute_code_tool.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [
+   "python/packages/hyperlight/tests/hyperlight/test_hyperlight_codeact.py"
+  ],
+  "preimage_match": 1.0,
+  "preimage_counts": "2/2"
+ },
+ {
+  "pr": "6751",
+  "src_files": [
+   "python/packages/gemini/agent_framework_gemini/_chat_client.py"
+  ],
+  "src_at_pin": [
+   "python/packages/gemini/agent_framework_gemini/_chat_client.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [
+   "python/packages/gemini/tests/test_gemini_client.py"
+  ],
+  "preimage_match": null,
+  "preimage_counts": "0/0"
+ },
+ {
+  "pr": "6804",
+  "src_files": [
+   "python/packages/ag-ui/agent_framework_ag_ui/_run_common.py"
+  ],
+  "src_at_pin": [
+   "python/packages/ag-ui/agent_framework_ag_ui/_run_common.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [
+   "python/packages/ag-ui/tests/ag_ui/test_run_common.py"
+  ],
+  "preimage_match": 1.0,
+  "preimage_counts": "1/1"
+ },
+ {
+  "pr": "6809",
+  "src_files": [
+   "python/packages/core/agent_framework/_types.py"
+  ],
+  "src_at_pin": [
+   "python/packages/core/agent_framework/_types.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [
+   "python/packages/core/tests/core/test_types.py"
+  ],
+  "preimage_match": 1.0,
+  "preimage_counts": "1/1"
+ },
+ {
+  "pr": "6822",
+  "src_files": [
+   "python/packages/ollama/agent_framework_ollama/_chat_client.py"
+  ],
+  "src_at_pin": [
+   "python/packages/ollama/agent_framework_ollama/_chat_client.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [
+   "python/packages/ollama/tests/test_ollama_chat_client.py"
+  ],
+  "preimage_match": 1.0,
+  "preimage_counts": "4/4"
+ },
+ {
+  "pr": "6908",
+  "src_files": [
+   "python/packages/ag-ui/agent_framework_ag_ui/_agent_run.py"
+  ],
+  "src_at_pin": [
+   "python/packages/ag-ui/agent_framework_ag_ui/_agent_run.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [
+   "python/packages/ag-ui/tests/ag_ui/test_agent_wrapper_comprehensive.py"
+  ],
+  "preimage_match": 0.45454545454545453,
+  "preimage_counts": "5/11"
+ },
+ {
+  "pr": "6924",
+  "src_files": [
+   "python/packages/core/agent_framework/_clients.py"
+  ],
+  "src_at_pin": [
+   "python/packages/core/agent_framework/_clients.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [],
+  "preimage_match": 0.8695652173913043,
+  "preimage_counts": "20/23"
+ },
+ {
+  "pr": "6969",
+  "src_files": [],
+  "src_at_pin": [],
+  "src_missing_at_pin": [],
+  "test_files": [],
+  "preimage_match": null,
+  "preimage_counts": "0/0"
+ },
+ {
+  "pr": "6990",
+  "src_files": [
+   "python/packages/core/agent_framework/_types.py"
+  ],
+  "src_at_pin": [
+   "python/packages/core/agent_framework/_types.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [
+   "python/packages/core/tests/core/test_types.py"
+  ],
+  "preimage_match": 0.0,
+  "preimage_counts": "0/1"
+ },
+ {
+  "pr": "7031",
+  "src_files": [
+   "python/packages/core/agent_framework/_skills.py"
+  ],
+  "src_at_pin": [
+   "python/packages/core/agent_framework/_skills.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [],
+  "preimage_match": 1.0,
+  "preimage_counts": "1/1"
+ },
+ {
+  "pr": "7060",
+  "src_files": [
+   "python/packages/anthropic/agent_framework_anthropic/_chat_client.py"
+  ],
+  "src_at_pin": [
+   "python/packages/anthropic/agent_framework_anthropic/_chat_client.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [
+   "python/packages/anthropic/tests/test_anthropic_client.py"
+  ],
+  "preimage_match": 1.0,
+  "preimage_counts": "2/2"
+ },
+ {
+  "pr": "7124",
+  "src_files": [
+   "python/packages/core/agent_framework/_compaction.py"
+  ],
+  "src_at_pin": [
+   "python/packages/core/agent_framework/_compaction.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [
+   "python/packages/core/tests/core/test_compaction.py"
+  ],
+  "preimage_match": 1.0,
+  "preimage_counts": "1/1"
+ },
+ {
+  "pr": "7162",
+  "src_files": [
+   "python/packages/anthropic/agent_framework_anthropic/_chat_client.py"
+  ],
+  "src_at_pin": [
+   "python/packages/anthropic/agent_framework_anthropic/_chat_client.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [
+   "python/packages/anthropic/tests/test_anthropic_client.py"
+  ],
+  "preimage_match": 1.0,
+  "preimage_counts": "4/4"
+ },
+ {
+  "pr": "7199",
+  "src_files": [
+   "python/packages/openai/agent_framework_openai/_chat_completion_client.py"
+  ],
+  "src_at_pin": [
+   "python/packages/openai/agent_framework_openai/_chat_completion_client.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [
+   "python/packages/openai/tests/openai/test_openai_chat_client.py",
+   "python/packages/openai/tests/openai/test_openai_chat_completion_client.py"
+  ],
+  "preimage_match": 1.0,
+  "preimage_counts": "1/1"
+ },
+ {
+  "pr": "7200",
+  "src_files": [
+   "python/packages/declarative/agent_framework_declarative/_models.py"
+  ],
+  "src_at_pin": [
+   "python/packages/declarative/agent_framework_declarative/_models.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [
+   "python/packages/declarative/tests/test_declarative_models.py",
+   "python/packages/openai/tests/openai/test_openai_chat_client.py"
+  ],
+  "preimage_match": 1.0,
+  "preimage_counts": "4/4"
+ },
+ {
+  "pr": "7202",
+  "src_files": [
+   "python/packages/foundry_hosting/agent_framework_foundry_hosting/_toolbox.py"
+  ],
+  "src_at_pin": [],
+  "src_missing_at_pin": [
+   "python/packages/foundry_hosting/agent_framework_foundry_hosting/_toolbox.py"
+  ],
+  "test_files": [
+   "python/packages/foundry_hosting/tests/test_toolbox.py"
+  ],
+  "preimage_match": null,
+  "preimage_counts": "0/0"
+ },
+ {
+  "pr": "7220",
+  "src_files": [
+   "python/packages/foundry_hosting/agent_framework_foundry_hosting/_responses.py"
+  ],
+  "src_at_pin": [
+   "python/packages/foundry_hosting/agent_framework_foundry_hosting/_responses.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [
+   "python/packages/foundry_hosting/tests/test_responses.py",
+   "python/packages/foundry_hosting/tests/test_responses_int.py"
+  ],
+  "preimage_match": 1.0,
+  "preimage_counts": "4/4"
+ },
+ {
+  "pr": "7271",
+  "src_files": [
+   "python/packages/core/agent_framework/_tools.py"
+  ],
+  "src_at_pin": [
+   "python/packages/core/agent_framework/_tools.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [
+   "python/packages/core/tests/core/test_function_invocation_logic.py"
+  ],
+  "preimage_match": 0.8571428571428571,
+  "preimage_counts": "6/7"
+ },
+ {
+  "pr": "7281",
+  "src_files": [
+   "python/samples/04-hosting/a2a/a2a_server.py"
+  ],
+  "src_at_pin": [
+   "python/samples/04-hosting/a2a/a2a_server.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [],
+  "preimage_match": 1.0,
+  "preimage_counts": "2/2"
+ },
+ {
+  "pr": "7322",
+  "src_files": [
+   "python/packages/gemini/agent_framework_gemini/_chat_client.py"
+  ],
+  "src_at_pin": [
+   "python/packages/gemini/agent_framework_gemini/_chat_client.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [
+   "python/packages/gemini/tests/test_gemini_client.py"
+  ],
+  "preimage_match": 1.0,
+  "preimage_counts": "3/3"
+ },
+ {
+  "pr": "7333",
+  "src_files": [
+   "python/packages/core/agent_framework/_middleware.py"
+  ],
+  "src_at_pin": [
+   "python/packages/core/agent_framework/_middleware.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [
+   "python/packages/core/tests/core/test_middleware_with_agent.py"
+  ],
+  "preimage_match": 1.0,
+  "preimage_counts": "4/4"
+ },
+ {
+  "pr": "7399",
+  "src_files": [
+   "python/packages/core/agent_framework/_evaluation.py"
+  ],
+  "src_at_pin": [
+   "python/packages/core/agent_framework/_evaluation.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [
+   "python/packages/core/tests/core/test_local_eval.py"
+  ],
+  "preimage_match": 1.0,
+  "preimage_counts": "4/4"
+ },
+ {
+  "pr": "7417",
+  "src_files": [
+   "python/packages/copilotstudio/agent_framework_copilotstudio/_agent.py",
+   "python/samples/02-agents/providers/copilotstudio/copilotstudio_with_explicit_settings.py"
+  ],
+  "src_at_pin": [
+   "python/packages/copilotstudio/agent_framework_copilotstudio/_agent.py",
+   "python/samples/02-agents/providers/copilotstudio/copilotstudio_with_explicit_settings.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [
+   "python/packages/copilotstudio/tests/test_copilot_agent.py"
+  ],
+  "preimage_match": 1.0,
+  "preimage_counts": "1/1"
+ },
+ {
+  "pr": "7427",
+  "src_files": [],
+  "src_at_pin": [],
+  "src_missing_at_pin": [],
+  "test_files": [
+   "dotnet/tests/Microsoft.Agents.AI.GitHub.Copilot.IntegrationTests/GitHubCopilotAgentTests.cs",
+   "python/packages/github_copilot/tests/test_github_copilot_agent.py"
+  ],
+  "preimage_match": null,
+  "preimage_counts": "0/0"
+ },
+ {
+  "pr": "7470",
+  "src_files": [
+   "python/packages/redis/agent_framework_redis/_history_provider.py"
+  ],
+  "src_at_pin": [
+   "python/packages/redis/agent_framework_redis/_history_provider.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [
+   "python/packages/redis/tests/test_providers.py"
+  ],
+  "preimage_match": 1.0,
+  "preimage_counts": "1/1"
+ },
+ {
+  "pr": "7557",
+  "src_files": [
+   "python/packages/core/agent_framework/_workflows/_edge_runner.py"
+  ],
+  "src_at_pin": [
+   "python/packages/core/agent_framework/_workflows/_edge_runner.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [
+   "python/packages/core/tests/workflow/test_edge.py"
+  ],
+  "preimage_match": 1.0,
+  "preimage_counts": "2/2"
+ },
+ {
+  "pr": "7635",
+  "src_files": [
+   "python/packages/azure-cosmos-memory/agent_framework_azure_cosmos_memory/_context_provider.py"
+  ],
+  "src_at_pin": [],
+  "src_missing_at_pin": [
+   "python/packages/azure-cosmos-memory/agent_framework_azure_cosmos_memory/_context_provider.py"
+  ],
+  "test_files": [
+   "python/packages/azure-cosmos-memory/tests/test_context_provider.py",
+   "python/packages/azure-cosmos-memory/tests/test_emulator.py"
+  ],
+  "preimage_match": null,
+  "preimage_counts": "0/0"
+ },
+ {
+  "pr": "7652",
+  "src_files": [
+   "python/packages/devui/agent_framework_devui/_mapper.py"
+  ],
+  "src_at_pin": [
+   "python/packages/devui/agent_framework_devui/_mapper.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [
+   "python/packages/devui/tests/devui/test_mapper.py"
+  ],
+  "preimage_match": 1.0,
+  "preimage_counts": "1/1"
+ },
+ {
+  "pr": "7655",
+  "src_files": [
+   "python/packages/ag-ui/agent_framework_ag_ui/_message_adapters.py"
+  ],
+  "src_at_pin": [
+   "python/packages/ag-ui/agent_framework_ag_ui/_message_adapters.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [
+   "python/packages/ag-ui/tests/ag_ui/test_message_adapters.py"
+  ],
+  "preimage_match": 1.0,
+  "preimage_counts": "4/4"
+ },
+ {
+  "pr": "7693",
+  "src_files": [],
+  "src_at_pin": [],
+  "src_missing_at_pin": [],
+  "test_files": [],
+  "preimage_match": null,
+  "preimage_counts": "0/0"
+ },
+ {
+  "pr": "7755",
+  "src_files": [
+   "python/packages/orchestrations/agent_framework_orchestrations/_handoff.py"
+  ],
+  "src_at_pin": [
+   "python/packages/orchestrations/agent_framework_orchestrations/_handoff.py"
+  ],
+  "src_missing_at_pin": [],
+  "test_files": [
+   "python/packages/orchestrations/tests/test_handoff.py"
+  ],
+  "preimage_match": null,
+  "preimage_counts": "0/0"
+ }
+]
