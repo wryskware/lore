@@ -15,7 +15,7 @@ jobs:
     # test around e2e-benchmark time rather than a CI lane for now.
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
