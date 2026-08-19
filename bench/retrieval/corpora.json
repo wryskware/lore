@@ -5,6 +5,11 @@
     "queries": "queries/lore-bench.json"
   },
   {
+    "name": "lore-bench-d",
+    "root": "C:\\Users\\perag\\bench-e2e\\lore-bench-d",
+    "queries": "queries/lore-bench-d.json"
+  },
+  {
     "name": "terrarium-bench",
     "root": "C:\\Users\\perag\\bench-e2e\\terrarium-bench",
     "queries": "queries/terrarium-bench.json"
