@@ -27,6 +27,12 @@ use std::fmt::Write as _;
 const LEXICAL_ONLY_NOTE: &str = "note: embeddings are unavailable, so these are lexical matches only; \
      semantically related chunks may be missing (call `status` for why)\n";
 
+/// Heads the distilled lane. Says derived-not-canon on the one line an agent
+/// reads before deciding whether to trust a card, and points at the anchors
+/// rather than at the card, because the sources are the part that is canon.
+const DISTILLED_HEADER: &str = "distilled cards (agent-generated summaries of this area - derived, not canon; \
+     expand one and follow its source anchors):";
+
 /// Displayed chunk-id length, git-style.
 ///
 /// A full blake3 id is 64 hex characters — roughly sixteen tokens spent twice
@@ -125,6 +131,9 @@ pub fn search(query: &str, response: &SearchResponse) -> String {
         if response.lexical_only {
             out.push_str(LEXICAL_ONLY_NOTE);
         }
+        // A card-only answer is still an answer - and it is exactly what a
+        // caller who scoped the query to `distilled/` asked for.
+        push_distilled(&mut out, &response.distilled);
         return out;
     }
 
@@ -147,10 +156,44 @@ pub fn search(query: &str, response: &SearchResponse) -> String {
         out.push('\n');
         push_result(&mut out, index + 1, result, index < EXCERPT_RANKS);
     }
+    push_distilled(&mut out, &response.distilled);
     out
 }
 
-fn push_result(out: &mut String, rank: usize, result: &SearchResult, with_excerpt: bool) {
+/// The distilled lane, under the results and never mixed into them.
+///
+/// The header states what the block is *for* in one line: a card reads like an
+/// authored document, and nothing else an agent can see says it was written by
+/// a model summarizing something else. Ranks are `d1..dn` so a follow-up
+/// naming "the second hit" cannot mean two different things - the same scheme
+/// the CLI renderer uses.
+///
+/// Excerpts follow the same [`EXCERPT_RANKS`] rule as the page above, which
+/// the lane never exceeds: a card the agent cannot read is a hop it has to pay
+/// for before it can tell whether the card is the one it wanted.
+fn push_distilled(out: &mut String, lane: &[SearchResult]) {
+    if lane.is_empty() {
+        return;
+    }
+    out.push('\n');
+    let _ = writeln!(out, "{DISTILLED_HEADER}");
+    for (index, card) in lane.iter().enumerate() {
+        out.push('\n');
+        push_result(
+            out,
+            format_args!("d{}", index + 1),
+            card,
+            index < EXCERPT_RANKS,
+        );
+    }
+}
+
+fn push_result(
+    out: &mut String,
+    rank: impl std::fmt::Display,
+    result: &SearchResult,
+    with_excerpt: bool,
+) {
     let language = match &result.language {
         Some(language) => format!("  [{language}]"),
         None => String::new(),
@@ -465,6 +508,7 @@ mod tests {
             &SearchResponse {
                 results: vec![vault_hit()],
                 lexical_only: false,
+                distilled: Vec::new(),
             },
         );
         assert!(rendered.starts_with("1 result(s) for \"vault authority\" (hybrid)\n"));
@@ -492,6 +536,7 @@ mod tests {
             &SearchResponse {
                 results: vec![demoted],
                 lexical_only: false,
+                distilled: Vec::new(),
             },
         );
         assert!(rendered.contains("    status: decided  refs: D-0007, D-0008\n"));
@@ -508,6 +553,7 @@ mod tests {
             &SearchResponse {
                 results: vec![code_hit()],
                 lexical_only: false,
+                distilled: Vec::new(),
             },
         );
         assert!(rendered.contains("    symbol: Board.Update\n"));
@@ -537,6 +583,7 @@ mod tests {
             &SearchResponse {
                 results,
                 lexical_only: false,
+                distilled: Vec::new(),
             },
         );
         assert!(rendered.contains(
@@ -563,6 +610,7 @@ mod tests {
             &SearchResponse {
                 results: vec![code_hit(), code_hit(), code_hit()],
                 lexical_only: false,
+                distilled: Vec::new(),
             },
         );
         assert!(!rendered.contains("note: excerpts"), "{rendered}");
@@ -601,6 +649,7 @@ mod tests {
             &SearchResponse {
                 results: vec![filler],
                 lexical_only: false,
+                distilled: Vec::new(),
             },
         );
         assert!(
@@ -621,6 +670,7 @@ mod tests {
             &SearchResponse {
                 results: vec![hit.clone()],
                 lexical_only: false,
+                distilled: Vec::new(),
             },
         );
         assert!(!rendered.contains(&hit.chunk_id), "{rendered}");
@@ -642,6 +692,7 @@ mod tests {
             &SearchResponse {
                 results: vec![],
                 lexical_only: true,
+                distilled: Vec::new(),
             },
         );
         assert_eq!(
@@ -657,10 +708,104 @@ mod tests {
             &SearchResponse {
                 results: vec![vault_hit(), code_hit()],
                 lexical_only: false,
+                distilled: Vec::new(),
             },
         );
         assert!(!rendered.contains("\n\n\n"), "{rendered}");
         assert!(rendered.contains("\n[2] lexomancy"));
+    }
+
+    fn card_hit() -> SearchResult {
+        SearchResult {
+            chunk_id: full_id("c0ffee042abc"),
+            project: "lore".into(),
+            project_key: "lore".into(),
+            path: "distilled/daemon-search.md".into(),
+            line_start: 1,
+            line_end: 24,
+            language: Some("markdown".into()),
+            symbol_path: None,
+            heading_path: Some(vec!["Daemon search".into()]),
+            design_status: None,
+            effective_authority: None,
+            authority_note: None,
+            decision_refs: vec![],
+            score: 0.4102,
+            excerpt: "Fusion happens in `daemon/search.rs`.".into(),
+            excerpt_truncated: false,
+        }
+    }
+
+    /// The lane sits after the page, is labelled for what it is, and numbers
+    /// itself apart from the page so a follow-up naming a hit is unambiguous.
+    #[test]
+    fn distilled_cards_render_in_a_labelled_lane_after_the_results() {
+        let rendered = search(
+            "how does ranking work",
+            &SearchResponse {
+                results: vec![vault_hit(), code_hit()],
+                lexical_only: false,
+                distilled: vec![card_hit()],
+            },
+        );
+        let (page, lane) = rendered
+            .split_once(DISTILLED_HEADER)
+            .expect("the lane is headed");
+        assert!(
+            !page.contains("distilled/daemon-search.md"),
+            "a card must never appear above the header: {rendered}"
+        );
+        assert!(
+            page.contains("[1] lore") && page.contains("[2] lexomancy"),
+            "{rendered}"
+        );
+        assert!(
+            lane.contains("[d1] lore  distilled/daemon-search.md:1-24  score 0.410  [markdown]"),
+            "{rendered}"
+        );
+        // The count in the opening line is the page's, not the page plus the
+        // lane: a card is not one of the results.
+        assert!(rendered.starts_with("2 result(s) for"), "{rendered}");
+        assert!(!rendered.contains("\n\n\n"), "{rendered}");
+    }
+
+    /// An empty lane costs nothing at all - no header, no blank line.
+    #[test]
+    fn an_empty_lane_renders_nothing() {
+        let rendered = search(
+            "q",
+            &SearchResponse {
+                results: vec![vault_hit()],
+                lexical_only: false,
+                distilled: Vec::new(),
+            },
+        );
+        assert!(!rendered.contains("distilled"), "{rendered}");
+        assert!(rendered.ends_with("\n"), "{rendered}");
+    }
+
+    /// A page can be empty while the lane is not - that is exactly what a
+    /// caller who scoped the query into `distilled/` asked for, and answering
+    /// "no results" alone would be a lie.
+    #[test]
+    fn a_card_only_answer_still_shows_its_lane() {
+        let rendered = search(
+            "cards only",
+            &SearchResponse {
+                results: Vec::new(),
+                lexical_only: false,
+                distilled: vec![card_hit()],
+            },
+        );
+        assert!(
+            rendered.starts_with("no results for \"cards only\" (hybrid)\n"),
+            "{rendered}"
+        );
+        assert!(rendered.contains(DISTILLED_HEADER), "{rendered}");
+        assert!(
+            rendered.contains("[d1] lore  distilled/daemon-search.md"),
+            "{rendered}"
+        );
     }
 
     #[test]

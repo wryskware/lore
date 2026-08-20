@@ -47,6 +47,13 @@ async fn stub_daemon() -> String {
 }
 
 async fn stub_daemon_recording() -> (String, Requests) {
+    stub_daemon_serving(canned_search()).await
+}
+
+/// The same stub over a caller-chosen `/v1/search` body, for the cases that
+/// are about what the *response* carries rather than about what the server
+/// sends.
+async fn stub_daemon_serving(search: SearchResponse) -> (String, Requests) {
     let seen: Requests = Arc::new(Mutex::new(Vec::new()));
     let app = Router::new()
         .route(
@@ -55,12 +62,13 @@ async fn stub_daemon_recording() -> (String, Requests) {
                 let seen = seen.clone();
                 move |Json(request): Json<SearchRequest>| {
                     let seen = seen.clone();
+                    let search = search.clone();
                     async move {
                         seen.lock().unwrap().push(format!(
                             "search project_key={:?} project={:?}",
                             request.project_key, request.project
                         ));
-                        Json(canned_search())
+                        Json(search)
                     }
                 }
             }),
@@ -168,6 +176,7 @@ fn canned_search() -> SearchResponse {
             },
         ],
         lexical_only: false,
+        distilled: Vec::new(),
     }
 }
 
@@ -295,6 +304,10 @@ async fn against_stub() -> LoreServer {
     LoreServer::new(Endpoint::Fixed(stub_daemon().await))
 }
 
+async fn against_stub_serving(search: SearchResponse) -> LoreServer {
+    LoreServer::new(Endpoint::Fixed(stub_daemon_serving(search).await.0))
+}
+
 // ---------------------------------------------------------------------------
 // Golden files
 // ---------------------------------------------------------------------------
@@ -345,6 +358,67 @@ async fn search_renders_vault_authority_and_a_truncated_code_hit() {
 /// it has to be the *key*, which identifies a source exactly where the display
 /// name only usually does. Asserted on the wire rather than in the rendering,
 /// because the agent never sees this happen.
+/// Two cards for the query, which is the shape the lane exists for: the page
+/// keeps its source hits and the summaries answer beside it, labelled as
+/// derived and numbered apart.
+fn canned_lane() -> SearchResponse {
+    let mut response = canned_search();
+    response.distilled = vec![
+        SearchResult {
+            chunk_id: "c0ffee042abc0123456789abcdef0123456789abcdef0123456789abcdef0123".into(),
+            project: "lore".into(),
+            project_key: "lore".into(),
+            path: "distilled/daemon-search.md".into(),
+            line_start: 1,
+            line_end: 22,
+            language: Some("markdown".into()),
+            symbol_path: None,
+            heading_path: Some(vec!["Daemon search".into()]),
+            design_status: None,
+            effective_authority: None,
+            authority_note: None,
+            decision_refs: vec![],
+            score: 0.5210,
+            excerpt: "Search fuses a lexical arm and a vector arm with RRF, then weights \n                      the result by vault authority. See `crates/lore/src/daemon/search.rs`."
+                .into(),
+            excerpt_truncated: false,
+        },
+        SearchResult {
+            chunk_id: "b17e5aab00110123456789abcdef0123456789abcdef0123456789abcdef0123".into(),
+            project: "lore".into(),
+            project_key: "lore".into(),
+            path: "distilled/mcp-surface.md".into(),
+            line_start: 1,
+            line_end: 18,
+            language: Some("markdown".into()),
+            symbol_path: None,
+            heading_path: Some(vec!["MCP surface".into()]),
+            design_status: None,
+            effective_authority: None,
+            authority_note: None,
+            decision_refs: vec![],
+            score: 0.4038,
+            excerpt: "The proxy holds no index state; see `crates/lore-mcp/src/server.rs`.".into(),
+            excerpt_truncated: false,
+        },
+    ];
+    response
+}
+
+/// The lane as an agent actually reads it, beneath a full page of source
+/// hits: this snapshot is where a change to the header wording, the `d`
+/// numbering, or the lane's position has to be argued for.
+#[tokio::test]
+async fn distilled_cards_render_beside_the_page_not_inside_it() {
+    let rendered = call_tool(
+        against_stub_serving(canned_lane()).await,
+        "search",
+        json!({ "query": "how does ranking work", "limit": 5 }),
+    )
+    .await;
+    insta::assert_snapshot!("search_distilled_lane", rendered);
+}
+
 #[tokio::test]
 async fn every_tool_call_resolves_and_scopes_itself_without_being_asked() {
     let (base, seen) = stub_daemon_recording().await;

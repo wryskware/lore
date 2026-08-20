@@ -1,0 +1,41 @@
+---
+source: crates/lore-mcp/tests/mcp_golden.rs
+expression: rendered
+---
+3 result(s) for "how does ranking work" (hybrid)
+
+[1] lore  design/4_Interfaces/4.1_MCP_Surface.md:15-18  score 0.874  [markdown]
+    heading: MCP Tool Surface > v0.1 tools
+    status: decided  refs: D-0007, D-0008
+    project_key: lore  chunk_id: 9f3a1c2b7e4d
+- **`search`** - one unified hybrid query. Filters: project, path glob,
+  language, vault status.
+
+[2] lexomancy  Assets/Scripts/Board.cs:120-141  score 0.612  [csharp]
+    symbol: Board.Update
+    project_key: lexomancy  chunk_id: 4e77ba0193ab
+void Update()
+{
+    if (!_dirty) return;
+    Rebuild();
+    (excerpt truncated - expand project_key="lexomancy" chunk_id="4e77ba0193ab" for the full text)
+
+[3] lore  design/99_Scratch/2026-08-14_notes.md:3-9  score 0.410  [markdown]
+    heading: Ranking rewrite
+    status: decided  refs: D-0007
+    authority: deprecated - 99_Scratch path cap
+    project_key: lore  chunk_id: 1c0ffee042ab
+Per D-0007 the daemon owns index state, so ranking should...
+
+distilled cards (agent-generated summaries of this area - derived, not canon; expand one and follow its source anchors):
+
+[d1] lore  distilled/daemon-search.md:1-22  score 0.521  [markdown]
+    heading: Daemon search
+    project_key: lore  chunk_id: c0ffee042abc
+Search fuses a lexical arm and a vector arm with RRF, then weights 
+                      the result by vault authority. See `crates/lore/src/daemon/search.rs`.
+
+[d2] lore  distilled/mcp-surface.md:1-18  score 0.404  [markdown]
+    heading: MCP surface
+    project_key: lore  chunk_id: b17e5aab0011
+The proxy holds no index state; see `crates/lore-mcp/src/server.rs`.

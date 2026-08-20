@@ -37,6 +37,29 @@
 //! than merely unbeatable. Read [`MAX_CANDIDATES`] for what happens when they
 //! do not, and for the one thing this still does not promise.
 //!
+//! # The distilled lane
+//!
+//! Chunks under `distilled/` are agent-written summaries of an area, and they
+//! outrank the source they summarize on precisely the queries they were
+//! written for. They therefore run as a *second* search rather than as
+//! competitors in the first: acquisition proves the main page over a
+//! population the partition has already emptied of cards, so `results` is
+//! byte-identical to the answer the same corpus would give with no
+//! `distilled/` directory in it, and [`page_is_final`] keeps reasoning about
+//! the only population it ever sees. The cards are then ranked among
+//! themselves by the same fusion and reported beside the page
+//! (`design/6_Evaluation/2026-08-18_distilled-cards-v0.md` measured why
+//! interleaving is the wrong answer). `Distilled::Off` runs the same main
+//! search and skips the second one — which is what makes the two modes'
+//! pages comparable by construction rather than by care.
+//!
+//! Ranking two populations separately is not the same as ranking one and then
+//! splitting it: RRF fuses *ranks*, and a rank compresses when the rows above
+//! it are filtered out, so a card's fused score orders it against the other
+//! cards and against nothing else. That is the price of the partition, and it
+//! is the cheap side of the trade — the alternative is a third pull over the
+//! whole corpus whose only product is a number nobody reads.
+//!
 //! # Degradation is a first-class path
 //!
 //! `lexical_only` means exactly "vectors did not participate in *this*
@@ -46,10 +69,12 @@
 
 use std::collections::{HashMap, HashSet};
 
-use lore_core::{SearchRequest, SearchResponse, SearchResult};
+use lore_core::{Distilled, SearchRequest, SearchResponse, SearchResult};
 
 use crate::authority::Authority;
-use crate::store::{Project, ProjectId, SearchFilter, SearchHit, StatusFilter, Store};
+use crate::store::{
+    DistilledScope, Project, ProjectId, SearchFilter, SearchHit, StatusFilter, Store,
+};
 use crate::types::{Chunk, ChunkKind, DesignStatus, SourceKind};
 
 /// Results returned when the caller does not ask for a specific number.
@@ -65,6 +90,14 @@ pub const DEFAULT_LIMIT: u32 = 10;
 /// Hard ceiling; `search` is meant to stay token-lean (`expand` exists for
 /// depth, 3.1).
 pub const MAX_LIMIT: u32 = 100;
+
+/// How many distilled cards the lane carries.
+///
+/// Not caller-tunable, and small on purpose: the lane is a router, not a
+/// second result set. Three covers the "which area is this?" question a card
+/// answers — the v0 experiment's one real win came from two cards in a page —
+/// while keeping the block's cost near a rounding error against `results`.
+pub const DISTILLED_LANE_LIMIT: usize = 3;
 
 /// Excerpts are capped so a handful of results cannot blow an agent's
 /// context window on one tool call.
@@ -231,6 +264,74 @@ pub fn execute(
         .map(|source| source.id)
         .collect();
 
+    // The main page is acquired over the corpus minus its cards, under both
+    // modes: `off` and `lane` differ only in whether the second search runs,
+    // which is what makes their pages identical rather than merely similar.
+    let mut main_filter = filter.clone();
+    main_filter.distilled = DistilledScope::Exclude;
+    let (fusion, lexical_only) = acquire(
+        store,
+        &request.query,
+        query_vector,
+        &main_filter,
+        limit,
+        &ranked,
+    )?;
+
+    let results = fusion
+        .page
+        .into_iter()
+        .map(|hit| to_result(&sources, hit))
+        .collect();
+
+    // Every caller-supplied filter still applies here: the lane narrows the
+    // corpus to cards, it does not widen it past what the caller asked for.
+    // A caller whose own `path_prefix` already points into `distilled/` is
+    // simply left with an empty page and a full lane — mechanically correct,
+    // and not worth a special case.
+    let distilled = match request.distilled {
+        Distilled::Off => Vec::new(),
+        Distilled::Lane => {
+            let mut lane_filter = filter;
+            lane_filter.distilled = DistilledScope::Only;
+            let (lane, _) = acquire(
+                store,
+                &request.query,
+                query_vector,
+                &lane_filter,
+                DISTILLED_LANE_LIMIT,
+                &ranked,
+            )?;
+            lane.page
+                .into_iter()
+                .map(|hit| to_result(&sources, hit))
+                .collect()
+        }
+    };
+
+    Ok(SearchResponse {
+        results,
+        lexical_only,
+        distilled,
+    })
+}
+
+/// One proved page over whatever population `filter` admits, plus whether the
+/// vector arm contributed to it.
+///
+/// Split out of [`execute`] so the distilled lane runs the *same* acquisition
+/// as the main page rather than a cheaper approximation of it: a lane ranked
+/// by a single fixed pull would order cards by a different rule than the
+/// results they sit beside. Each call is independent — the partition is in
+/// the filter, so neither population can see the other's rows at any depth.
+fn acquire(
+    store: &mut Store,
+    query: &str,
+    query_vector: Option<&[f32]>,
+    filter: &SearchFilter,
+    limit: usize,
+    ranked: &HashSet<ProjectId>,
+) -> Result<(Fusion, bool), crate::store::StoreError> {
     // Candidate acquisition is a loop, not one fixed pull (see the module
     // header). Both arms are always asked for the same depth, because the stop
     // condition is stated in terms of a single `depth`. The floor keeps a
@@ -238,15 +339,15 @@ pub fn execute(
     // (`limit = 100` must not top out at 50); the cap governs the other end.
     let mut depth = limit.clamp(LEXICAL_CANDIDATES.max(VECTOR_CANDIDATES), MAX_CANDIDATES);
 
-    let (fusion, lexical_only) = loop {
-        let lexical = store.lexical_search(&request.query, &filter, depth)?;
+    loop {
+        let lexical = store.lexical_search(query, filter, depth)?;
 
         // A vector-arm failure degrades this request instead of failing it:
         // the usual cause is a fingerprint that moved under a live query
         // (dimension mismatch), which the worker is already fixing by
         // re-embedding.
         let vector = match query_vector {
-            Some(query_vector) => match store.vector_search(query_vector, &filter, depth) {
+            Some(query_vector) => match store.vector_search(query_vector, filter, depth) {
                 Ok(hits) => hits,
                 Err(err) => {
                     tracing::debug!(error = %err, "vector arm failed; falling back to lexical-only");
@@ -265,24 +366,24 @@ pub fn execute(
         // Honest by construction: an embedded query over a corpus with no
         // vectors in the filtered scope contributed nothing, and says so.
         let lexical_only = vector.is_empty();
-        let fusion = fuse_detailed(vec![lexical, vector], limit, &ranked);
+        let fusion = fuse_detailed(vec![lexical, vector], limit, ranked);
 
         if open == 0 {
             // Both arms are fully enumerated: this ranking is exact, not an
             // approximation. Short pages here are genuinely short.
-            break (fusion, lexical_only);
+            return Ok((fusion, lexical_only));
         }
         if page_is_final(&fusion, depth, open) {
-            break (fusion, lexical_only);
+            return Ok((fusion, lexical_only));
         }
         if depth >= MAX_CANDIDATES {
             tracing::debug!(
                 depth,
                 limit,
-                query = %request.query,
+                query = %query,
                 "candidate cap reached; this page is the best of the fetched pool, not proven best"
             );
-            break (fusion, lexical_only);
+            return Ok((fusion, lexical_only));
         }
         // `.max(depth + 1)` makes growth strictly monotonic, so the cap above
         // is always reached and the loop always terminates.
@@ -290,17 +391,7 @@ pub fn execute(
             .saturating_mul(CANDIDATE_GROWTH)
             .max(depth + 1)
             .min(MAX_CANDIDATES);
-    };
-
-    let results = fusion
-        .page
-        .into_iter()
-        .map(|hit| to_result(&sources, hit))
-        .collect();
-    Ok(SearchResponse {
-        results,
-        lexical_only,
-    })
+    }
 }
 
 /// Can anything we have not placed on the page still reach it?

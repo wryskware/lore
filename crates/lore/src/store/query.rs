@@ -2,7 +2,7 @@
 
 use rusqlite::types::Value;
 
-use super::{SearchFilter, StatusFilter, status_str};
+use super::{DistilledScope, SearchFilter, StatusFilter, status_str};
 
 /// Hard cap on terms in one FTS query — pasted-blob queries should not turn
 /// into thousand-term MATCH expressions.
@@ -98,6 +98,14 @@ pub(crate) struct FilterSql {
 /// gap, not a new one).
 const PATHS_IGNORE_CASE: bool = cfg!(windows);
 
+/// The project-relative prefix that marks a chunk as a distilled card.
+///
+/// Path alone, never frontmatter: cards have to be recognizable in a
+/// repository with no authority profile, where nothing parses frontmatter at
+/// all (D-0012). The trailing slash is load-bearing — `distilled_notes.md` at
+/// the root is an ordinary file.
+pub(crate) const DISTILLED_PREFIX: &str = "distilled/";
+
 /// Build the filter fragment for a query whose chunk table is aliased `c`.
 ///
 /// Path prefixing uses `substr(path, 1, n) = prefix` rather than `LIKE`:
@@ -133,6 +141,25 @@ pub(crate) fn filter_sql(filter: &SearchFilter) -> FilterSql {
     if let Some(language) = &filter.language {
         sql.push_str(" AND c.language = ?");
         params.push(Value::Text(language.clone()));
+    }
+    // The distilled partition. Folded exactly like `path_prefix` above, so a
+    // `Distilled/` directory on Windows is the same directory to this
+    // predicate as it is to every other path comparison in the daemon.
+    // `DISTILLED_PREFIX` is already lowercase, so one bound value serves both
+    // branches.
+    if let Some(op) = match filter.distilled {
+        DistilledScope::Any => None,
+        DistilledScope::Exclude => Some("<>"),
+        DistilledScope::Only => Some("="),
+    } {
+        let chars = DISTILLED_PREFIX.chars().count() as i64;
+        if PATHS_IGNORE_CASE {
+            sql.push_str(&format!(" AND lower(substr(c.path, 1, ?)) {op} ?"));
+        } else {
+            sql.push_str(&format!(" AND substr(c.path, 1, ?) {op} ?"));
+        }
+        params.push(Value::Integer(chars));
+        params.push(Value::Text(DISTILLED_PREFIX.to_string()));
     }
     // Effective, not declared: `min_authority` is a ranking-side floor, and a
     // caller asking to skip low-authority material means the authority Lore

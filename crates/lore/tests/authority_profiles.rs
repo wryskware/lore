@@ -20,7 +20,7 @@ use lore::daemon::search;
 use lore::repo_config::{Behavior, Profile, REPO_CONFIG_FILE, RepoAuthority};
 use lore::store::{NewEmbedding, Project, ProjectStatus, SearchFilter};
 use lore::types::ChunkId;
-use lore_core::{SearchRequest, SearchResult};
+use lore_core::{Distilled, SearchRequest, SearchResult};
 use serde_json::Value;
 
 const LEDGER: &str = "design/0_Canon/DECISIONS.md";
@@ -74,6 +74,7 @@ fn request(query: &str) -> SearchRequest {
         status: Vec::new(),
         sources: None,
         limit: Some(20),
+        distilled: Distilled::default(),
     }
 }
 

@@ -1,6 +1,6 @@
 ---
 source: crates/lore-mcp/tests/mcp_golden.rs
-assertion_line: 326
+assertion_line: 339
 expression: rendered
 ---
 {
@@ -62,6 +62,14 @@ expression: rendered
               "deprecated",
               "unclassified"
             ]
+          },
+          "DistilledParam": {
+            "description": "Where agent-generated cards under a project's `distilled/` directory go.\n`lane` (the default) keeps them out of the ranked results and lists the\nbest few separately, so a summary can never take a slot from the source it\nsummarizes; `off` leaves them out of the answer entirely.",
+            "type": "string",
+            "enum": [
+              "lane",
+              "off"
+            ]
           }
         },
         "type": "object",
@@ -102,6 +110,17 @@ expression: rendered
             ],
             "format": "uint32",
             "minimum": 0
+          },
+          "distilled": {
+            "description": "Where `distilled/` cards - agent-written summaries of an area, not canon - are reported: \"lane\" (default) lists them under the results instead of competing with them for a slot, \"off\" leaves them out.",
+            "anyOf": [
+              {
+                "$ref": "#/$defs/DistilledParam"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [

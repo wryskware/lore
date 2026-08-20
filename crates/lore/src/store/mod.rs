@@ -242,6 +242,26 @@ pub struct SearchFilter {
     /// can produce; `recall` at M3 is this filter set to `[Session]`, with no
     /// path convention leaking through the store API.
     pub source_kinds: Option<Vec<SourceKind>>,
+    /// Which side of the distilled partition this query may see.
+    pub distilled: DistilledScope,
+}
+
+/// Which side of the `distilled/` partition a query runs over.
+///
+/// The partition is a store-level predicate rather than a post-filter because
+/// ranking must never *see* the other side: the daemon's lane proves its main
+/// page final against a candidate population, and a population that still
+/// contains cards would prove the wrong thing (see `daemon::search`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DistilledScope {
+    /// Both populations. The store's own default, and what every caller that
+    /// is not the search lane wants.
+    #[default]
+    Any,
+    /// Only chunks outside `distilled/`.
+    Exclude,
+    /// Only chunks inside `distilled/`.
+    Only,
 }
 
 impl SearchFilter {

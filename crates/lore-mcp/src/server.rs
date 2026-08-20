@@ -38,7 +38,7 @@ use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::Deserialize;
 use tokio::sync::OnceCell;
 
-use lore_core::{ExpandRequest, ProjectInfo, SearchRequest};
+use lore_core::{Distilled, ExpandRequest, ProjectInfo, SearchRequest};
 
 use crate::daemon::{DaemonClient, DaemonError, Endpoint};
 use crate::render;
@@ -77,6 +77,28 @@ impl StatusFilter {
     }
 }
 
+// Same reasoning as `StatusFilter`: an enum puts the vocabulary in the tool
+// schema instead of leaving the agent to guess a string. NOTE: agent-facing.
+/// Where agent-generated cards under a project's `distilled/` directory go.
+/// `lane` (the default) keeps them out of the ranked results and lists the
+/// best few separately, so a summary can never take a slot from the source it
+/// summarizes; `off` leaves them out of the answer entirely.
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum DistilledParam {
+    Lane,
+    Off,
+}
+
+impl DistilledParam {
+    fn as_wire(self) -> Distilled {
+        match self {
+            DistilledParam::Lane => Distilled::Lane,
+            DistilledParam::Off => Distilled::Off,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SearchParams {
     #[schemars(
@@ -103,6 +125,12 @@ pub struct SearchParams {
                        breadth, not longer excerpts."
     )]
     pub limit: Option<u32>,
+    #[schemars(
+        description = "Where `distilled/` cards - agent-written summaries of an area, not \
+                       canon - are reported: \"lane\" (default) lists them under the results \
+                       instead of competing with them for a slot, \"off\" leaves them out."
+    )]
+    pub distilled: Option<DistilledParam>,
 }
 
 impl SearchParams {
@@ -136,6 +164,9 @@ impl From<SearchParams> for SearchRequest {
             // setting. It arrives with the session ledger at M3.
             sources: None,
             limit: params.limit,
+            distilled: params
+                .distilled
+                .map_or(Distilled::default(), DistilledParam::as_wire),
         }
     }
 }
@@ -387,6 +418,7 @@ mod tests {
             language: Some("markdown".into()),
             status: Some(vec![StatusFilter::Decided, StatusFilter::Leaning]),
             limit: Some(5),
+            distilled: Some(DistilledParam::Off),
         };
         let request = params.into_request("lore-9a1c");
 
@@ -399,6 +431,7 @@ mod tests {
         assert_eq!(request.language.as_deref(), Some("markdown"));
         assert_eq!(request.status, vec!["decided", "leaning"]);
         assert_eq!(request.limit, Some(5));
+        assert_eq!(request.distilled, Distilled::Off);
     }
 
     #[test]
@@ -411,11 +444,16 @@ mod tests {
             language: None,
             status: None,
             limit: None,
+            distilled: None,
         }
         .into();
         assert!(request.status.is_empty());
+        // An agent that never mentions the lane gets it: `lane` is the mode a
+        // caller who does not know the knob exists meant to ask for.
+        assert_eq!(request.distilled, Distilled::Lane);
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["status"], serde_json::json!([]));
+        assert_eq!(json["distilled"], "lane");
     }
 
     #[test]

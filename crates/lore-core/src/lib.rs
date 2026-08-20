@@ -428,14 +428,51 @@ pub struct SearchRequest {
     pub sources: Option<Vec<String>>,
     /// Max results; daemon clamps to a sane ceiling.
     pub limit: Option<u32>,
+    /// Where agent-generated `distilled/` cards go. Absent = [`Distilled::Lane`],
+    /// which is what a client that predates the lane meant by sending nothing.
+    #[serde(default)]
+    pub distilled: Distilled,
+}
+
+/// How a search treats the distilled layer: agent-written Markdown cards
+/// under a project's `distilled/` directory that summarize an area and point
+/// back at the sources they summarize.
+///
+/// There is no `interleave` setting. Cards outrank the source they describe
+/// on exactly the queries they were written for, so mixing them into one
+/// ranking spends page slots on the summary instead of on the thing being
+/// summarized — measured, not assumed
+/// (`design/6_Evaluation/2026-08-18_distilled-cards-v0.md`). The lane is the
+/// answer: the ranked page never sees them, and they are reported beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Distilled {
+    /// Cards are kept out of [`SearchResponse::results`] entirely and the
+    /// best of them are reported in [`SearchResponse::distilled`].
+    #[default]
+    Lane,
+    /// Cards do not participate at all; both fields are card-free.
+    Off,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResponse {
     pub results: Vec<SearchResult>,
     /// True when vectors did not participate (no/unhealthy endpoint or
-    /// unembedded corpus) — lexical-only degradation, D-0007.
+    /// unembedded corpus) — lexical-only degradation, D-0007. Reported for
+    /// [`Self::results`]; the lane is ranked by the same arms.
     pub lexical_only: bool,
+    /// The distilled lane: the best `distilled/` cards for this query, ranked
+    /// by the same fusion as [`Self::results`] and never competing with it for
+    /// a slot there. Empty under [`Distilled::Off`], and from any daemon that
+    /// predates the lane.
+    ///
+    /// The two rankings are computed over disjoint populations, so a card's
+    /// `score` orders it against the other cards and against nothing else —
+    /// comparing it to a result's is meaningless, the same way scores from two
+    /// separate responses are.
+    #[serde(default)]
+    pub distilled: Vec<SearchResult>,
 }
 
 /// One ranked chunk with provenance and authority at a glance (4.1).

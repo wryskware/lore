@@ -33,9 +33,9 @@ use lore::repo_config::{self, DeclaredName};
 use lore::setup;
 use lore_core::discovery;
 use lore_core::{
-    DaemonStatus, EmbeddingStatus, ExpandResponse, IndexRequest, IndexResponse, ProjectInfo,
-    ProjectStatus, RegisterProjectRequest, RemoveProjectResponse, SearchRequest, SearchResponse,
-    SearchResult, WatchState,
+    DaemonStatus, Distilled, EmbeddingStatus, ExpandResponse, IndexRequest, IndexResponse,
+    ProjectInfo, ProjectStatus, RegisterProjectRequest, RemoveProjectResponse, SearchRequest,
+    SearchResponse, SearchResult, WatchState,
 };
 use serde::Serialize;
 
@@ -79,9 +79,31 @@ pub struct SearchArgs {
     /// Maximum results. The daemon clamps this to a sane ceiling.
     #[arg(long)]
     pub limit: Option<u32>,
+    /// Where `distilled/` cards go: `lane` lists them under the results,
+    /// `off` drops them. They never compete for a result slot either way.
+    #[arg(long, value_enum, default_value_t = DistilledArg::Lane)]
+    pub distilled: DistilledArg,
     /// Print the daemon's raw JSON response instead of the reading view.
     #[arg(long)]
     pub json: bool,
+}
+
+/// The wire's [`Distilled`] as a flag value, so an unknown spelling is
+/// refused by clap with the vocabulary listed rather than by the daemon with
+/// a parse error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum DistilledArg {
+    Lane,
+    Off,
+}
+
+impl From<DistilledArg> for Distilled {
+    fn from(arg: DistilledArg) -> Self {
+        match arg {
+            DistilledArg::Lane => Distilled::Lane,
+            DistilledArg::Off => Distilled::Off,
+        }
+    }
 }
 
 impl From<&SearchArgs> for SearchRequest {
@@ -97,6 +119,7 @@ impl From<&SearchArgs> for SearchRequest {
             status: args.status.clone(),
             sources: (!args.source.is_empty()).then(|| args.source.clone()),
             limit: args.limit,
+            distilled: args.distilled.into(),
         }
     }
 }
@@ -1103,6 +1126,12 @@ impl Client {
 const LEXICAL_ONLY_NOTE: &str = "note: embeddings are unavailable, so these are lexical matches only; \
      semantically related chunks may be missing (run `lore status`)\n";
 
+/// Heads the distilled lane. Says derived-not-canon on the one line a reader
+/// sees before deciding whether to trust a card, and points at the anchors
+/// rather than at the card, because the sources are the part that is canon.
+const DISTILLED_HEADER: &str = "distilled cards (agent-generated summaries of this area - derived, not canon; \
+     expand one and follow its source anchors):";
+
 /// Displayed chunk-id length, git-style, and the same twelve `lore-mcp` uses.
 ///
 /// A full blake3 id is 64 hex characters whose only job is to be handed back
@@ -1181,6 +1210,9 @@ fn render_search(query: &str, response: &SearchResponse) -> String {
         if response.lexical_only {
             out.push_str(LEXICAL_ONLY_NOTE);
         }
+        // A card-only answer is still an answer, and it is exactly what
+        // `--path-prefix distilled/` asks for.
+        push_distilled(&mut out, &response.distilled);
         return out;
     }
 
@@ -1196,10 +1228,30 @@ fn render_search(query: &str, response: &SearchResponse) -> String {
         out.push('\n');
         push_result(&mut out, index + 1, result);
     }
+    push_distilled(&mut out, &response.distilled);
     out
 }
 
-fn push_result(out: &mut String, rank: usize, result: &SearchResult) {
+/// The distilled lane, printed under the results and never mixed into them.
+///
+/// The header states what the block is *for* in one line: a card reads like an
+/// authored document, and nothing else in the output says it was written by a
+/// model summarizing something else. Ranks are `d1..dn` so "the third hit"
+/// cannot name two different things - the same scheme `lore-mcp`'s renderer
+/// uses.
+fn push_distilled(out: &mut String, lane: &[SearchResult]) {
+    if lane.is_empty() {
+        return;
+    }
+    out.push('\n');
+    let _ = writeln!(out, "{DISTILLED_HEADER}");
+    for (index, card) in lane.iter().enumerate() {
+        out.push('\n');
+        push_result(out, format_args!("d{}", index + 1), card);
+    }
+}
+
+fn push_result(out: &mut String, rank: impl std::fmt::Display, result: &SearchResult) {
     let language = match &result.language {
         Some(language) => format!("  [{language}]"),
         None => String::new(),
@@ -2418,6 +2470,7 @@ mod tests {
             &SearchResponse {
                 results: vec![vault_hit()],
                 lexical_only: false,
+                distilled: Vec::new(),
             },
         );
         assert!(rendered.starts_with("1 result(s) for \"authority\" (hybrid)\n"));
@@ -2427,6 +2480,115 @@ mod tests {
         assert!(rendered.contains("    heading: MCP Tool Surface > v0.1 tools\n"));
         assert!(rendered.contains("    status: decided  refs: D-0007\n"));
         assert!(rendered.contains("    chunk_id: 9f3a1c2b7e4d\n"));
+    }
+
+    fn card_hit() -> SearchResult {
+        SearchResult {
+            chunk_id: full_id("c0ffee042abc"),
+            project: "lore".into(),
+            project_key: "lore".into(),
+            path: "distilled/daemon-search.md".into(),
+            line_start: 1,
+            line_end: 24,
+            language: Some("markdown".into()),
+            symbol_path: None,
+            heading_path: Some(vec!["Daemon search".into()]),
+            design_status: None,
+            effective_authority: None,
+            authority_note: None,
+            decision_refs: vec![],
+            score: 0.410,
+            excerpt: "Fusion happens in `crates/lore/src/daemon/search.rs`.".into(),
+            excerpt_truncated: false,
+        }
+    }
+
+    /// The lane follows the page, says what it is, and numbers itself apart
+    /// so `[2]` and `[d2]` can never be confused. The same shape `lore-mcp`
+    /// renders; the two are asserted separately because they are separate
+    /// code (see the rendering header).
+    #[test]
+    fn distilled_cards_render_in_a_labelled_lane_after_the_results() {
+        let rendered = render_search(
+            "ranking",
+            &SearchResponse {
+                results: vec![vault_hit(), code_hit()],
+                lexical_only: false,
+                distilled: vec![card_hit()],
+            },
+        );
+        let (page, lane) = rendered
+            .split_once(DISTILLED_HEADER)
+            .expect("the lane is headed");
+        assert!(
+            !page.contains("distilled/daemon-search.md"),
+            "a card must never appear above the header: {rendered}"
+        );
+        assert!(
+            lane.contains("[d1] lore  distilled/daemon-search.md:1-24  score 0.410  [markdown]"),
+            "{rendered}"
+        );
+        // The headline counts results, not cards.
+        assert!(rendered.starts_with("2 result(s) for"), "{rendered}");
+        assert!(!rendered.contains("\n\n\n"), "{rendered}");
+    }
+
+    #[test]
+    fn an_empty_lane_costs_no_output_and_a_card_only_answer_still_shows_one() {
+        let quiet = render_search(
+            "ranking",
+            &SearchResponse {
+                results: vec![vault_hit()],
+                lexical_only: false,
+                distilled: Vec::new(),
+            },
+        );
+        assert!(!quiet.contains("distilled"), "{quiet}");
+
+        // Empty page, full lane: what a `--path-prefix distilled/` search
+        // asks for, and answering "no results" alone would be a lie.
+        let cards_only = render_search(
+            "ranking",
+            &SearchResponse {
+                results: Vec::new(),
+                lexical_only: false,
+                distilled: vec![card_hit()],
+            },
+        );
+        assert!(
+            cards_only.starts_with("no results for \"ranking\" (hybrid)\n"),
+            "{cards_only}"
+        );
+        assert!(cards_only.contains(DISTILLED_HEADER), "{cards_only}");
+        assert!(
+            cards_only.contains("[d1] lore  distilled/daemon-search.md"),
+            "{cards_only}"
+        );
+    }
+
+    /// `--distilled` is a closed vocabulary, and `lane` is what a caller who
+    /// does not pass it meant.
+    #[test]
+    fn the_distilled_flag_defaults_to_lane_and_refuses_anything_else() {
+        use clap::Parser as _;
+
+        #[derive(clap::Parser)]
+        struct Cmd {
+            #[command(flatten)]
+            args: SearchArgs,
+        }
+
+        let default = Cmd::parse_from(["lore", "ranking"]).args;
+        assert_eq!(default.distilled, DistilledArg::Lane);
+        assert_eq!(SearchRequest::from(&default).distilled, Distilled::Lane);
+
+        let off = Cmd::parse_from(["lore", "ranking", "--distilled", "off"]).args;
+        assert_eq!(SearchRequest::from(&off).distilled, Distilled::Off);
+
+        assert!(
+            Cmd::try_parse_from(["lore", "ranking", "--distilled", "interleave"]).is_err(),
+            "an unknown mode must be refused, not silently defaulted"
+        );
     }
 
     /// The CLI half of issue #9's `symbol: #s0`. Kept in step with
@@ -2450,6 +2612,7 @@ mod tests {
             &SearchResponse {
                 results: vec![filler],
                 lexical_only: false,
+                distilled: Vec::new(),
             },
         );
         assert!(
@@ -2469,6 +2632,7 @@ mod tests {
             &SearchResponse {
                 results: vec![hit.clone()],
                 lexical_only: false,
+                distilled: Vec::new(),
             },
         );
         assert!(!rendered.contains(&hit.chunk_id), "{rendered}");
@@ -2484,6 +2648,7 @@ mod tests {
             &SearchResponse {
                 results: vec![code_hit()],
                 lexical_only: false,
+                distilled: Vec::new(),
             },
         );
         assert!(rendered.contains("    symbol: Board.Update\n"));
@@ -2501,6 +2666,7 @@ mod tests {
             &SearchResponse {
                 results: vec![],
                 lexical_only: true,
+                distilled: Vec::new(),
             },
         );
         assert_eq!(

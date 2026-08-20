@@ -22,7 +22,8 @@
 //! branch base), field for field.
 
 use lore_core::{
-    ExpandRequest, ProjectInfo, ProjectStatus, SearchRequest, SearchResult, SourceInfo, WatchState,
+    Distilled, ExpandRequest, ProjectInfo, ProjectStatus, SearchRequest, SearchResponse,
+    SearchResult, SourceInfo, WatchState,
     snapshot::{
         Manifest, MassDeleteTrip, PushCommitResponse, PushFileResponse, PushLeaseResponse,
         PushManifestRequest, PushManifestResponse,
@@ -241,6 +242,7 @@ fn every_pre_existing_wire_field_survives_and_the_additions_are_the_specified_on
                 status: vec!["decided".into()],
                 sources: Some(vec!["repo".into()]),
                 limit: Some(20),
+                distilled: Distilled::Lane,
             }),
             before: &[
                 "language",
@@ -255,7 +257,7 @@ fn every_pre_existing_wire_field_survives_and_the_additions_are_the_specified_on
             // (a request naming neither is now refused). That tightening is
             // not expressible as a field, which is why it is a self-describing
             // 400 rather than an API_VERSION bump.
-            added: &["project_key", "sources"],
+            added: &["distilled", "project_key", "sources"],
         },
     ];
 
@@ -353,6 +355,58 @@ fn a_response_from_a_daemon_that_predates_this_change_still_deserializes() {
             .expect("old expand parses");
     assert_eq!(old_expand.project_key, None);
     assert_eq!(old_expand.context_lines, None);
+}
+
+/// The distilled lane, in both directions.
+///
+/// The default is the load-bearing part: a client that never heard of the
+/// lane sends no field, and what it meant by that is `lane` - cards kept out
+/// of the ranked page - not "interleave them", which is the behavior the v0
+/// experiment measured and rejected.
+#[test]
+fn a_client_that_predates_the_distilled_lane_still_talks_to_a_daemon_with_one() {
+    let old_request: SearchRequest =
+        serde_json::from_value(json!({ "query": "ranking" })).expect("old request parses");
+    assert_eq!(old_request.distilled, Distilled::Lane);
+
+    let old_response: SearchResponse =
+        serde_json::from_value(json!({ "results": [], "lexical_only": false }))
+            .expect("old response parses");
+    assert!(
+        old_response.distilled.is_empty(),
+        "a daemon without a lane reports no cards, which is not an error"
+    );
+
+    // Both spellings round-trip, and an unknown one is refused rather than
+    // quietly defaulted: a client asking for a mode this daemon does not have
+    // must hear about it, exactly as a bad `status` value does.
+    for (mode, wire) in [(Distilled::Lane, "lane"), (Distilled::Off, "off")] {
+        let request = SearchRequest {
+            distilled: mode,
+            ..SearchRequest::default()
+        };
+        let json = serde_json::to_value(&request).expect("serializes");
+        assert_eq!(json["distilled"], wire);
+        let back: SearchRequest = serde_json::from_value(json).expect("round-trips");
+        assert_eq!(back.distilled, mode);
+    }
+    assert!(
+        serde_json::from_value::<SearchRequest>(json!({ "query": "q", "distilled": "interleave" }))
+            .is_err()
+    );
+
+    // And the response's new field carries results of the *same* shape, so a
+    // renderer needs no second vocabulary to display it.
+    let response = SearchResponse {
+        results: vec![populated_search_result()],
+        lexical_only: false,
+        distilled: vec![populated_search_result()],
+    };
+    let json = serde_json::to_value(&response).expect("serializes");
+    assert_eq!(json["distilled"][0]["path"], json["results"][0]["path"]);
+    let back: SearchResponse = serde_json::from_value(json).expect("round-trips");
+    assert_eq!(back.distilled.len(), 1);
+    assert_eq!(back.results.len(), 1);
 }
 
 /// The push protocol's own additive fields (D-0015).
