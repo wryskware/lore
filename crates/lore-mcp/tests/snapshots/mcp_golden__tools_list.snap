@@ -1,25 +1,25 @@
 ---
 source: crates/lore-mcp/tests/mcp_golden.rs
+assertion_line: 326
 expression: rendered
 ---
 {
   "instructions": "Lore indexes this project's code and design vault locally. Search it before answering questions about this codebase or about past design decisions, and prefer sources whose effective authority is `decided` over prose that merely sounds confident - a document declaring itself decided has not earned that unless Lore validated it against the project's decision ledger, and it will say so when it did not. Every tool here is scoped to the one project this session is in; other projects on this machine are not reachable and asking for them is not an option. Registering projects and forcing a reindex are deliberately not available either: ask the user to run `lore add <path>` or `lore index`.",
   "tools": [
     {
+      "name": "expand",
       "description": "Read a search hit in full, plus surrounding context lines. This is the 'now actually read it' step: search returns truncated excerpts, so do not quote or edit code from a search result without expanding it first.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "required": [
+          "chunk_id"
+        ],
+        "type": "object",
         "properties": {
-          "chunk_id": {
-            "description": "chunk_id from the search result you want to read. Search prints a shortened id; pass it exactly as shown - any prefix of at least 8 hexadecimal characters resolves, and an ambiguous one is answered with the candidates.",
-            "type": "string"
-          },
-          "context_lines": {
-            "description": "Extra lines of context on each side of the chunk. The daemon applies a default and a ceiling.",
-            "format": "uint32",
-            "minimum": 0,
+          "project_key": {
+            "description": "project_key exactly as it appeared in the search result. Prefer this over `project`: it identifies the source unambiguously.",
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -30,54 +30,45 @@ expression: rendered
               "null"
             ]
           },
-          "project_key": {
-            "description": "project_key exactly as it appeared in the search result. Prefer this over `project`: it identifies the source unambiguously.",
+          "chunk_id": {
+            "description": "chunk_id from the search result you want to read. Search prints a shortened id; pass it exactly as shown - any prefix of at least 8 hexadecimal characters resolves, and an ambiguous one is answered with the candidates.",
+            "type": "string"
+          },
+          "context_lines": {
+            "description": "Extra lines of context on each side of the chunk. The daemon applies a default and a ceiling.",
             "type": [
-              "string",
+              "integer",
               "null"
-            ]
+            ],
+            "format": "uint32",
+            "minimum": 0
           }
-        },
-        "required": [
-          "chunk_id"
-        ],
-        "type": "object"
-      },
-      "name": "expand"
+        }
+      }
     },
     {
+      "name": "search",
       "description": "Your first tool for any \"where is X / how does Y work / what was decided about Z\" question in an indexed project: one query replaces a chain of exploratory greps and directory reads, and also surfaces design-doc and decision context that grep cannot see. Prefer it whenever you do not already know the exact file; fall back to grep only for exhaustive literal sweeps (every occurrence of an exact string) - and note that inconsistently-named concepts defeat literal grep but not this search. Hybrid lexical+semantic search over this session's project - the code and design vault of the repository you are working in, scoped automatically, with no way to reach another project. Each hit carries provenance (file, line span, symbol path for code, heading path for Markdown), the status the document declares, and the authority Lore actually assigns it. Those differ on purpose: `decided` is honored only when the document cites a decision still active in the project's ledger, and scratch/research paths are capped whatever they declare - a demoted hit says why in its authority note. Prefer sources whose *effective* authority is `decided` when documents disagree; cited decision IDs are provenance, not authority. Excerpts are inline for the top few hits only and truncated even there; every later hit is a pointer (header lines, no excerpt). Call `expand` with a hit's project_key and chunk_id to read any of them - do not re-search hoping for longer excerpts.",
       "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$defs": {
           "StatusFilter": {
             "description": "How settled a design document *declares* itself to be. `decided` means\nvalidated canon: Lore honors it only when the document cites a decision\nthat is still active in the project's ledger, and demotes it otherwise\n(the result then carries an `authority note` saying so). `leaning` and\n`exploration` record thinking that is not binding; `deprecated` has been\nsuperseded; `unclassified` means the document declares no status at all.\nNote that this filters on the declaration, not on the authority Lore\nactually assigns — scratch and research material is demoted by path\nwhatever it declares.",
+            "type": "string",
             "enum": [
               "exploration",
               "leaning",
               "decided",
               "deprecated",
               "unclassified"
-            ],
-            "type": "string"
+            ]
           }
         },
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
         "properties": {
-          "language": {
-            "description": "Lowercase language tag filter (\"csharp\", \"rust\", \"markdown\").",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "limit": {
-            "description": "Maximum results; default 10, clamped to a sane ceiling. Results past the top few are pointer headers either way, so raising this buys breadth, not longer excerpts.",
-            "format": "uint32",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
+          "query": {
+            "description": "What to look for. Natural language or literal identifiers both work; the query is matched lexically and semantically.",
+            "type": "string"
           },
           "path_prefix": {
             "description": "Project-relative path prefix filter, forward slashes (e.g. \"design/\").",
@@ -86,35 +77,45 @@ expression: rendered
               "null"
             ]
           },
-          "query": {
-            "description": "What to look for. Natural language or literal identifiers both work; the query is matched lexically and semantically.",
-            "type": "string"
+          "language": {
+            "description": "Lowercase language tag filter (\"csharp\", \"rust\", \"markdown\").",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "status": {
             "description": "Keep only chunks carrying one of these vault authority levels. Omit for no filter.",
-            "items": {
-              "$ref": "#/$defs/StatusFilter"
-            },
             "type": [
               "array",
               "null"
-            ]
+            ],
+            "items": {
+              "$ref": "#/$defs/StatusFilter"
+            }
+          },
+          "limit": {
+            "description": "Maximum results; default 10, clamped to a sane ceiling. Results past the top few are pointer headers either way, so raising this buys breadth, not longer excerpts.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint32",
+            "minimum": 0
           }
         },
         "required": [
           "query"
-        ],
-        "type": "object"
-      },
-      "name": "search"
+        ]
+      }
     },
     {
+      "name": "status",
       "description": "Index health for this session's project: daemon version, index generation, the project's file/chunk/embedding coverage, and the embedding endpoint's state. Check this when search comes back empty, stale, or lexical-only - an unconfigured or unreachable embedding endpoint silently costs you every semantic match.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object"
-      },
-      "name": "status"
+      }
     }
   ]
 }
