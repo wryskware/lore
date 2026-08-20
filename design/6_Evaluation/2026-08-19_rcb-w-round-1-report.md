@@ -331,6 +331,21 @@ Corrected headline deltas: Sonnet **+41%** raw / **+57%** cost-weighted (was
 survives; the per-cell magnitudes in the ledger tables above are inflated
 ~1.4–1.6× and the round JSONLs carry the old values.
 
+Claude Code's own nominal `cost_usd` (captured per cell in `metrics.json`
+and the round JSONLs from day one, computed internally from true per-call
+usage — unaffected by the recount bug) cross-checks the proxy:
+
+| round | off | on | delta |
+| --- | ---: | ---: | ---: |
+| Sonnet 5 @ high | $2.42 | $3.57 | +48% |
+| Opus 5 @ medium | $1.65 | $2.95 | +79% |
+
+The whole 20-cell, two-answerer round cost $10.59 nominal; the Opus round
+was cheaper in dollars than the Sonnet round ($4.60 vs $5.99) while fixing
+3/5 per arm vs 1/5, so capability-dominates-retrieval holds in dollars too.
+Most expensive cell: Sonnet on-W4, $1.64 (four 20-result searches resident
+in cache plus the longest trajectory).
+
 **2. It is not MCP context overhead — it is search-payload residency and
 trajectory length.** First-turn context is ~2.9k tokens off vs ~3.3k on: the
 three lore tool schemas cost ~400 tokens, negligible. Output tokens are
