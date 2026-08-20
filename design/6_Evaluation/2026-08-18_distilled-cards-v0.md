@@ -174,6 +174,36 @@ a stronger distiller model for coverage (LB-03), and a judged-pool pass to
 price the noise cards add below rank-10. None of that is worth doing before
 deciding whether the lane surface is wanted at all.
 
+## v1 direction — judgment-carved areas (Wrysk, 2026-08-20)
+
+Wrysk's leaning after v0: directory grouping is not durable across
+repositories. The perfect-world shape is a strong agent scanning the repo and
+highlighting the lanes worth distilling, then fanning out to compile each
+card — some strategy where *judgment*, not folder structure, decides what a
+card is about.
+
+v1 implements the minimal honest version of that as a two-phase pipeline
+(`bench/distill/distill2.py`):
+
+- **Map pass** — one call to the strongest available model over a repo
+  digest (file tree + the head of every indexable file). It returns a JSON
+  plan: areas with a slug, a title, an *intent* line ("the questions this
+  area answers"), and an explicit file list. Areas may cross directories,
+  skip boilerplate, and overlap where a file genuinely serves two stories.
+  The plan is validated mechanically (paths must exist; hallucinated ones
+  are dropped loudly) and cached beside the bench, so it is reviewable and
+  the compile pass is resumable against it.
+- **Compile pass** — per area, **whole files** (large caps, truncation
+  marked) plus the plan's intent line, so the compiler writes toward the
+  questions the planner said the area answers rather than guessing from
+  content alone. Card format unchanged except frontmatter records the
+  strategy and both models.
+
+Growth path, deliberately not v1: compile agents with tools (request more
+files, search the index), planner critique/iteration, cross-card links. The
+laundering exclusions (tests, fixtures, scratch, research raw) are strategy-
+independent and stay.
+
 ## Generator
 
 `bench/distill/distill.py` — standalone, no daemon involvement. Walks the
