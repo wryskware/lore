@@ -43,6 +43,10 @@ foreach ($c in $allCorpora) {
             latency_ms = [math]::Round($qsw.Elapsed.TotalMilliseconds, 1)
             results = @($resp.results | ForEach-Object { [ordered]@{
                 path = $_.path; line_start = $_.line_start; line_end = $_.line_end; score = $_.score } })
+            # Lane-aware daemons report distilled cards beside the page;
+            # pre-lane daemons have no field and this records @().
+            distilled = @($resp.distilled | ForEach-Object { [ordered]@{
+                path = $_.path; score = $_.score } })
         }
     }
     $out | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $OutDir "searches\$($c.name).json")

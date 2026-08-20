@@ -1,0 +1,216 @@
+{
+  "strategy": "v1-planned",
+  "plan_model": "qwen3.8:latest",
+  "generated": "2026-08-20",
+  "areas": [
+    {
+      "slug": "project-governance",
+      "title": "Canon, Authority Model, and Decision Ledger",
+      "intent": "What is binding in this vault, how authority is established, and what the working rules are for agents editing design material",
+      "files": [
+        "AGENTS.md",
+        "CLAUDE.md",
+        "design/0_Canon/README.md",
+        "design/0_Canon/DECISIONS.md",
+        "design/00_MASTER_INDEX.md"
+      ]
+    },
+    {
+      "slug": "architecture-and-design-specs",
+      "title": "Architecture, Memory, Retrieval, Interface, and Milestone Design",
+      "intent": "The intended system topology, two-tier memory model, chunking/ranking strategy, MCP tool surface, and implementation milestones",
+      "files": [
+        "design/1_Architecture/1.1_Overview.md",
+        "design/2_Memory/2.1_Memory_Model.md",
+        "design/3_Retrieval/3.1_Chunking_and_Ranking.md",
+        "design/4_Interfaces/4.1_MCP_Surface.md",
+        "design/5_Implementation/5.1_Milestones.md"
+      ]
+    },
+    {
+      "slug": "research-phase",
+      "title": "Landscape Survey and Adopt-vs-Build Analysis",
+      "intent": "What existing local code-context engines exist, how they compare on the critical axes, and why a new integrated daemon was chosen",
+      "files": [
+        "context-engine-research-handoff.md",
+        "design/7_Research/00_summary.md",
+        "design/7_Research/01_landscape.md",
+        "design/7_Research/02_feature-matrix.md"
+      ]
+    },
+    {
+      "slug": "workspace-and-dependencies",
+      "title": "Cargo Workspace and Dependency Pins",
+      "intent": "What crates compose the project, what versions are pinned, and why specific features are enabled or excluded",
+      "files": [
+        "Cargo.toml",
+        "crates/lore-core/Cargo.toml",
+        "crates/lore/Cargo.toml",
+        "crates/lore-mcp/Cargo.toml"
+      ]
+    },
+    {
+      "slug": "wire-contract",
+      "title": "Shared API Types and Daemon Discovery",
+      "intent": "What the HTTP wire contract looks like (request/response shapes, error format, versioning) and how clients locate the running daemon",
+      "files": [
+        "crates/lore-core/src/lib.rs",
+        "crates/lore-core/src/discovery.rs"
+      ]
+    },
+    {
+      "slug": "shared-types",
+      "title": "Core Data Model and Module Ownership",
+      "intent": "What a Chunk, ChunkId, DesignStatus, and VaultMeta are, how chunk identity is derived, and how the library's modules are organized",
+      "files": [
+        "crates/lore/src/types.rs",
+        "crates/lore/src/lib.rs"
+      ]
+    },
+    {
+      "slug": "chunking-pipeline",
+      "title": "File-to-Chunk Conversion (Code, Markdown, Text)",
+      "intent": "How source files are parsed into stable, content-addressed chunks using tree-sitter grammars, heading trees, and line windows",
+      "files": [
+        "crates/lore/src/chunk/mod.rs",
+        "crates/lore/src/chunk/common.rs",
+        "crates/lore/src/chunk/code/mod.rs",
+        "crates/lore/src/chunk/code/csharp.rs",
+        "crates/lore/src/chunk/code/python.rs",
+        "crates/lore/src/chunk/code/rust.rs",
+        "crates/lore/src/chunk/code/webish.rs",
+        "crates/lore/src/chunk/markdown.rs",
+        "crates/lore/src/chunk/text.rs"
+      ]
+    },
+    {
+      "slug": "authority-ranking",
+      "title": "Declared vs Effective Authority Tier",
+      "intent": "How a document's effective authority is computed from its declared status, path, decision references, and the project's active ledger",
+      "files": [
+        "crates/lore/src/authority.rs"
+      ]
+    },
+    {
+      "slug": "search-execution",
+      "title": "Hybrid Search and Expand Endpoints",
+      "intent": "How a query is executed (BM25 + cosine fused via RRF, authority-multiplied) and how a hit is expanded into surrounding file context",
+      "files": [
+        "crates/lore/src/daemon/search.rs",
+        "crates/lore/src/daemon/expand.rs"
+      ]
+    },
+    {
+      "slug": "store",
+      "title": "SQLite SearchStore: Schema, FTS5, Vectors, Query",
+      "intent": "How chunks, FTS5 index, and embedding vectors are stored in one transaction domain, how the schema migrates, and how FTS queries are sanitized",
+      "files": [
+        "crates/lore/src/store/mod.rs",
+        "crates/lore/src/store/schema.rs",
+        "crates/lore/src/store/query.rs",
+        "crates/lore/src/store/vector.rs"
+      ]
+    },
+    {
+      "slug": "embedding-subsystem",
+      "title": "Local Embedding Client, Health, Worker, and Text Construction",
+      "intent": "How chunks are embedded via a local OpenAI-compatible endpoint, how health is tracked, how the background worker keeps vectors current, and how embedding text is prefixed",
+      "files": [
+        "crates/lore/src/embed/mod.rs",
+        "crates/lore/src/embed/client.rs",
+        "crates/lore/src/embed/health.rs",
+        "crates/lore/src/embed/worker.rs",
+        "crates/lore/src/embed/text.rs"
+      ]
+    },
+    {
+      "slug": "daemon-lifecycle",
+      "title": "Daemon Startup, Ownership, Watcher, and Work Queue",
+      "intent": "How the daemon acquires single-instance ownership, starts its subsystems, watches the filesystem, coalesces events, and decides what is indexable",
+      "files": [
+        "crates/lore/src/daemon/mod.rs",
+        "crates/lore/src/daemon/ownership.rs",
+        "crates/lore/src/daemon/handshake.rs",
+        "crates/lore/src/daemon/paths.rs",
+        "crates/lore/src/daemon/queue.rs",
+        "crates/lore/src/daemon/walk.rs",
+        "crates/lore/src/daemon/watch.rs"
+      ]
+    },
+    {
+      "slug": "indexing-pipeline",
+      "title": "Full Scan and Incremental Indexing",
+      "intent": "How disk state is reconciled into the store via content hashing, and how incremental (watcher-driven) indexing works",
+      "files": [
+        "crates/lore/src/daemon/index.rs"
+      ]
+    },
+    {
+      "slug": "http-api",
+      "title": "Loopback HTTP Server and Route Handlers",
+      "intent": "How the axum server is structured, how routes are versioned, how errors are serialized, and how handlers delegate to the store",
+      "files": [
+        "crates/lore/src/daemon/http.rs"
+      ]
+    },
+    {
+      "slug": "store-handle",
+      "title": "Store Concurrency and Blocking-Pool Dispatch",
+      "intent": "How the synchronous Store is safely shared across async tasks via a Mutex on the blocking pool without starving search",
+      "files": [
+        "crates/lore/src/daemon/store_handle.rs"
+      ]
+    },
+    {
+      "slug": "cli-and-binary",
+      "title": "Lore Binary: Daemon Runner and CLI Subcommands",
+      "intent": "How the single `lore` binary dispatches between daemon mode and client subcommands (add, index, status, search)",
+      "files": [
+        "crates/lore/src/main.rs",
+        "crates/lore/src/cli.rs"
+      ]
+    },
+    {
+      "slug": "mcp-proxy",
+      "title": "Thin MCP Stdio Server for AI Agents",
+      "intent": "How the MCP server exposes search/expand/status as tools, discovers the daemon per-call, and renders responses for agent consumption",
+      "files": [
+        "crates/lore-mcp/src/lib.rs",
+        "crates/lore-mcp/src/main.rs",
+        "crates/lore-mcp/src/daemon.rs",
+        "crates/lore-mcp/src/render.rs",
+        "crates/lore-mcp/src/server.rs"
+      ]
+    },
+    {
+      "slug": "registry",
+      "title": "Project Registry and Stable Keys",
+      "intent": "How registered project roots are persisted in projects.toml, reconciled against the database, and assigned stable keys",
+      "files": [
+        "crates/lore/src/registry.rs"
+      ]
+    },
+    {
+      "slug": "configuration",
+      "title": "Daemon Configuration (config.toml)",
+      "intent": "What optional settings the daemon accepts (embedding endpoint, batch size, model) and how unknown keys are rejected",
+      "files": [
+        "crates/lore/src/config.rs"
+      ]
+    },
+    {
+      "slug": "bench-config",
+      "title": "Bench Slot Configuration",
+      "intent": "Which bench slot this repository instance occupies and its authority profile",
+      "files": [
+        ".lore.toml"
+      ]
+    }
+  ],
+  "uncovered": [],
+  "usage": {
+    "prompt_tokens": 19703,
+    "completion_tokens": 5142,
+    "total_tokens": 24845
+  }
+}
