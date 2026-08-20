@@ -67,7 +67,7 @@ cannot be filled honestly say so.
 | containment | unchanged from RCB round 1 (netns + broker allowlist, web tools removed twice) |
 | diff capture | `git add -A && git diff --cached --binary <root>` per cell; `.lore.toml`/`.loreignore` masked via template `info/exclude` |
 | artifacts | `~/bench/rcbw/out/rcbw1-0819-claude/<arm>/<task>/` — per-cell dirs from day one (RCB defect 1 not inherited) |
-| token basis | recounted per assistant message from `agent.ndjson`, subagents included (RCB's reporting error not reproduced); basis = input+output+cache_read+cache_write |
+| token basis | recounted per assistant message from `agent.ndjson`, subagents included; basis = input+output+cache_read+cache_write. **Corrected 2026-08-20**: per-event summing double-counts multi-block turns; the ledger tables below carry the original inflated values, the post-round debug section carries the deduped ones. Per-arm ratios survive the correction |
 
 ## Cell ledger
 
@@ -250,7 +250,10 @@ the locating phase.
 context and search results in every turn's cache reads without the offsetting
 fan-out collapse that made lore cheap in the QA round. On this task shape,
 lore is currently a cost, not a saving — in both answerers (+54% Sonnet,
-+107% Opus), with n=5 per answerer and no repeats.
++107% Opus), with n=5 per answerer and no repeats. *(Corrected and decomposed
+2026-08-20 — see the post-round debug section: the MCP context itself is ~400
+tokens; the real drivers are 20-result search payloads riding in cache and
+trajectory-length variance, and the recount had a double-counting bug.)*
 
 **The cross-model result reframes the program's question.** Opus @ medium
 beat Sonnet @ high 3/5-vs-1/5 on both arms at roughly a third of the tokens,
@@ -291,15 +294,96 @@ change contract/completeness failures (W1, W2, W5-Sonnet) into fixes. Round
 - `judge_batch.py` content parsing hardened (thinking blocks can precede the
   structured output block); the two affected W4 verdicts re-ran cleanly.
 
+## Post-round debug: where the on-arm tokens actually went (2026-08-20)
+
+Wrysk asked why the on arm inflated so consistently — the expectation was
+"minimal effect on a write task", and consistent degradation smelled like a
+miscalibration. Transcript decomposition (per-turn usage from every
+`agent.ndjson`, both rounds) answers it. Three findings, one of them a bug in
+this report's own numbers.
+
+**1. The recount double-counted.** claude-code stream-json emits one
+`assistant` event per content block, and every event of one API call repeats
+that call's cumulative usage snapshot. `recount_claude()` summed per event, so
+every text+tool_use turn was counted twice (the deduped unique-call counts
+match the runner's `num_turns` exactly, which the per-event counts never did).
+Fixed in `run_writer.py` (dedupe on message id). Corrected per-cell numbers,
+with a cost-weighted basis (input + 1.25×cache_write + 0.1×cache_read +
+5×output, the API's actual price ratios):
+
+| task | arm | Sonnet calls | Sonnet tok | Sonnet cost-wt | Opus calls | Opus tok | Opus cost-wt |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| W1 | off | 7 | 243,784 | 35,555 | 11 | 262,299 | 40,583 |
+| W1 | on | 11 | 474,130 | 71,553 | 12 | 289,563 | 44,223 |
+| W2 | off | 11 | 442,865 | 66,621 | 10 | 272,016 | 48,337 |
+| W2 | on | 13 | 834,344 | 143,482 | 11 | 339,128 | 56,129 |
+| W3 | off | 13 | 466,276 | 56,883 | 11 | 257,660 | 36,724 |
+| W3 | on | 15 | 1,043,352 | 163,675 | 12 | 368,201 | 57,753 |
+| W4 | off | 25 | 1,184,870 | 160,566 | 10 | 265,152 | 43,285 |
+| W4 | on | 27 | 2,501,341 | 356,303 | 22 | 705,138 | 94,654 |
+| W5 | off | 28 | 1,430,275 | 189,132 | 11 | 279,610 | 43,743 |
+| W5 | on | 12 | 460,355 | 63,864 | 29 | 1,080,849 | 144,736 |
+| **sum** | off | 84 | 3,768,070 | 508,757 | 53 | 1,336,737 | 212,672 |
+| **sum** | on | 78 | 5,313,522 | 798,877 | 86 | 2,782,879 | 397,495 |
+
+Corrected headline deltas: Sonnet **+41%** raw / **+57%** cost-weighted (was
++54%); Opus **+108%** raw / **+87%** cost-weighted (was +107%). The story
+survives; the per-cell magnitudes in the ledger tables above are inflated
+~1.4–1.6× and the round JSONLs carry the old values.
+
+**2. It is not MCP context overhead — it is search-payload residency and
+trajectory length.** First-turn context is ~2.9k tokens off vs ~3.3k on: the
+three lore tool schemas cost ~400 tokens, negligible. Output tokens are
+30–350 per cell. Totals are almost entirely `cache_read` — i.e. **total ≈
+average context × number of API calls**, so anything that fattens the context
+early or lengthens the trajectory multiplies. The two drivers:
+
+- *Payload residency.* Every `lore search` returned the daemon default of
+  **20 results with full chunk text — 29–36KB, roughly 8–9k tokens per
+  call** — and each payload then rides in the context for every remaining
+  turn. One 9k-token result at turn 2 of a 25-call run costs ~200k cache-read
+  tokens by itself. Sonnet made 11 searches (272KB of payloads) and its
+  ex-variance inflation is mostly this; not one of the 20 cells ever passed
+  the tool's existing `limit` parameter, so the default *is* the interface.
+  The usage that worked (Sonnet W3: rank-3 result → `chunk_id` → `expand` →
+  golden file) would have been identical with 5 results.
+- *Trajectory variance at n=1, same outcome.* Opus on-W4 took 22 calls vs
+  off's 10 and on-W5 took 29 vs 11 **with zero lore calls in W5** — and both
+  arms produced the same grade touching the same file, so the extra turns
+  bought nothing (long test-verification tails). Sonnet W5 flipped the same
+  way in the *other* direction (off 28 calls, on 12). Those two cells are
+  most of each round's headline delta; per-cell deltas at n=1 are dominated
+  by this noise, which is why the paired sign counts (4–5 of 5 cells on-arm
+  more expensive) matter more than the percentages.
+
+**3. Calibration recommendations for lore itself** (Wrysk's call, not made
+here): `DEFAULT_LIMIT` is 20 at `crates/lore/src/daemon/search.rs:56` — for
+an agent-in-the-loop consumer whose every token is re-read each turn, that
+default is expensive; ~8 would have served every observed use. Independently,
+a compact form for tail results (full snippet for the top few, one-line
+path/symbol/score/chunk_id header for the rest — `expand` already exists for
+follow-up) would cut a 20-result payload ~4×. The bench needs no change to
+pick either up; it measures whatever the daemon ships.
+
+The runner now also emits `api_calls` and `cost_weighted_tokens` per cell so
+future rounds report both bases natively.
+
+## Task-set freeze (2026-08-20)
+
+Wrysk approved the W1/W4 prompt fixes and the freeze. `tasks/_task_set.json`
+now pins **`rcbw-v1`** with per-file sha256 hashes: W1's symptom pins the
+merged contract behaviorally (never-write with a compliance reason,
+pre-existing history left alone, negative rejected loudly), W4's names the
+Python stack. Golden diffs, regression tests, and task metadata are unchanged
+from round 1. `run_writer.py` stamps every row with the task-set id
+(`unfrozen` when the manifest is absent, as in round 1).
+
 ## Carried over and next
 
-1. **W1 prompt fix**: the symptom must pin the merged contract behaviorally
-   ("what was already stored must remain readable; nothing new is kept") or
-   the task keeps grading coherent alternatives as failures.
-2. **W4 prompt fix**: name the stack ("my Python agent") — dual-stack corpus
-   plus stack-blind symptom measures coin flips, not ability.
-3. **Freeze the task set** (with the two prompt fixes) before round 2:
-   `_task_set` id + prompt hashes, per bench convention. Needs Wrysk.
+1. ~~W1 prompt fix~~ — done 2026-08-20, frozen in `rcbw-v1`.
+2. ~~W4 prompt fix~~ — done 2026-08-20, frozen in `rcbw-v1`.
+3. ~~Freeze the task set~~ — done 2026-08-20 with Wrysk's approval
+   (`tasks/_task_set.json`, id `rcbw-v1`, per-file hashes).
 4. **Round 2 questions**: do the artifacts-removed patterns hold on repeats?
    Does on-arm zero-adoption (W5 both models, W1 Opus) repeat, and does
    adoption correlate with fix completeness? The Opus result also asks
