@@ -204,6 +204,47 @@ files, search the index), planner critique/iteration, cross-card links. The
 laundering exclusions (tests, fixtures, scratch, research raw) are strategy-
 independent and stay.
 
+## Results — round 2, run 20260820-145702 (lane binary, v0 vs v1 cards)
+
+Three arms in one session on the branch build (lane shipped): control,
+`lore-bench-d` (v0 folder cards), `lore-bench-d2` (v1 judgment cards, 20
+areas, qwen3.8 for both phases — same model as v0, so deltas are the
+strategy). Token cost, measured: map 19.7k→5.1k, compile ~142k→~16k.
+
+**The lane guarantee held live: all three arms' page metrics are identical**
+(hit@5 0.92, hit@10 0.92, MRR 0.76, nDCG 0.77). Cards in the corpus change
+nothing about the ranked page. The comparison is therefore lane *routing*:
+did the ≤3-card lane contain a card whose anchors hold a key path?
+
+| routing hits | design | lexical | semantic | symbol | total | rescues |
+|---|---|---|---|---|---|---|
+| v0 folder cards | 0/6 | 5/5 | 7/10 | 4/4 | 16/25 | 1 (LB-01) |
+| v1 judgment cards | **4/6** | 5/5 | 7/10 | 2/4 | 18/25 | 0 |
+
+Read (n=25 caveats apply as ever):
+
+- **v1 fixed design routing outright** (0→4): v0's single merged "design"
+  card never surfaced for design queries; concept-carved cards do.
+- **v1 lost the LB-01 rescue — and not to coverage.** `daemon-lifecycle.md`
+  anchors `ownership.rs` and describes the lock correctly, but three wrong
+  cards outrank it in the lane for that query. A 7-file area's prose dilutes
+  any single story; v0's accidentally-narrow daemon cards matched tighter.
+  Card *retrievability* trades against area breadth — the planner's epics
+  (7-9 files) are too big for their own findability.
+- v1's symbol-routing drop (4→2) is the same effect in reverse and costless:
+  the page scores 1.0 on symbol queries; lane routing there is decorative.
+- LB-03 remains unrouted by both strategies (two carvings, same miss) —
+  walker-exclusion phrasing looks like a genuinely hard case.
+- Per-card quality is visibly better in v1 (whole files + intent line: the
+  authority card explains laundering, path ceilings, bare-ID supersession),
+  but several v1 cards hit the 800-token completion cap; raise it for the
+  compile pass next round.
+
+Next levers, in order of expected value: cap planner areas at ~4 files
+(split the epics), open each card with its intent sentence (it embeds), and
+re-test whether the LB-01-class rescue returns without losing the design
+gains. A stronger distiller remains untested.
+
 ## Generator
 
 `bench/distill/distill.py` — standalone, no daemon involvement. Walks the
