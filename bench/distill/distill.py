@@ -140,11 +140,14 @@ def call_model(api: str, model: str, area: str, files: list[tuple[str, str, bool
     with urllib.request.urlopen(req, timeout=600) as resp:
         out = json.load(resp)
     text = out["choices"][0]["message"]["content"].strip()
-    # Strip any <think> reasoning block a local qwen may emit.
+    # Strip any <think> reasoning block a local qwen may emit. It still
+    # counted against completion_tokens — usage reporting exists to make
+    # that overhead visible instead of estimated after the fact.
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
     if not text.startswith("#"):
         text = "# " + (area or "Repository root") + "\n\n" + text
-    return text
+    usage = out.get("usage") or {}
+    return text, usage
 
 
 def main():
@@ -169,6 +172,7 @@ def main():
 
     out_dir.mkdir(exist_ok=True)
     failures, written, skipped = [], 0, 0
+    tok_in = tok_out = 0
     for area, files in groups.items():
         card_path = out_dir / f"{slugify(area)}.md"
         if card_path.exists() and not args.force:
@@ -178,12 +182,14 @@ def main():
         heads = [read_head(f) for f in files]
         t0 = time.time()
         try:
-            prose = call_model(args.api, args.model, area,
-                               [(r, t, tr) for r, (t, tr) in zip(rels, heads)])
+            prose, usage = call_model(args.api, args.model, area,
+                                      [(r, t, tr) for r, (t, tr) in zip(rels, heads)])
         except Exception as e:
-            print(f"  FAIL {area or '(root)'}: {e}")
+            print(f"  FAIL {area or '(root)'}: {e}", flush=True)
             failures.append(area or "(root)")
             continue
+        tok_in += usage.get("prompt_tokens", 0)
+        tok_out += usage.get("completion_tokens", 0)
         sources = "\n".join(
             f"  - path: {r}\n    sha256: {sha12(f)}" for r, f in zip(rels, files))
         card = (
