@@ -46,7 +46,7 @@ expression: rendered
       "name": "expand"
     },
     {
-      "description": "Your first tool for any \"where is X / how does Y work / what was decided about Z\" question in an indexed project: one query replaces a chain of exploratory greps and directory reads, and also surfaces design-doc and decision context that grep cannot see. Prefer it whenever you do not already know the exact file; fall back to grep only for exhaustive literal sweeps (every occurrence of an exact string) - and note that inconsistently-named concepts defeat literal grep but not this search. Hybrid lexical+semantic search over this session's project - the code and design vault of the repository you are working in, scoped automatically, with no way to reach another project. Each hit carries provenance (file, line span, symbol path for code, heading path for Markdown), the status the document declares, and the authority Lore actually assigns it. Those differ on purpose: `decided` is honored only when the document cites a decision still active in the project's ledger, and scratch/research paths are capped whatever they declare - a demoted hit says why in its authority note. Prefer sources whose *effective* authority is `decided` when documents disagree; cited decision IDs are provenance, not authority. Excerpts are truncated; call `expand` with a hit's project_key and chunk_id to read it.",
+      "description": "Your first tool for any \"where is X / how does Y work / what was decided about Z\" question in an indexed project: one query replaces a chain of exploratory greps and directory reads, and also surfaces design-doc and decision context that grep cannot see. Prefer it whenever you do not already know the exact file; fall back to grep only for exhaustive literal sweeps (every occurrence of an exact string) - and note that inconsistently-named concepts defeat literal grep but not this search. Hybrid lexical+semantic search over this session's project - the code and design vault of the repository you are working in, scoped automatically, with no way to reach another project. Each hit carries provenance (file, line span, symbol path for code, heading path for Markdown), the status the document declares, and the authority Lore actually assigns it. Those differ on purpose: `decided` is honored only when the document cites a decision still active in the project's ledger, and scratch/research paths are capped whatever they declare - a demoted hit says why in its authority note. Prefer sources whose *effective* authority is `decided` when documents disagree; cited decision IDs are provenance, not authority. Excerpts are inline for the top few hits only and truncated even there; every later hit is a pointer (header lines, no excerpt). Call `expand` with a hit's project_key and chunk_id to read any of them - do not re-search hoping for longer excerpts.",
       "inputSchema": {
         "$defs": {
           "StatusFilter": {
@@ -71,7 +71,7 @@ expression: rendered
             ]
           },
           "limit": {
-            "description": "Maximum results. The daemon clamps this to a sane ceiling.",
+            "description": "Maximum results; default 10, clamped to a sane ceiling. Results past the top few are pointer headers either way, so raising this buys breadth, not longer excerpts.",
             "format": "uint32",
             "minimum": 0,
             "type": [
