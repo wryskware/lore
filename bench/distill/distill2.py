@@ -30,8 +30,9 @@ from distill import EXCLUDE_DIRS, EXTENSIONS, sha12
 DIGEST_HEAD_BYTES = 1_200     # per-file head shown to the planner
 CARD_FILE_BYTES = 24_000      # per-file cap shown to the compiler
 CARD_AREA_BYTES = 72_000      # total source budget per card
-MAX_OUTPUT_TOKENS = 800
-PLAN_MAX_TOKENS = 6_000   # plan JSON + any thinking share this budget
+MAX_OUTPUT_TOKENS = 1600
+PLAN_MAX_TOKENS = 10_000  # plan JSON + any thinking share this budget
+DIGEST_BUDGET = 300_000   # plan-input cap; big repos fall back to tree mode
 
 PLAN_SYSTEM = (
     "You are planning a distillation of a repository into knowledge cards "
@@ -53,10 +54,10 @@ Return ONLY a JSON object, no prose, in this exact shape:
              "intent": "one sentence: the questions this area answers",
              "files": ["exact/path/from/digest", "..."]}}]}}
 
-Rules: 8-24 areas. Every file path must be copied exactly from the digest.
-Every substantial source file should appear in at least one area; a file may
-appear in two areas when it genuinely serves both. Tiny config or license
-files may be omitted."""
+Rules: 12-40 areas, each citing the 2-6 files that best tell its story —
+cards are routers to the right sources, not exhaustive coverage, so leaving
+most files uncited is correct. Every cited path must be copied exactly from
+the digest. A file may appear in two areas when it genuinely serves both."""
 
 CARD_SYSTEM = (
     "You write distilled knowledge cards for a code retrieval index. A card "
@@ -193,10 +194,19 @@ def main():
     ap.add_argument("--force-plan", action="store_true")
     ap.add_argument("--force", action="store_true", help="recompile existing cards")
     ap.add_argument("--dry-run", action="store_true", help="plan only, compile nothing")
+    ap.add_argument("--file-list", type=Path,
+                    help="newline-separated project-relative paths to use instead of walking (e.g. exported from the live index)")
     args = ap.parse_args()
 
     root = args.root.resolve()
-    files = indexable_files(root)
+    if args.file_list:
+        rels = [l.strip() for l in args.file_list.read_text(encoding="utf-8").splitlines() if l.strip()]
+        files = [root / r for r in rels if (root / r).is_file()]
+        missing = len(rels) - len(files)
+        if missing:
+            print(f"file-list: {missing} listed paths not on disk (skipped)", flush=True)
+    else:
+        files = indexable_files(root)
     plan_file = args.plan_file or Path(__file__).parent / "plans" / f"{root.name}.json"
 
     if plan_file.exists() and not args.force_plan:
