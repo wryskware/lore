@@ -215,6 +215,19 @@ as the right fix on the wrong stack, and on-W5 is identified as exactly the
 suppress-the-seed non-fix the W5 test author designed against. No cell where
 the judge and the regression outcome disagree in direction.
 
+Opus 5 @ medium cells, same judge:
+
+| task | off | on |
+| --- | --- | --- |
+| W1 | partial (negative validation matches golden; deletes on zero) | partial (same) |
+| W2 | incorrect (reasonable recursion, fails the same clause) | incorrect (same) |
+| W3 | **equivalent** (identical gate) | **equivalent** |
+| W4 | **equivalent** (identical `ensure_ascii=False` one-liner) | **equivalent** |
+| W5 | ERR (verdict truncated at max_tokens; deterministic grade is fixed, and the identical twin diff judged equivalent) | **equivalent** (same accumulator strategy) |
+
+One verdict of 20 was lost to output truncation; noted rather than re-run,
+since the tertiary layer never overrides the deterministic grade.
+
 ## What this round says
 
 **The write program measures a different thing than the QA program, by
