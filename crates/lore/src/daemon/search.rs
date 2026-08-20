@@ -53,7 +53,14 @@ use crate::store::{Project, ProjectId, SearchFilter, SearchHit, StatusFilter, St
 use crate::types::{Chunk, ChunkKind, DesignStatus, SourceKind};
 
 /// Results returned when the caller does not ask for a specific number.
-pub const DEFAULT_LIMIT: u32 = 20;
+///
+/// Was 20 through RCB-W round 1; the 2026-08-20 transcript debug showed no
+/// agent ever passed `limit` and none consumed past rank 3, while every
+/// returned token is re-read on each later turn of an agent loop. Ten keeps
+/// real breadth (the MCP rendering carries excerpts only for the top ranks
+/// anyway) at roughly half the payload; callers who want more still get it,
+/// clamped at [`MAX_LIMIT`].
+pub const DEFAULT_LIMIT: u32 = 10;
 
 /// Hard ceiling; `search` is meant to stay token-lean (`expand` exists for
 /// depth, 3.1).

@@ -101,6 +101,16 @@ fn trim_discriminator(segment: &str) -> &str {
     if discriminator { head } else { segment }
 }
 
+/// Ranks that carry their excerpt inline; every later result is a pointer.
+///
+/// Calibrated from RCB-W round 1 (2026-08-20 debug): an agent re-reads every
+/// returned token on each later turn of its loop, a full-excerpt result set
+/// ran 8-9k tokens per call, and every productive use in twenty transcripts
+/// consumed rank <= 3 before switching to `expand`. The tail keeps its header
+/// lines - everything an agent needs to decide whether to `expand` - at
+/// roughly 2% of an excerpt's cost, so breadth survives the trim.
+const EXCERPT_RANKS: usize = 3;
+
 /// Rendered `search` result set.
 pub fn search(query: &str, response: &SearchResponse) -> String {
     let mut out = String::new();
@@ -126,14 +136,21 @@ pub fn search(query: &str, response: &SearchResponse) -> String {
     if response.lexical_only {
         out.push_str(LEXICAL_ONLY_NOTE);
     }
+    if response.results.len() > EXCERPT_RANKS {
+        let _ = writeln!(
+            out,
+            "note: excerpts are inline for the top {EXCERPT_RANKS}; the rest are pointers - \
+             call `expand` with a result's project_key/chunk_id to read one"
+        );
+    }
     for (index, result) in response.results.iter().enumerate() {
         out.push('\n');
-        push_result(&mut out, index + 1, result);
+        push_result(&mut out, index + 1, result, index < EXCERPT_RANKS);
     }
     out
 }
 
-fn push_result(out: &mut String, rank: usize, result: &SearchResult) {
+fn push_result(out: &mut String, rank: usize, result: &SearchResult, with_excerpt: bool) {
     let language = match &result.language {
         Some(language) => format!("  [{language}]"),
         None => String::new(),
@@ -188,6 +205,9 @@ fn push_result(out: &mut String, rank: usize, result: &SearchResult) {
         short_id(&result.chunk_id)
     );
 
+    if !with_excerpt {
+        return;
+    }
     out.push_str(result.excerpt.trim_end_matches('\n'));
     out.push('\n');
     if result.excerpt_truncated {
@@ -497,6 +517,56 @@ mod tests {
         assert!(rendered.contains(
             "    (excerpt truncated - expand project_key=\"lexomancy\" chunk_id=\"4e77ba0193ab\" for the full text)\n"
         ));
+    }
+
+    /// RCB-W round 1: full excerpts on deep ranks were pure cache-resident
+    /// cost. The tail must keep every header line - the `expand` handle above
+    /// all - and lose only the excerpt, and the trade must be announced once.
+    #[test]
+    fn tail_results_are_pointers_not_excerpts() {
+        let results: Vec<SearchResult> = (0..5)
+            .map(|n| {
+                let mut hit = code_hit();
+                hit.chunk_id = full_id(&format!("aaaa{n:08x}"));
+                hit.excerpt = format!("void Update{n}() {{\n    Tick();");
+                hit
+            })
+            .collect();
+        let rendered = search(
+            "board update",
+            &SearchResponse {
+                results,
+                lexical_only: false,
+            },
+        );
+        assert!(rendered.contains(
+            "note: excerpts are inline for the top 3; the rest are pointers - \
+             call `expand` with a result's project_key/chunk_id to read one\n"
+        ));
+        // Ranks 1-3 keep their excerpts; ranks 4-5 keep everything else.
+        assert!(rendered.contains("void Update0()"));
+        assert!(rendered.contains("void Update2()"));
+        assert!(!rendered.contains("void Update3()"), "{rendered}");
+        assert!(!rendered.contains("void Update4()"), "{rendered}");
+        assert!(rendered.contains("[4] lexomancy  Assets/Scripts/Board.cs:120-141"));
+        assert!(rendered.contains("    project_key: lexomancy  chunk_id: aaaa00000004\n"));
+        // A pointer has no excerpt, so it must not claim one was truncated.
+        let tail = rendered.split("[4] ").nth(1).unwrap();
+        assert!(!tail.contains("excerpt truncated"), "{tail}");
+    }
+
+    /// At or under the excerpt budget nothing changes and no note is spent.
+    #[test]
+    fn small_result_sets_render_whole_without_the_pointer_note() {
+        let rendered = search(
+            "board update",
+            &SearchResponse {
+                results: vec![code_hit(), code_hit(), code_hit()],
+                lexical_only: false,
+            },
+        );
+        assert!(!rendered.contains("note: excerpts"), "{rendered}");
+        assert_eq!(rendered.matches("void Update()").count(), 3);
     }
 
     /// Issue #9: `symbol: #s0` told a reader nothing at all. The chunker's

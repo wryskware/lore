@@ -97,7 +97,11 @@ pub struct SearchParams {
                               Omit for no filter."
     )]
     pub status: Option<Vec<StatusFilter>>,
-    #[schemars(description = "Maximum results. The daemon clamps this to a sane ceiling.")]
+    #[schemars(
+        description = "Maximum results; default 10, clamped to a sane ceiling. Results past \
+                       the top few are pointer headers either way, so raising this buys \
+                       breadth, not longer excerpts."
+    )]
     pub limit: Option<u32>,
 }
 
@@ -265,8 +269,10 @@ impl LoreServer {
                        paths are capped whatever they declare - a demoted hit says why in its \
                        authority note. Prefer sources whose *effective* authority is `decided` \
                        when documents disagree; cited decision IDs are provenance, not \
-                       authority. Excerpts are truncated; call `expand` with a hit's \
-                       project_key and chunk_id to read it."
+                       authority. Excerpts are inline for the top few hits only and truncated \
+                       even there; every later hit is a pointer (header lines, no excerpt). \
+                       Call `expand` with a hit's project_key and chunk_id to read any of \
+                       them - do not re-search hoping for longer excerpts."
     )]
     async fn search(&self, Parameters(params): Parameters<SearchParams>) -> CallToolResult {
         let scope = match self.scope().await {

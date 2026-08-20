@@ -67,7 +67,9 @@ A hit looks like this:
   whether this is the definition or an incidental mention.
 - `status:` / `refs:` / `authority:` — see the next section.
 - `project_key` / `chunk_id` — the handle you pass to `expand`.
-- The excerpt is **truncated**. It is a pointer, not a source.
+- The excerpt is **truncated**, and only the top few hits carry one at all —
+  the rest are header-only pointers. Every hit is a pointer, not a source;
+  `expand` reads any of them in full.
 
 ## 3. Authority: what Lore assigns beats what the document claims
 
