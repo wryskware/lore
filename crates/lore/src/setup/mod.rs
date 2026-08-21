@@ -72,6 +72,11 @@ pub const SKILLS: &[Skill] = &[
         summary: "tune a project's .loreignore by measuring the repo",
         body: include_str!("assets/lore-ignore.md"),
     },
+    Skill {
+        name: "lore-vault",
+        summary: "stand up a lore-v1 design vault: .lore.toml, 0_Canon, agent instructions",
+        body: include_str!("assets/lore-vault.md"),
+    },
 ];
 
 /// The `lore setup` target that installs the user-level ignore rules. Not a
@@ -377,27 +382,54 @@ pub fn pending(items: &[Item], force: bool) -> bool {
 /// It matters more since D-0020: nothing is generated into the project and lore
 /// ships no rules of its own, so a fresh project's ignore rules are whatever the
 /// repo's `.gitignore` already said.
-///
-/// It names the command that is actually the next step, which depends on
-/// whether the asset is installed — a nudge to run something already installed
-/// is noise, and a nudge to invoke a skill that is absent is a dead end.
 pub fn ignore_nudge() -> String {
+    let action = next_step("lore-ignore");
+    format!("lore indexes what this repo's .gitignore allows; to tune it, {action}")
+}
+
+/// The line `lore add` prints when the repo declares no authority profile.
+///
+/// Same reasoning as [`ignore_nudge`] and the same blind spot: authority is
+/// repo-opt-in (D-0012), so a repo that never commits a `.lore.toml` gets
+/// neutral retrieval forever and nothing in the tool ever mentions that a
+/// design vault was an option. Registration is the one moment a user is
+/// looking at lore and thinking about this repo.
+///
+/// Deliberately silent when a profile is already declared, when the config is
+/// broken (that error has its own louder channel), and when the profile is
+/// suspended with `behavior = "off"` — a nudge to do the thing someone
+/// explicitly turned off is noise.
+pub fn vault_nudge(root: &Utf8Path) -> Option<String> {
+    let config = crate::repo_config::RepoAuthority::load(root);
+    if config.profile.is_some() || config.error.is_some() {
+        return None;
+    }
+    let action = next_step("lore-vault");
+    Some(format!(
+        "this repo declares no authority profile, so design docs rank as ordinary \
+         prose; to set one up, {action}"
+    ))
+}
+
+/// Name the command that is actually the next step, which depends on whether
+/// the asset is installed — a nudge to run something already installed is
+/// noise, and a nudge to invoke a skill that is absent is a dead end.
+fn next_step(skill: &str) -> String {
     let installed = Host::ALL.iter().filter(|host| host.detected()).any(|host| {
         host.skills_dir().is_ok_and(|dir| {
             plan(&dir)
                 .iter()
-                .any(|item| item.name == "lore-ignore" && item.state != State::Missing)
+                .any(|item| item.name == skill && item.state != State::Missing)
         })
     });
-    let action = if installed {
-        "ask your agent to run /lore-ignore".to_string()
+    if installed {
+        format!("ask your agent to run /{skill}")
     } else {
         format!(
             "run `lore setup {}` to install the skill that does it",
             Host::ClaudeCode
         )
-    };
-    format!("lore indexes what this repo's .gitignore allows; to tune it, {action}")
+    }
 }
 
 /// Guard against shipping an asset a host would reject, or one that would fight
@@ -518,6 +550,44 @@ mod tests {
             std::fs::read_to_string(&item.path).unwrap(),
             "my-own-rule/\n"
         );
+    }
+
+    /// The nudge exists for the repo that has never heard of authority at all.
+    #[test]
+    fn a_repo_with_no_config_is_told_the_vault_was_an_option() {
+        let (_dir, root) = temp();
+        let nudge = vault_nudge(&root).expect("an unconfigured repo gets the nudge");
+        assert!(nudge.contains("authority profile"), "{nudge}");
+    }
+
+    /// Three ways to have already answered the question, none of which wants
+    /// to be asked again: a live profile, a deliberately suspended one, and a
+    /// broken config that `lore status` is already shouting about.
+    #[test]
+    fn a_repo_that_has_answered_the_question_is_not_asked_again() {
+        for config in [
+            "[authority]\nprofile = \"lore-v1\"\n",
+            "[authority]\nprofile = \"lore-v1\"\nbehavior = \"off\"\n",
+            "[authority]\nprofile = \"nonesuch\"\n",
+            "[authority]\nprofil = \"lore-v1\"\n",
+        ] {
+            let (_dir, root) = temp();
+            std::fs::write(root.join(crate::repo_config::REPO_CONFIG_FILE), config).unwrap();
+            assert_eq!(vault_nudge(&root), None, "{config}");
+        }
+    }
+
+    /// A `.lore.toml` carrying only the other tables has said nothing about
+    /// authority, so it is still the unconfigured case.
+    #[test]
+    fn a_config_without_an_authority_table_still_gets_the_nudge() {
+        let (_dir, root) = temp();
+        std::fs::write(
+            root.join(crate::repo_config::REPO_CONFIG_FILE),
+            "[project]\nname = \"whatever\"\n",
+        )
+        .unwrap();
+        assert!(vault_nudge(&root).is_some());
     }
 
     /// The whole point of the stamp: an installed asset is a prompt, and a user

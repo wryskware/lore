@@ -145,9 +145,10 @@ The server scopes itself to the project containing the working directory, so
 agents never have to name a project or reach into a repo they are not working
 in. `lore setup claude-code` installs the agent-side skills — `lore-search`,
 the method for using the index (search by concept, read a hit's provenance and
-authority, expand before quoting, when to fall back to grep), and `lore-ignore`,
-the method for tuning what a repo indexes — and bare `lore setup` reports on all
-of it without writing anything.
+authority, expand before quoting, when to fall back to grep); `lore-ignore`,
+the method for tuning what a repo indexes; and `lore-vault`, the method for
+standing up a `lore-v1` design vault in a repo that has none — and bare
+`lore setup` reports on all of it without writing anything.
 
 The skills exist because the tool descriptions cannot carry a procedure.
 Benchmarking found that agents told nothing about Lore never reach for it, and

@@ -154,6 +154,9 @@ pub async fn add(path: Option<String>, name: Option<String>) -> Result<()> {
     // cannot see a vendored SDK, a corpus, or a checked-in credential, so the
     // one place a user will read this is here.
     println!("  {}", setup::ignore_nudge());
+    if let Some(nudge) = setup::vault_nudge(&root) {
+        println!("  {nudge}");
+    }
     Ok(())
 }
 
