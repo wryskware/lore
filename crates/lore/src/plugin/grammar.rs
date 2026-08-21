@@ -161,6 +161,15 @@ mod enabled {
     pub(crate) fn load(symbol: &str, bytes: &[u8]) -> Result<Grammar, Unavailable> {
         // A throwaway store purely to compile the module. The `Language` it
         // returns outlives it and is what every thread's own store is handed.
+        //
+        // This is the first call into tree-sitter's C runtime, so on Windows it
+        // is also where a mislinked build dies — not with an error this can map
+        // to `Unavailable`, but with a hard STATUS_ACCESS_VIOLATION, because the
+        // wasmtime C API entry points behind it were garbage collected at link
+        // time. Nothing here can defend against that; the fix is the
+        // `/OPT:NOREF` flag in this repo's `.cargo/config.toml`, which explains
+        // the mechanism. If the daemon dies between "listening" and "chunker
+        // plugins loaded" with no panic and no log line, that is this.
         let mut store = WasmStore::new(engine()).map_err(|err| Unavailable::EngineFailed {
             detail: err.to_string(),
         })?;

@@ -79,9 +79,22 @@ it on the evidence.
 ## Install
 
 ```sh
-cargo install --path crates/lore
-cargo install --path crates/lore-mcp
+cargo install --path crates/lore --locked
+cargo install --path crates/lore-mcp --locked
 ```
+
+`--locked` is not optional politeness. `cargo install` ignores `Cargo.lock`
+without it and re-resolves to the newest compatible dependencies, which is how
+you end up running a build nobody has tested.
+
+If you build on Windows with `rust-lld` as your linker rather than the MSVC
+default, note that this repo ships a `.cargo/config.toml` adding
+`-Clink-arg=/OPT:NOREF`. It is load-bearing: without it `rust-lld` strips the
+wasmtime C API functions that `tree-sitter` reaches through synthesized import
+thunks, and the daemon segfaults on the first wasm grammar it loads. The file
+explains the mechanism and how to verify a binary; the short version is that
+the LNK4217 warnings you will see on every Windows build are expected and are
+*not* a signal for that bug.
 
 Both binaries need to be on `PATH`. Start the daemon:
 

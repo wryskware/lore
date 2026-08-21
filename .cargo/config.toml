@@ -1,0 +1,56 @@
+# Cargo configuration for this repository.
+#
+# # Why `/OPT:NOREF` is here
+#
+# It works around a `rust-lld` bug that produces a binary which links cleanly
+# and then segfaults on the first wasm grammar it loads. You only hit it if
+# your linker for `x86_64-pc-windows-msvc` is `rust-lld` (the MSVC default,
+# `link.exe`, is unaffected) — but when you do hit it, nothing about the
+# failure points here, so the flag is unconditional rather than a note in a
+# README nobody reads at 2am.
+#
+# The mechanism, measured rather than guessed:
+#
+# `tree-sitter`'s C runtime is compiled against wasmtime's headers with
+# `WASM_API_EXTERN` expanding to `__declspec(dllimport)`, so it reaches the
+# wasmtime C API through 27 `__imp_wasmtime_*` symbols. `wasmtime-c-api-impl`
+# defines those functions as *plain* externals — nobody defines the `__imp_`
+# form, so the linker synthesizes it. That mismatch is what the flood of
+# LNK4217 warnings on every Windows build is reporting, and on its own it is
+# harmless: `link.exe` synthesizes the thunks and keeps the target functions
+# alive.
+#
+# `rust-lld` does not. Its `/OPT:REF` pass does not treat a synthesized
+# local-import chunk as a reference to the symbol behind it, so it garbage
+# collects every wasmtime C API body, leaving each `__imp_` slot pointing at
+# ImageBase+0 — the DOS header. The first call through one jumps into the PE
+# header and the process dies with STATUS_ACCESS_VIOLATION (0xC0000005),
+# inside `PluginRegistry::load` before the daemon has logged a single plugin.
+#
+# Isolated by single-knob A/B in one target directory: `link.exe` passes,
+# `rust-lld` crashes, `rust-lld` + `/OPT:NOREF` passes. Not ThinLTO — the
+# debug profile has no LTO and crashes too, and `lto = "off"` does not help.
+# Not `/OPT:ICF`. Not the toolchain channel. Not a duplicate or version-skewed
+# wasmtime: there is exactly one in the tree.
+#
+# Cost: no link-time dead-code stripping, about +5% binary size.
+#
+# Do not use the LNK4217 warnings to check whether this is working — the count
+# is identical on builds that crash and builds that do not. To verify a binary,
+# confirm `__imp_wasmtime_*` in `.rdata` points into `.text` rather than at
+# ImageBase+0:
+#
+#     llvm-pdbutil dump -publics lore.pdb | grep -A1 __imp_wasmtime_func_call_unchecked
+#
+# This is upstream's bug to fix properly; see tree-sitter#4715 for the parallel
+# discussion of not static-linking wasmtime's C API at all. Remove this once
+# `rust-lld` roots synthesized imports correctly, or once `tree-sitter` stops
+# declaring statically linked symbols `dllimport`.
+#
+# Note this replaces any `[target.x86_64-pc-windows-msvc] rustflags` you set in
+# your own `~/.cargo/config.toml` — cargo picks the closest config, it does not
+# merge the arrays. If you need flags of your own for this repo, add them to
+# this list rather than expecting both to apply.
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-Clink-arg=/OPT:NOREF"]
