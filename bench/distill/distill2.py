@@ -121,11 +121,29 @@ def rel(p: Path, root: Path) -> str:
 
 
 def build_digest(root: Path, files: list[Path]) -> str:
-    parts = []
-    for p in files:
-        head = p.read_bytes()[:DIGEST_HEAD_BYTES].decode("utf-8", errors="replace")
-        parts.append(f"=== {rel(p, root)} ({p.stat().st_size:,} bytes) ===\n{head}")
-    return "\n\n".join(parts)
+    """Per-file heads when the budget allows; otherwise tree mode — every
+    path with its size (paths carry real signal in a well-named repo), plus
+    heads for Markdown docs only, shallowest first, until the budget is
+    spent. Same budget either way, so any repo produces a plannable input."""
+    if len(files) * (DIGEST_HEAD_BYTES // 2) <= DIGEST_BUDGET:
+        parts = []
+        for p in files:
+            head = p.read_bytes()[:DIGEST_HEAD_BYTES].decode("utf-8", errors="replace")
+            parts.append(f"=== {rel(p, root)} ({p.stat().st_size:,} bytes) ===\n{head}")
+        return "\n\n".join(parts)
+    tree = "\n".join(f"{rel(p, root)} ({p.stat().st_size:,} bytes)" for p in files)
+    spent = len(tree)
+    doc_parts = []
+    docs = sorted((p for p in files if p.suffix.lower() == ".md"),
+                  key=lambda p: (len(p.relative_to(root).parts), str(p)))
+    for p in docs:
+        if spent >= DIGEST_BUDGET:
+            break
+        head = p.read_bytes()[:500].decode("utf-8", errors="replace")
+        doc_parts.append(f"=== {rel(p, root)} ===\n{head}")
+        spent += len(head) + 60
+    return (tree + "\n\nDocumentation heads (Markdown only; all other files "
+            "are listed by path and size above):\n\n" + "\n\n".join(doc_parts))
 
 
 def make_plan(args, root: Path, files: list[Path]) -> dict:
@@ -135,10 +153,27 @@ def make_plan(args, root: Path, files: list[Path]) -> dict:
     text, usage = chat(args.plan_api, args.plan_model, PLAN_SYSTEM,
                        PLAN_TEMPLATE.format(digest=digest),
                        max_tokens=PLAN_MAX_TOKENS)
-    m = re.search(r"\{.*\}", text, flags=re.S)
+    m = re.search(r"\{.*", text, flags=re.S)
     if not m:
         sys.exit(f"planner returned no JSON object:\n{text[:2000]}")
-    plan = json.loads(m.group(0))
+    raw = m.group(0)
+    try:
+        plan = json.loads(raw)
+    except json.JSONDecodeError:
+        # Output clipped mid-object: salvage every complete area entry by
+        # trimming to the last fully-closed '}' inside the areas array and
+        # re-closing the structure. Losing the tail beats losing the plan.
+        cut = raw.rfind("}")
+        while cut > 0:
+            try:
+                plan = json.loads(raw[:cut + 1] + "]}")
+                print(f"  plan: JSON truncated; salvaged prefix "
+                      f"({cut + 1}/{len(raw)} chars)", flush=True)
+                break
+            except json.JSONDecodeError:
+                cut = raw.rfind("}", 0, cut)
+        else:
+            sys.exit(f"planner JSON unrecoverable:\n{raw[:2000]}")
 
     known = {rel(p, root) for p in files}
     areas, seen_slugs = [], set()
