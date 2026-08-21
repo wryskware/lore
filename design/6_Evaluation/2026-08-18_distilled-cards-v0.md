@@ -245,6 +245,54 @@ Next levers, in order of expected value: cap planner areas at ~4 files
 re-test whether the LB-01-class rescue returns without losing the design
 gains. A stronger distiller remains untested.
 
+## Results — round 3, run 20260820-191125 (lexomancy: the headroom test)
+
+The corpus where retrieval is actually weak, per Wrysk's framing that a null
+here should close the question. 40 v1 cards (tree-mode plan: 1,538 indexed
+files -> 40 areas / 194 anchors; qwen3.8 both phases; plan 74k->15.7k tok,
+compile 520k->40k tok, all local), drained through the **production vLLM
+FP8 embedding stack** via the new `run-vllm.ps1` (the model-matrix `run.ps1`
+predates the 2026-08-17 vLLM switch), 17,974 chunks in 2.2 min.
+
+Page: hit@10 0.80 (24/30; keys predate corpus drift off the pin, so treat
+absolute numbers as internal to this run). The number that matters:
+
+**The lane rescued 3 of the page's 6 misses — all semantic-kind.**
+
+| | page hit | lane routing | rescues |
+|---|---|---|---|
+| semantic (13) | 7 | 4 | **3** |
+| lexical (6) | 6 | 4 | 0 |
+| symbol (5) | 5 | 2 | 0 |
+| docs (4) | 4 | 3 | 0 |
+| multi-file (2) | 2 | 1 | 0 |
+
+All three rescues verified by hand and mechanically sound: the topically
+right card ranks 1-2 in the lane and its frontmatter anchors the key file —
+`hand-system` -> `HandLayoutManager.cs` for "what makes the tiles you're
+holding spread into a curve and lift up" (LX-04), `player-actions` ->
+`PlayerActionSO.cs` (LX-08), `overworld-level-gen` -> `HexRoomGenerator.cs`
+(LX-12). Exactly the mechanism as designed: intent-phrased queries that raw
+chunks miss, matched by card prose, routed through anchors. Three misses
+remain unrescued (LX-02/05/10) — coverage, not ranking.
+
+Scoreboard across rounds, rescues per page-miss:
+
+| corpus | page misses | rescued |
+|---|---|---|
+| lore-bench v0 (r1) | 2 | 1 |
+| lore-bench v1 (r2) | 2 | 0 |
+| lexomancy v1 (r3) | 6 | **3** |
+
+Reading: on a strong corpus the lane is decoration; on the weak, flagship
+corpus it converts half the failures. The value concentrates exactly where
+retrieval needs help, which is the only place a second lane was ever going
+to pay. Still open before this is a feature and not an experiment: the
+freshness/regeneration loop and plan evolution (unchanged from the parking
+assessment), and the three unrescued misses set the coverage ceiling for
+this carving. The cards are live in the Lexomancy root, so the dogfood
+daemon indexes them and the lane can be felt in real use immediately.
+
 ## Generator
 
 `bench/distill/distill.py` — standalone, no daemon involvement. Walks the
