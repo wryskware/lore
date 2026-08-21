@@ -85,6 +85,8 @@ this area — do not just repeat identifiers.
 e.g. `{example}`.
 - No code blocks, no bullet lists, no headings other than the title, no \
 restating of the file list.
+- The FIRST sentence after the title must directly answer the intent line \
+above — it is what a semantic query will match against.
 Output only the card text."""
 
 
