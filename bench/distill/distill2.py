@@ -31,7 +31,7 @@ DIGEST_HEAD_BYTES = 1_200     # per-file head shown to the planner
 CARD_FILE_BYTES = 24_000      # per-file cap shown to the compiler
 CARD_AREA_BYTES = 72_000      # total source budget per card
 MAX_OUTPUT_TOKENS = 1600
-PLAN_MAX_TOKENS = 10_000  # plan JSON + any thinking share this budget
+PLAN_MAX_TOKENS = 24_000  # plan JSON + any thinking share this budget
 DIGEST_BUDGET = 300_000   # plan-input cap; big repos fall back to tree mode
 
 PLAN_SYSTEM = (
