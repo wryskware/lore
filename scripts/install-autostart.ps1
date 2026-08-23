@@ -45,7 +45,14 @@ if (-not (Test-Path $loreExe)) {
 # model, ~2.1x throughput. Pass -LlamaCpp to register the old stack instead.
 $serveScript = Join-Path $PSScriptRoot ($LlamaCpp ? 'serve-embeddings.ps1' : 'serve-embeddings-vllm.ps1')
 if (-not (Test-Path $serveScript)) { throw "$serveScript not found" }
-$pwshExe = (Get-Command pwsh).Source
+# Bare name, resolved by Task Scheduler at *run* time. `(Get-Command pwsh).Source`
+# bakes in the version-stamped Store path
+# (…\WindowsApps\Microsoft.PowerShell_7.6.4.0_x64__…\pwsh.exe), which the next
+# PowerShell update invalidates — and a logon task whose Execute no longer
+# exists fails with 0x80070002 into the task history and nowhere else, so the
+# first symptom is `lore status` saying the daemon is not running weeks later.
+$pwshExe = 'pwsh.exe'
+if (-not (Get-Command $pwshExe -ErrorAction SilentlyContinue)) { throw 'pwsh.exe is not on PATH' }
 
 # No -ExecutionTimeLimit of the 72h default: both processes are meant to run
 # for the whole session.
