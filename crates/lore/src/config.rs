@@ -212,6 +212,21 @@ pub struct EmbeddingsConfig {
     /// but some (llama-server started with `--api-key`) demand *something*.
     /// Absent ⇒ no header at all.
     pub api_key: Option<String>,
+    /// Argv of a command `lore start` runs when `endpoint` is not answering,
+    /// e.g. `["wsl", "-d", "Ubuntu", "--", "/opt/vllm/serve.sh"]`. Empty ⇒
+    /// `lore start` reports the dead endpoint and starts the daemon anyway.
+    ///
+    /// Argv rather than a shell string: a quoted command line is one escaping
+    /// mistake away from running something else, and the interesting case here
+    /// (`wsl -d … -- …`) is exactly where nested quoting goes wrong.
+    ///
+    /// Deliberately inert everywhere but `lore start`. The daemon never reads
+    /// it — an endpoint that may be absent or unhealthy at any moment is the
+    /// contract the embed path is built on (D-0007), and a daemon that could
+    /// launch its own backend would quietly become that backend's supervisor.
+    /// It is also not part of the fingerprint: how a server was started says
+    /// nothing about what its vectors are.
+    pub start_command: Vec<String>,
 }
 
 impl Default for EmbeddingsConfig {
@@ -227,6 +242,7 @@ impl Default for EmbeddingsConfig {
             concurrency: DEFAULT_EMBED_CONCURRENCY,
             max_embed_bytes: DEFAULT_MAX_EMBED_BYTES,
             api_key: None,
+            start_command: Vec::new(),
         }
     }
 }

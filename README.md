@@ -99,8 +99,15 @@ the LNK4217 warnings you will see on every Windows build are expected and are
 Both binaries need to be on `PATH`. Start the daemon:
 
 ```sh
-lore daemon
+lore start
 ```
+
+That backgrounds it, logs to `<data-dir>\daemon.log`, and returns once it is
+answering. It is idempotent — run it again and it reports the daemon it found
+rather than starting a second one. It will also start your embedding server
+first, if you have told it how (see below). `lore stop` shuts the daemon down
+cleanly; `lore daemon` still runs it in the foreground, which is what you want
+when you are reading its logs live.
 
 Then register a repository and index it:
 
@@ -128,9 +135,33 @@ dimensions = 2560
 
 Every key is optional and unknown keys are rejected rather than ignored — a
 misspelled `endpoint` fails loudly instead of presenting as "embeddings
-mysteriously never turned on". `scripts/serve-embeddings.ps1` is the launcher
-used on the development machine, and `scripts/install-autostart.ps1` registers
-the daemon and the embedding server as logon tasks.
+mysteriously never turned on". `scripts/serve-embeddings-vllm.ps1` is the
+launcher used on the development machine, and `scripts/install-autostart.ps1`
+registers the daemon and the embedding server as logon tasks.
+
+Add `start_command` and `lore start` will launch that server for you when the
+endpoint is not already answering:
+
+```toml
+[embeddings]
+endpoint = "http://127.0.0.1:8000/v1"
+start_command = [
+  "wsl.exe", "-d", "Ubuntu", "-e", "bash", "-lc",
+  "exec bash /mnt/c/path/to/lore/scripts/serve-embeddings-vllm.sh",
+]
+```
+
+It is argv rather than a shell line, because the interesting case is exactly
+where nested quoting goes wrong. `lore start` probes the endpoint first and
+only runs the command if nothing answers, then waits up to three minutes for it
+to come up, logging to `<data-dir>\embed.log`.
+
+Nothing supervises it after that. `lore stop` does not stop it, a server that
+dies is not restarted, and a server that never comes up is reported rather than
+treated as an error — an absent or unhealthy endpoint is a state the daemon is
+built to degrade through (search goes lexical-only and says so), which is what
+lets this be a launcher instead of a process manager. The daemon re-probes on
+its own, so a server that arrives late is picked up within a minute either way.
 
 Changing the model or its dimensions re-embeds the index.
 

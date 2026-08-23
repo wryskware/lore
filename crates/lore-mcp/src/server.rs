@@ -483,6 +483,6 @@ mod tests {
         let result = failed(&DaemonError::NotRunning("no daemon handshake".into()));
         assert_eq!(result.is_error, Some(true));
         let rendered = result.content[0].as_text().unwrap().text.clone();
-        assert!(rendered.contains("`lore daemon`"), "{rendered}");
+        assert!(rendered.contains("`lore start`"), "{rendered}");
     }
 }

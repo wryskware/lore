@@ -39,6 +39,37 @@ fn documented_example_parses_field_for_field() {
     // files written before it existed.
     assert_eq!(embeddings.concurrency, DEFAULT_EMBED_CONCURRENCY);
     assert_eq!(embeddings.batch_max_bytes, DEFAULT_BATCH_MAX_BYTES);
+    assert!(embeddings.start_command.is_empty());
+}
+
+/// `start_command` is argv, not a shell line: the case it exists for is
+/// `wsl -d <distro> -- <script>`, where a quoted command line is one escaping
+/// mistake away from running something else.
+#[test]
+fn start_command_parses_as_argv_and_defaults_to_empty() {
+    let config = Config::parse(
+        r#"
+[embeddings]
+endpoint = "http://127.0.0.1:8000/v1"
+start_command = ["wsl", "-d", "Ubuntu", "--", "/opt/vllm/serve.sh"]
+"#,
+    )
+    .expect("start_command must parse");
+    assert_eq!(
+        config.embeddings.start_command,
+        ["wsl", "-d", "Ubuntu", "--", "/opt/vllm/serve.sh"]
+    );
+
+    // Absent is the default, and the daemon must not care either way: the key
+    // is read by `lore start` alone.
+    let bare = Config::parse(
+        r#"
+[embeddings]
+endpoint = "http://127.0.0.1:8000/v1"
+"#,
+    )
+    .unwrap();
+    assert!(bare.embeddings.start_command.is_empty());
 }
 
 #[test]

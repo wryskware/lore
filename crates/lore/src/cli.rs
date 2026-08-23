@@ -395,7 +395,7 @@ pub fn plugin_add(path: String) -> Result<()> {
     // Both halves, because either one alone leaves a user with a plugin that
     // appears to do nothing.
     println!(
-        "  restart the daemon to load it (`lore stop`, then `lore daemon`), and enable it in a \
+        "  restart the daemon to load it (`lore stop`, then `lore start`), and enable it in a \
          project's .lore.toml:\n\n    [plugins]\n    enable = [\"{name}\"]\n",
         name = installed.name
     );
@@ -741,6 +741,321 @@ fn setup_report() -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// lore start
+// ---------------------------------------------------------------------------
+
+/// Where a backgrounded daemon's log goes, inside the data directory.
+///
+/// The foreground `lore daemon` writes to stderr and an operator redirects it
+/// wherever they like; a detached one has nowhere to write, and a daemon whose
+/// crash left no trace is the failure `lore start` would otherwise introduce.
+const DAEMON_LOG: &str = "daemon.log";
+
+/// Where a spawned embedding server's output goes. Same reasoning, and kept
+/// separate so a model server's loading chatter never interleaves with the
+/// daemon's own log.
+const EMBED_LOG: &str = "embed.log";
+
+/// How long `lore start` waits for the daemon it spawned to answer.
+///
+/// Startup is a lock, a handshake write and an HTTP bind; the opening rescan
+/// runs *after* the daemon is discoverable, so this covers process spawn and
+/// not the size of anyone's repo.
+const START_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long `lore start` waits for a spawned embedding server to answer.
+///
+/// Generous, because a cold GPU server loads weights before it will embed
+/// anything — and cheap to overrun, because the embed worker re-probes an
+/// unreachable endpoint forever at a one-minute ceiling
+/// (`embed::worker::PROBE_BACKOFF_MAX`). A server that arrives late is picked
+/// up either way, so expiring here is reported and *not* an error: all this
+/// bound really decides is how long the terminal is held.
+const EMBED_READY_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Ceiling on one readiness probe. Short because it is retried in a loop —
+/// this is how often we look, not how long we are willing to wait.
+const EMBED_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often either wait re-checks.
+const START_POLL: Duration = Duration::from_millis(200);
+
+/// `lore start` — bring up the embedding server and the daemon, in that order,
+/// and return once they are answering.
+///
+/// Every "the daemon is not running" path in this binary — and in the MCP
+/// proxy, which can only ask — now ends in "start it with: lore start". This
+/// is the command those messages name: `lore daemon` without a terminal held
+/// open for as long as the daemon lives.
+///
+/// Idempotent by design: both halves check before they spawn, so running it
+/// twice is a status report rather than a second process. The daemon's
+/// ownership lock (`daemon::ownership`) is the real guarantee — this only
+/// makes the common case say something useful instead of failing.
+///
+/// Embeddings go first so the daemon's very first probe finds a live endpoint.
+/// Started in the other order it would still converge, but only after the
+/// worker's backoff walked back down, which is up to a minute of lexical-only
+/// search for no reason.
+///
+/// What this deliberately is *not* is a supervisor. Nothing here restarts a
+/// child that dies, and `lore stop` does not stop the embedding server: the
+/// daemon treats the endpoint as something that may be absent or unhealthy at
+/// any moment (D-0007) and degrades visibly when it is, which is exactly the
+/// property that lets this command be a one-shot launcher instead of a process
+/// manager living inside a context daemon.
+pub async fn start() -> Result<()> {
+    let data_dir = discovery::data_dir()?;
+    std::fs::create_dir_all(&data_dir)
+        .with_context(|| format!("creating the data directory {data_dir}"))?;
+    let config = lore::config::Config::load(&data_dir)?;
+    start_embeddings(&config.embeddings, &data_dir).await?;
+    start_daemon(&data_dir).await
+}
+
+/// The daemon half of [`start`].
+async fn start_daemon(data_dir: &Utf8Path) -> Result<()> {
+    // A handshake that is present, current and *answering* is the only thing
+    // that means "already running". A present one that answers nothing means
+    // the daemon died without withdrawing it, which is precisely the state
+    // `lore start` should resolve rather than report.
+    if let Ok(Some(handshake)) = discovery::read(data_dir) {
+        if handshake.api_version != lore_core::API_VERSION {
+            bail!(
+                "the running lore daemon ({}) speaks API v{}, but this build speaks v{}.\nStop it with: lore stop",
+                handshake.daemon_version,
+                handshake.api_version,
+                lore_core::API_VERSION
+            );
+        }
+        let client = Client::connect_at(data_dir)?;
+        if client.get("status").await.is_ok() {
+            println!(
+                "the lore daemon is already running (pid {}) at {}",
+                client.pid, client.base_url
+            );
+            return Ok(());
+        }
+        println!(
+            "{} names pid {} but nothing is answering there; starting a new daemon",
+            discovery::handshake_path(data_dir),
+            client.pid
+        );
+    }
+
+    let exe =
+        std::env::current_exe().context("finding this executable to start the daemon from")?;
+    let log_path = data_dir.join(DAEMON_LOG);
+    let mut command = std::process::Command::new(exe);
+    command.arg("daemon");
+    redirect(&mut command, &log_path)?;
+    detach(&mut command);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("starting `lore daemon`; its log would be {log_path}"))?;
+    println!("starting the lore daemon (pid {})", child.id());
+
+    let deadline = std::time::Instant::now() + START_TIMEOUT;
+    loop {
+        // Checked before the handshake: a daemon refused admission by the
+        // ownership lock exits in milliseconds, and waiting out the full
+        // timeout to then guess why is worse than naming the log.
+        if let Some(status) = child.try_wait().context("waiting on `lore daemon`")? {
+            bail!("`lore daemon` exited immediately ({status}); see {log_path}");
+        }
+        // The pid must be *ours*. Any other handshake is some other daemon,
+        // and reporting it as the one we just started would be a lie that
+        // survives until the next command fails.
+        if let Ok(client) = Client::connect_at(data_dir)
+            && client.pid == child.id()
+            && client.get("status").await.is_ok()
+        {
+            println!("  answering at {}; log: {log_path}", client.base_url);
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "the lore daemon (pid {}) did not answer within {}s; it is still running, so check {log_path}",
+                child.id(),
+                START_TIMEOUT.as_secs()
+            );
+        }
+        tokio::time::sleep(START_POLL).await;
+    }
+}
+
+/// The embedding half of [`start`]: probe, and only if that fails run the
+/// configured `[embeddings] start_command` and wait for the endpoint to come
+/// up.
+///
+/// Never fatal. Lexical-only search is a supported state (D-0007), so a
+/// missing key, an unreachable endpoint or a command that never finishes
+/// loading all end in a printed line and a daemon that starts anyway.
+async fn start_embeddings(
+    config: &lore::config::EmbeddingsConfig,
+    data_dir: &Utf8Path,
+) -> Result<()> {
+    let Some(settings) = lore::embed::EmbedSettings::from_config(config) else {
+        if !config.start_command.is_empty() {
+            println!(
+                "embeddings: `start_command` is configured but `endpoint` is not, so there is \
+                 nothing to wait for; not starting it"
+            );
+        }
+        return Ok(());
+    };
+    // One attempt, short ceiling: the retry policy the worker uses is for
+    // getting real work done through a flaky server, whereas this asks a
+    // question we are about to ask again in 200ms.
+    let client = lore::embed::EmbedClient::new(lore::embed::EmbedSettings {
+        retry: lore::embed::RetryPolicy {
+            max_attempts: 1,
+            ..Default::default()
+        },
+        request_timeout: EMBED_PROBE_TIMEOUT,
+        ..settings
+    })
+    .context("building the embedding probe client")?;
+    let endpoint = client.endpoint().to_string();
+
+    if client.probe().await.is_ok() {
+        println!("embeddings: {endpoint} is already answering");
+        return Ok(());
+    }
+    let Some((program, args)) = config.start_command.split_first() else {
+        println!(
+            "embeddings: {endpoint} is not answering and no `start_command` is configured; \
+             search stays lexical-only until it is up"
+        );
+        return Ok(());
+    };
+
+    let log_path = data_dir.join(EMBED_LOG);
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    redirect(&mut command, &log_path)?;
+    detach(&mut command);
+    // The handle is dropped rather than held: this process is not the server's
+    // supervisor, and letting it go is what says so. On Windows a detached
+    // child outlives its parent outright; on POSIX it is reparented.
+    let child = command.spawn().with_context(|| {
+        format!("running the configured `[embeddings] start_command`: {program}")
+    })?;
+    println!(
+        "embeddings: started `{program}` (pid {}) for {endpoint}",
+        child.id()
+    );
+
+    if await_embed_ready(&client, EMBED_READY_TIMEOUT).await {
+        println!("  answering; log: {log_path}");
+    } else {
+        println!(
+            "  still not answering after {}s; check {log_path}. The daemon re-probes on \
+             its own, so search turns hybrid without another command once it is up \
+             (`lore status`)",
+            EMBED_READY_TIMEOUT.as_secs()
+        );
+    }
+    Ok(())
+}
+
+/// Poll `client` until it embeds something or `timeout` expires. `false` means
+/// the deadline won, which is a report and not a failure — see
+/// [`start_embeddings`].
+///
+/// Split out from its caller because the giving-up path is the one worth a
+/// test and a 180-second constant is not testable in place.
+async fn await_embed_ready(client: &lore::embed::EmbedClient, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if client.probe().await.is_ok() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(START_POLL).await;
+    }
+}
+
+/// Point a child's stdio at an append-only log file and close its stdin.
+///
+/// Append rather than truncate: the log of the run that crashed is the one
+/// worth having, and a `lore stop` / `lore start` cycle is exactly when it
+/// would otherwise be thrown away.
+fn redirect(command: &mut std::process::Command, log_path: &Utf8Path) -> Result<()> {
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .with_context(|| format!("opening {log_path}"))?;
+    let err = log
+        .try_clone()
+        .with_context(|| format!("duplicating the handle to {log_path}"))?;
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(err));
+    Ok(())
+}
+
+/// Detach a child from this console so it survives the terminal that started
+/// it, and — the part that is not optional — so it does not hold this
+/// process's own stdout open after we exit.
+///
+/// `CreateProcessW` is called with `bInheritHandles = TRUE` by
+/// `std::process::Command` unconditionally, which means a child inherits every
+/// *inheritable* handle this process holds, not merely the three named in
+/// `STARTUPINFO`. Redirecting the daemon's stdio to a log file therefore does
+/// not stop it inheriting our stdout — and when our stdout is a pipe (anything
+/// that captures output: `$(lore start)`, a PowerShell assignment, a test
+/// harness), the read end never sees EOF because a daemon that intends to run
+/// for weeks is still holding the write end. The caller hangs forever on a
+/// command that already printed everything it was going to print.
+///
+/// Clearing `HANDLE_FLAG_INHERIT` first is the fix. It mutates this process,
+/// not the `Command`, which is why it lives here rather than at a call site:
+/// both spawns want it, and this process is about to exit anyway.
+#[cfg(windows)]
+fn detach(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt as _;
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: both calls take a handle we did not open and do not keep,
+        // and neither writes through a pointer. A process with no console and
+        // no redirection has null std handles, which `SetHandleInformation`
+        // rejects — hence the failure being ignored rather than reported:
+        // there is nothing to fix and nothing the user could do about it.
+        unsafe {
+            let handle = GetStdHandle(id);
+            if !handle.is_null() {
+                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+
+    // DETACHED_PROCESS: no inherited console, so closing the window that ran
+    // `lore start` does not deliver CTRL_CLOSE_EVENT to the daemon and take
+    // the index owner down with it.
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    // CREATE_NEW_PROCESS_GROUP: Ctrl-C in that window is not the daemon's.
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+}
+
+/// With stdio already redirected to a file, a POSIX child outlives this
+/// process on its own. It stays in the terminal's process group, so Ctrl-C
+/// there reaches it — accepted rather than fixed with a `setsid` dance,
+/// because Lore is Windows-native (D-0003) and this build exists so the suite
+/// runs, not so anyone daemonizes on it.
+#[cfg(unix)]
+fn detach(_command: &mut std::process::Command) {}
+
 /// How long `lore stop` waits for the daemon to actually be gone.
 ///
 /// The daemon gives its own tasks [`lore::daemon::SHUTDOWN_GRACE`] and then
@@ -787,7 +1102,7 @@ pub async fn stop() -> Result<()> {
         // chains a restart does not proceed on a guess.
         false => bail!(
             "the daemon (pid {pid}) accepted the stop but {path} still names it after {secs}s.\n\
-             Check the daemon's log; if the process is gone, delete that file and start a new one with: lore daemon",
+             Check the daemon's log; if the process is gone, delete that file and start a new one with: lore start",
             pid = stopping.pid,
             path = discovery::handshake_path(&client.data_dir),
             secs = STOP_TIMEOUT.as_secs(),
@@ -983,20 +1298,20 @@ impl Client {
         let handshake = discovery::read(data_dir)
             .with_context(|| {
                 format!(
-                    "the daemon handshake at {} is unreadable; if the daemon is not running, delete it and start it with: lore daemon",
+                    "the daemon handshake at {} is unreadable; if the daemon is not running, delete it and start it with: lore start",
                     discovery::handshake_path(data_dir)
                 )
             })?
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "the lore daemon is not running (no handshake at {}).\nStart it with: lore daemon",
+                    "the lore daemon is not running (no handshake at {}).\nStart it with: lore start",
                     discovery::handshake_path(data_dir)
                 )
             })?;
 
         if handshake.api_version != lore_core::API_VERSION {
             bail!(
-                "the running lore daemon ({}) speaks API v{}, but this build speaks v{}.\nStop the old daemon and start this build with: lore daemon",
+                "the running lore daemon ({}) speaks API v{}, but this build speaks v{}.\nStop the old daemon and start this build with: lore stop, then lore start",
                 handshake.daemon_version,
                 handshake.api_version,
                 lore_core::API_VERSION
@@ -1073,11 +1388,11 @@ impl Client {
         let response = request.send().await.map_err(|err| {
             if self.heartbeat_fresh {
                 anyhow::anyhow!(
-                    "the lore daemon published a handshake but is not answering at {url} ({err}).\nIt may have crashed; restart it with: lore daemon"
+                    "the lore daemon published a handshake but is not answering at {url} ({err}).\nIt may have crashed; restart it with: lore start"
                 )
             } else {
                 anyhow::anyhow!(
-                    "the lore daemon's handshake is stale and it is not answering at {url} ({err}).\nStart it with: lore daemon"
+                    "the lore daemon's handshake is stale and it is not answering at {url} ({err}).\nStart it with: lore start"
                 )
             }
         })?;
@@ -1998,6 +2313,37 @@ mod tests {
             .args
     }
 
+    /// The give-up path, which the 180-second constant makes untestable in
+    /// place: waiting on a server that never arrives has to *end*, and it has
+    /// to end by returning rather than by failing — the daemon starts either
+    /// way, lexical-only, which is the designed degradation (D-0007).
+    #[tokio::test]
+    async fn waiting_for_an_endpoint_that_never_arrives_gives_up_and_returns() {
+        // Port 1 refuses on connect, so each probe fails immediately and the
+        // loop is bounded by the deadline rather than by a socket timeout.
+        let client = lore::embed::EmbedClient::new(lore::embed::EmbedSettings {
+            retry: lore::embed::RetryPolicy {
+                max_attempts: 1,
+                ..Default::default()
+            },
+            request_timeout: EMBED_PROBE_TIMEOUT,
+            ..lore::embed::EmbedSettings::from_config(&lore::config::EmbeddingsConfig {
+                endpoint: Some("http://127.0.0.1:1/v1".into()),
+                ..Default::default()
+            })
+            .expect("a configured endpoint yields settings")
+        })
+        .expect("probe client builds");
+
+        let timeout = Duration::from_millis(500);
+        let started = std::time::Instant::now();
+        assert!(!await_embed_ready(&client, timeout).await);
+        assert!(
+            started.elapsed() < timeout * 10,
+            "the wait outlived its own deadline by an order of magnitude"
+        );
+    }
+
     #[test]
     fn every_flag_maps_onto_the_wire_request() {
         let request = SearchRequest::from(&parse_args(&[
@@ -2061,7 +2407,7 @@ mod tests {
         let err = Client::connect_at(&data_dir).unwrap_err();
         let text = format!("{err}");
         assert!(text.contains("the lore daemon is not running"), "{text}");
-        assert!(text.contains("Start it with: lore daemon"), "{text}");
+        assert!(text.contains("Start it with: lore start"), "{text}");
         assert!(text.contains("daemon.json"), "{text}");
     }
 

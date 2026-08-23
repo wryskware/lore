@@ -96,12 +96,12 @@ impl Endpoint {
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
     #[error(
-        "the lore daemon is not running ({0}). Ask the user to start it with `lore daemon`, then retry."
+        "the lore daemon is not running ({0}). Ask the user to start it with `lore start`, then retry."
     )]
     NotRunning(String),
 
     #[error(
-        "the lore daemon published a handshake but is not answering at {url} ({source}). It may have crashed or be shutting down; ask the user to (re)start it with `lore daemon`."
+        "the lore daemon published a handshake but is not answering at {url} ({source}). It may have crashed or be shutting down; ask the user to (re)start it with `lore start`."
     )]
     Unreachable {
         url: String,
@@ -109,7 +109,7 @@ pub enum DaemonError {
     },
 
     #[error(
-        "the lore daemon published a stale handshake and is not answering at {url} ({source}). It is probably dead; ask the user to start it with `lore daemon`."
+        "the lore daemon published a stale handshake and is not answering at {url} ({source}). It is probably dead; ask the user to start it with `lore start`."
     )]
     Stale {
         url: String,
@@ -290,7 +290,7 @@ mod tests {
         let text = err.to_string();
         assert!(text.starts_with("the lore daemon is not running"), "{text}");
         assert!(text.contains("no daemon handshake at"), "{text}");
-        assert!(text.contains("`lore daemon`"), "{text}");
+        assert!(text.contains("`lore start`"), "{text}");
         // M1: never offer to start it ourselves.
         assert!(!text.contains("starting"), "{text}");
     }

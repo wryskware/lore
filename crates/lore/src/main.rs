@@ -17,6 +17,13 @@ struct Cli {
 enum Command {
     /// Run the daemon in the foreground.
     Daemon,
+    /// Start the embedding server and the daemon in the background, and wait
+    /// until they answer.
+    ///
+    /// Idempotent: anything already up is reported, not started twice. The
+    /// embedding server is only launched if `[embeddings] start_command` names
+    /// one, and nothing here supervises it afterwards.
+    Start,
     /// Stop the running daemon cleanly and wait until it is gone.
     ///
     /// Killing it instead leaves a fresh handshake behind, which every client
@@ -113,6 +120,7 @@ fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
     match args.command {
         Command::Daemon => daemon(),
+        Command::Start => cli::run(cli::start()),
         Command::Stop => cli::run(cli::stop()),
         Command::Add { path, name } => cli::run(cli::add(path, name)),
         Command::Remove { project } => cli::run(cli::remove(project)),
