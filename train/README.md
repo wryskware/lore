@@ -58,22 +58,16 @@ first and it is absolute.
   number meaningless, and the numbers are the only reason RCB exists.
 - Whatever corpus is ultimately chosen as retrieval-eval corpus two.
 
-**In training data, conditionally:** the 26 repositories and 260 questions of
+**In training data:** the 26 repositories and 260 questions of
 `TIGER-Lab/SWE-QA-Pro-Bench`.
 
-The condition is real and is not yet discharged.
-`design/7_Research/2026-08-27_second-corpus-survey.md` flags the coupling
-directly: SWE-QA-Pro is the *second-ranked* candidate for the retrieval eval,
-and if it is chosen for eval then neither it nor its sibling SFT trajectories
-can be training data. The survey's parent leans toward **SWE Atlas** for eval
-precisely because that keeps SWE-QA-Pro free for training — but that is a
-leaning in a research report, not an accepted decision, and Wrysk has not ruled.
-
-**So: if SWE-QA-Pro-Bench is later picked as the eval corpus, every batch
-generated from it must be discarded.** That is the risk this directory carries.
-It is cheap to carry — the manifest records the question source per batch, so
-identifying and deleting the affected rows is mechanical — and the alternative
-is blocking the whole LoRA track behind an unrelated decision.
+The condition this depended on is discharged: **Wrysk chose SWE Atlas as the
+second eval corpus (2026-08-27, in session)**, which is exactly what clears
+SWE-QA-Pro — repos, questions, and sibling SFT trajectories — for training
+use. The coupling itself is recorded in
+`design/7_Research/2026-08-27_second-corpus-survey.md`. Should that ruling
+ever be reversed, the manifest records the question source per batch, so
+identifying and deleting the affected rows is mechanical.
 
 ### Separation from `bench/rcb/`
 
