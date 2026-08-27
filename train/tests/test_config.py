@@ -61,10 +61,6 @@ def test_an_empty_path_stays_empty(tmp_path):
     assert common.load_config(str(path)).get_path("lore", "state_dir") == ""
 
 
-@pytest.mark.xfail(reason="`_merge` copies one level only, so any section the "
-                          "TOML does not mention is returned aliased to the "
-                          "module-level `common.DEFAULTS` and can be mutated "
-                          "process-wide")
 def test_a_loaded_config_does_not_alias_the_module_defaults(tmp_path):
     """Latent today -- nothing in the three stages writes to its config -- but a
     single `--min-file-recall` override flag, or two batches converted in one

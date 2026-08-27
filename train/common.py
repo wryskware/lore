@@ -11,6 +11,7 @@ bench/rcb".
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import datetime as _dt
 import hashlib
@@ -149,7 +150,11 @@ DEFAULTS: dict = {
 
 
 def _merge(base: dict, over: dict) -> dict:
-    out = dict(base)
+    # Deep-copied, not aliased: a section the TOML never mentions must come
+    # back as a private copy, or the first caller to write through the config
+    # (an override flag, a second batch in one process) silently rewrites the
+    # module-level DEFAULTS for everyone after it.
+    out = {k: copy.deepcopy(v) for k, v in base.items()}
     for key, value in over.items():
         if isinstance(value, dict) and isinstance(out.get(key), dict):
             out[key] = _merge(out[key], value)
