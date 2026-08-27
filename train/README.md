@@ -399,6 +399,7 @@ stays green and the disagreement stays visible.
 | `test_question_echo.py` | the 80-character echo threshold, at and either side of the boundary, checked against the validator rule it is pinned to |
 | `test_row_structure.py` | the emitted row against the output gate — string `arguments`, byte-identical `tools`, string `content`, a byte-stable JSON round trip, and the mask |
 | `test_manifest.py` | Decision 2 — what the pin records, what rides in `meta`, and each stage's refusal to run without its inputs |
+| `test_output_gate.py` | Decision 6 — how the referenced validator is invoked (against a stub) and the read-only daemon preflight |
 | `test_config.py` | the shipped example config and the documented default thresholds |
 | `test_dry_run_e2e.py` | `--dry-run` through all three stages in a subprocess, in a tmpdir |
 
