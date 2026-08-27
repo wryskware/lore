@@ -98,7 +98,21 @@ fn expand_term(term: &str, prefix: bool) -> String {
     format!("(\"{term}\"{star} OR \"{phrase}\"{star})")
 }
 
-/// The same terms joined with `OR` instead of by juxtaposition.
+/// The terms as one conjunction: every term must match.
+///
+/// Spelled with an explicit `AND` rather than by juxtaposition, and that is not
+/// a style choice. FTS5's implicit-AND is a rule about *adjacent phrases*: the
+/// moment either side of the join is a parenthesized expression — which is
+/// exactly what [`expand_term`] produces for a compound term — juxtaposition
+/// stops parsing and the whole query is an `fts5: syntax error`. `"how"
+/// ("a" OR "b")` is a syntax error; `"how" AND ("a" OR "b")` is the same
+/// conjunction FTS5 always meant. Writing the operator makes the expression
+/// legal whatever its operands turn out to be.
+pub(crate) fn and_fts_query(terms: &[String]) -> String {
+    terms.join(" AND ")
+}
+
+/// The same terms joined with `OR` instead of `AND`.
 ///
 /// FTS5 reads `"a" "b"` as `"a" AND "b"`, so a five-word natural-language
 /// question only matches a chunk containing all five words — which for prose
@@ -228,7 +242,24 @@ mod tests {
     /// The conjunctive expression `lexical_search` builds first, so these
     /// assertions read as the string that actually reaches FTS5.
     fn sanitize_fts_query(input: &str) -> String {
-        sanitize_fts_terms(input).join(" ")
+        and_fts_query(&sanitize_fts_terms(input))
+    }
+
+    /// The join has to be an explicit operator, because juxtaposition is only
+    /// legal between phrases: `"how" ("a" OR "b")` is an `fts5: syntax error`,
+    /// and a query mixing a plain word with a compound one is the *ordinary*
+    /// case, not an edge.
+    #[test]
+    fn a_mixed_query_joins_with_an_explicit_operator() {
+        let terms = sanitize_fts_terms("how does _dispatch_fanout work");
+        assert_eq!(
+            and_fts_query(&terms),
+            r#""how" AND "does" AND ("_dispatch_fanout" OR "dispatch fanout") AND "work""#
+        );
+        assert_eq!(
+            or_fts_query(&terms),
+            r#""how" OR "does" OR ("_dispatch_fanout" OR "dispatch fanout") OR "work""#
+        );
     }
 
     /// A compound term keeps its verbatim branch — that is the exact-identifier
@@ -242,18 +273,19 @@ mod tests {
         );
         assert_eq!(
             sanitize_fts_query("Board.Update"),
-            "\"Board\" \"Update\"".to_string(),
+            "\"Board\" AND \"Update\"".to_string(),
             "`.` already separates, and neither half is compound"
         );
     }
 
-    /// Words that were never compound must produce the expression they always
-    /// did: prose queries pay nothing for the identifier machinery.
+    /// Words that were never compound must reach FTS5 as themselves: prose
+    /// queries pay nothing for the identifier machinery beyond the operator
+    /// that was always implied.
     #[test]
     fn plain_words_are_left_exactly_as_they_were() {
         assert_eq!(
             sanitize_fts_query("how does the daemon own the index"),
-            "\"how\" \"does\" \"the\" \"daemon\" \"own\" \"the\" \"index\""
+            r#""how" AND "does" AND "the" AND "daemon" AND "own" AND "the" AND "index""#
         );
         assert_eq!(sanitize_fts_query("café"), "\"café\"");
     }
@@ -297,7 +329,10 @@ mod tests {
     fn sanitize_strips_operator_syntax() {
         assert_eq!(sanitize_fts_query("a AND ("), "\"a\"");
         assert_eq!(sanitize_fts_query("\"unterminated"), "\"unterminated\"");
-        assert_eq!(sanitize_fts_query("NEAR(a b, 3)"), "\"a\" \"b\" \"3\"");
+        assert_eq!(
+            sanitize_fts_query("NEAR(a b, 3)"),
+            "\"a\" AND \"b\" AND \"3\""
+        );
         assert_eq!(sanitize_fts_query(")))"), "");
         assert_eq!(sanitize_fts_query("   "), "");
     }

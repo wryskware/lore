@@ -50,7 +50,7 @@ use crate::types::{
     Chunk, ChunkId, ChunkKind, DesignStatus, SourceKind, VaultMeta, authority_tier,
 };
 
-use query::{filter_sql, or_fts_query, sanitize_fts_terms};
+use query::{and_fts_query, filter_sql, or_fts_query, sanitize_fts_terms};
 use vector::{Scored, TopK};
 
 /// Opaque project handle. Stable for the life of the database.
@@ -1372,7 +1372,7 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<SearchHit>> {
         let terms = sanitize_fts_terms(query);
-        let match_expr = terms.join(" ");
+        let match_expr = and_fts_query(&terms);
         if match_expr.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }

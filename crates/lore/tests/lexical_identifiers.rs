@@ -199,6 +199,31 @@ fn prose_is_still_found_by_its_plain_words() {
     );
 }
 
+/// The shape that actually reaches the daemon: a sentence mixing plain words
+/// with an identifier, long enough that the conjunction misses and the
+/// disjunctive retry runs. Both joins have to survive a parenthesized operand
+/// — expanding a term into `("a" OR "b c")` and then relying on FTS5's
+/// implicit AND produces `fts5: syntax error`, and unit tests over the
+/// expression string cannot tell you that. Only executing it can.
+#[test]
+fn a_question_mixing_prose_and_an_identifier_executes_under_both_joins() {
+    let mut corpus = identifiers();
+
+    // Conjunction: every term is present in one chunk.
+    assert_eq!(
+        corpus.search("fn _dispatch_fanout msg"),
+        vec!["src/messaging.rs".to_string()]
+    );
+    // No chunk holds all of these, so this is the disjunctive retry.
+    let hits =
+        corpus.search("how does _dispatch_fanout reach every ConcurrentOrchestration worker");
+    assert!(
+        hits.contains(&"src/messaging.rs".to_string())
+            && hits.contains(&"src/runner.rs".to_string()),
+        "the relaxed pass must still run and rank both identifiers; got {hits:?}"
+    );
+}
+
 /// Anchors carry symbol names, which are the densest identifiers there are,
 /// and they are indexed at the highest BM25 weight. A subword of a symbol name
 /// has to be reachable even when the body never spells it out.
