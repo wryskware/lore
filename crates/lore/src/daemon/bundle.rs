@@ -3022,7 +3022,7 @@ mod tests {
 
         let bundle = super::assemble(
             "RunAsync thread",
-            &response(&[doc.clone()]),
+            &response(std::slice::from_ref(&doc)),
             &[definition(found, "RunAsync", &doc, 0)],
             &fixture.1,
             40_000,
@@ -3117,10 +3117,16 @@ mod tests {
         found.chunk_id = "definition".into();
 
         let query = "alpha bravo zulu yankee";
-        let off = assemble(query, &response(&[doc.clone()]), &fixture.1, 40_000, 24);
+        let off = assemble(
+            query,
+            &response(std::slice::from_ref(&doc)),
+            &fixture.1,
+            40_000,
+            24,
+        );
         let on = super::assemble(
             query,
-            &response(&[doc.clone()]),
+            &response(std::slice::from_ref(&doc)),
             &[definition(found, "Zulu.Yankee", &doc, 0)],
             &fixture.1,
             40_000,
@@ -3218,7 +3224,7 @@ mod tests {
 
         let bundle = super::assemble(
             "widget",
-            &response(&[doc.clone()]),
+            &response(std::slice::from_ref(&doc)),
             &[definition(found, "Widget", &doc, 0)],
             &fixture.1,
             40_000,
@@ -3257,7 +3263,7 @@ mod tests {
         // 1000) is 1400 characters, so exactly one definition fits.
         let bundle = super::assemble(
             "line",
-            &response(&[doc.clone()]),
+            &response(std::slice::from_ref(&doc)),
             &[
                 definition(first, "One", &doc, 0),
                 definition(second, "Two", &doc, 0),
@@ -3291,7 +3297,7 @@ mod tests {
 
         let bundle = super::assemble(
             "quantum chromodynamics lattice gauge",
-            &response(&[doc.clone()]),
+            &response(std::slice::from_ref(&doc)),
             &[definition(found, "Charlie.Delta", &doc, 0)],
             &fixture.1,
             4000,
@@ -3349,7 +3355,7 @@ mod tests {
 
         let bundle = super::assemble(
             "update line",
-            &response(&[doc.clone()]),
+            &response(std::slice::from_ref(&doc)),
             &[followed],
             &fixture.1,
             40_000,
@@ -3379,7 +3385,7 @@ mod tests {
 
         let bundle = super::assemble(
             "line",
-            &response(&[doc.clone()]),
+            &response(std::slice::from_ref(&doc)),
             &[definition(found, "Widget", &doc, 0)],
             &fixture.1,
             40_000,
