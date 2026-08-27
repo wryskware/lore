@@ -1,0 +1,19 @@
+---
+source: crates/lore-mcp/tests/mcp_golden.rs
+assertion_line: 419
+expression: rendered
+---
+VERDICT: weak (1 verified span(s), but only 1 of 2 query terms appear in them -- treat as partial, and find the rest yourself)
+NO MATCH FOR: rebuild
+DROPPED (stale, 1): design/99_Scratch/2026-08-14_notes.md:3-9
+=== Assets/Scripts/Board.cs:118-126 [Board.Update] ===
+118      private bool _dirty;
+119  
+120      void Update()
+121      {
+122          if (!_dirty) return;
+123          Rebuild();
+124          _dirty = false;
+125      }
+126  
+FURTHER READING: design/4_Interfaces/4.1_MCP_Surface.md:15-18

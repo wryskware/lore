@@ -536,3 +536,121 @@ pub struct ExpandResponse {
     /// Full-file line count, so the caller knows whether more exists.
     pub file_lines: u32,
 }
+
+// ---------------------------------------------------------------------------
+// POST /v1/bundle
+// ---------------------------------------------------------------------------
+
+/// One query in, one finished evidence bundle out.
+///
+/// The whole of `search` → verify → widen → merge → budget → verdict happens
+/// daemon-side, because only the daemon owns index state *and* the corpus on
+/// disk (D-0003). A caller that assembled its own bundle would be reading the
+/// files a second process is indexing, and asserting verification it cannot
+/// perform.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BundleRequest {
+    /// The question, written by the calling agent. There is deliberately no
+    /// query-rewriting layer anywhere between here and retrieval.
+    pub query: String,
+    /// Scope by name or id. **Required**, exactly as for [`SearchRequest`],
+    /// unless [`Self::project_key`] is given.
+    pub project: Option<String>,
+    /// Stable opaque project key; takes precedence over [`Self::project`].
+    #[serde(default)]
+    pub project_key: Option<String>,
+    /// Roughly how many tokens of rendered source the bundle may carry.
+    /// Overflow degrades whole spans to further reading — a span is never
+    /// truncated mid-block.
+    pub budget_tokens: Option<u32>,
+    /// Ranked chunks considered before verification and budgeting. Well above
+    /// what the budget renders on purpose: merging collapses hits, and the
+    /// surplus becomes further reading rather than being discarded.
+    pub limit: Option<u32>,
+}
+
+/// The bundle: a rendered text block for an agent, and the same content in
+/// fields for anything that would otherwise have to parse it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BundleResponse {
+    /// The whole bundle as the consuming agent should see it: verdict line,
+    /// uncovered terms, line-numbered spans, further reading.
+    pub text: String,
+    /// Echoed back so a stored bundle carries the query that produced it.
+    pub query: String,
+    /// `found`, `weak` or `none` — computed from term coverage, never from
+    /// the retrieval score (which under RRF is a pure function of rank and
+    /// therefore does not fall when a query matches nothing).
+    pub verdict: String,
+    /// The parenthesized half of the verdict line, already worded.
+    pub verdict_detail: String,
+    /// Fraction of [`Self::terms`] that appear in what came back.
+    pub coverage: f64,
+    /// Content words of the query, after stopwording.
+    pub terms: Vec<String>,
+    pub terms_covered: Vec<String>,
+    /// Always reported, and always printed when nonempty: this is the honest
+    /// gap signal that tells a caller what it still has to go and find.
+    pub terms_uncovered: Vec<String>,
+    /// True when vectors did not participate (D-0007). Recall may be lower.
+    pub lexical_only: bool,
+    pub hits_returned: u32,
+    pub hits_verified: u32,
+    pub hits_rejected: u32,
+    /// Hits that failed verification, grouped by mechanical reason.
+    pub dropped: Vec<BundleDropped>,
+    /// The spans actually rendered into [`Self::text`], in rank order.
+    pub spans: Vec<BundleSpan>,
+    /// Verified spans that did not fit the budget, or were too large to be
+    /// evidence rather than a pointer.
+    pub further_reading: Vec<BundleSpanRef>,
+    pub spans_widened: u32,
+    pub spans_after_merge: u32,
+    pub spans_oversized: u32,
+    /// Score of the highest-ranked *verified* hit. Reported for diagnostics
+    /// only — see [`Self::verdict`] for why it is not thresholded.
+    pub top_score: Option<f64>,
+    pub bundle_chars: u32,
+    pub bundle_tokens_est: u32,
+    /// The budget actually applied, after defaulting.
+    pub budget_tokens: u32,
+    /// The chunk limit actually applied, after defaulting and clamping.
+    pub limit: u32,
+}
+
+/// One rendered span.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BundleSpan {
+    /// Project-relative path, forward slashes.
+    pub path: String,
+    /// 1-based inclusive line span, as rendered.
+    pub line_start: u32,
+    pub line_end: u32,
+    /// Symbol path or heading trail, exactly as the index recorded it.
+    /// Absent when the chunk carries neither.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// How many ranked hits folded into this span (1 = no merge).
+    pub merged: u32,
+    /// The highest-ranked member's chunk id, so a caller can `expand` it.
+    pub chunk_id: String,
+}
+
+/// A pointer to something verified but not rendered.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BundleSpanRef {
+    pub path: String,
+    pub line_start: u32,
+    pub line_end: u32,
+}
+
+/// Hits refused by verification, by reason: `missing`, `unreadable`, `range`
+/// or `stale`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BundleDropped {
+    pub reason: String,
+    /// Hits refused for this reason — may exceed `paths.len()`, which is
+    /// deduplicated and capped for display.
+    pub count: u32,
+    pub paths: Vec<String>,
+}

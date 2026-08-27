@@ -1537,3 +1537,128 @@ async fn oversized_bodies_are_rejected_rather_than_buffered() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
+
+// ---------------------------------------------------------------------------
+// bundle
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn bundle_answers_with_verified_spans_read_from_disk() {
+    let h = harness();
+    populate_standard_tree(&h.fixture);
+    full_scan(&h.fixture.context(), &h.fixture.project);
+
+    let (status, body) = post(
+        &h.router,
+        "/v1/bundle",
+        json!({ "query": "the daemon owns index state", "project": "demo" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["verdict"], "found", "{body}");
+
+    let text = body["text"].as_str().unwrap();
+    assert!(text.starts_with("VERDICT: found ("), "{text}");
+    // Lexical-only degradation is visible here exactly as it is in `search`:
+    // this harness configures no embedding endpoint.
+    assert_eq!(body["lexical_only"], true);
+    assert!(text.contains("lexical-only degradation"), "{text}");
+    // The span header names the file, the span and the chunker's own label,
+    // and the body carries real line numbers off disk.
+    assert!(text.contains("=== docs/design.md:"), "{text}");
+    assert!(text.contains("The daemon owns index state."), "{text}");
+    assert!(text.contains("Topology"), "{text}");
+
+    let spans = body["spans"].as_array().unwrap();
+    assert!(!spans.is_empty(), "{body}");
+    let top = &spans[0];
+    assert_eq!(top["path"], "docs/design.md");
+    assert!(top["line_start"].as_u64().unwrap() >= 1);
+    assert!(top["chunk_id"].as_str().unwrap().len() >= 32);
+    // Nothing in a freshly-scanned tree can be stale, missing or out of range.
+    assert_eq!(body["hits_rejected"], 0, "{body}");
+    assert!(body["dropped"].as_array().unwrap().is_empty(), "{body}");
+    assert!(
+        body["bundle_tokens_est"].as_u64().unwrap() <= 4000,
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn a_bundle_that_covers_nothing_says_so_and_names_the_gap() {
+    let h = harness();
+    populate_standard_tree(&h.fixture);
+    full_scan(&h.fixture.context(), &h.fixture.project);
+
+    let (status, body) = post(
+        &h.router,
+        "/v1/bundle",
+        json!({ "query": "quantum chromodynamics lattice gauge", "project": "demo" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // Whatever the retriever's score said, no query term is anywhere in what
+    // came back — which is the failure a score threshold cannot see.
+    assert_eq!(body["verdict"], "none", "{body}");
+    assert_eq!(body["coverage"], 0.0, "{body}");
+    let text = body["text"].as_str().unwrap();
+    assert!(
+        text.contains("NO MATCH FOR: quantum, chromodynamics, lattice, gauge"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn bundle_is_scoped_and_says_how_to_scope_it() {
+    let h = harness();
+    populate_standard_tree(&h.fixture);
+    full_scan(&h.fixture.context(), &h.fixture.project);
+
+    let (status, body) = post(&h.router, "/v1/bundle", json!({ "query": "daemon" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("lore add <path>"),
+        "{body}"
+    );
+
+    let (status, body) = post(
+        &h.router,
+        "/v1/bundle",
+        json!({ "query": "daemon", "project": "nope" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["message"].as_str().unwrap().contains("nope"), "{body}");
+}
+
+#[tokio::test]
+async fn a_bundle_budget_of_one_span_demotes_the_rest_to_further_reading() {
+    let h = harness();
+    populate_standard_tree(&h.fixture);
+    full_scan(&h.fixture.context(), &h.fixture.project);
+
+    let (_, body) = post(
+        &h.router,
+        "/v1/bundle",
+        json!({
+            "query": "daemon watcher alpha beta demo project",
+            "project": "demo",
+            "budget_tokens": 1
+        }),
+    )
+    .await;
+    // One span always renders, and everything past it is a pointer rather
+    // than a truncated block.
+    assert_eq!(body["spans"].as_array().unwrap().len(), 1, "{body}");
+    assert!(
+        !body["further_reading"].as_array().unwrap().is_empty(),
+        "{body}"
+    );
+    assert!(
+        body["text"].as_str().unwrap().contains("FURTHER READING: "),
+        "{body}"
+    );
+}

@@ -1,11 +1,46 @@
 ---
 source: crates/lore-mcp/tests/mcp_golden.rs
-assertion_line: 326
+assertion_line: 390
 expression: rendered
 ---
 {
   "instructions": "Lore indexes this project's code and design vault locally. Search it before answering questions about this codebase or about past design decisions, and prefer sources whose effective authority is `decided` over prose that merely sounds confident - a document declaring itself decided has not earned that unless Lore validated it against the project's decision ledger, and it will say so when it did not. Every tool here is scoped to the one project this session is in; other projects on this machine are not reachable and asking for them is not an option. Registering projects and forcing a reindex are deliberately not available either: ask the user to run `lore add <path>` or `lore index`.",
   "tools": [
+    {
+      "name": "bundle",
+      "description": "One call that answers a retrieval question outright: instead of ranked pointers you get a finished evidence bundle - a verdict line, then the verified source spans themselves, line-numbered and read from the files on disk at the moment you asked. Use it when you want the answer rather than a place to start looking; use `search` when you want to steer the retrieval yourself (path/language/status filters, or several narrowing passes). Everything in the bundle has been checked mechanically: the path resolves inside the project, the line range exists, and the text shown is what is in the working tree - so you may quote and edit from it without expanding first, which is the one thing `search` results never permit. Read the header before the code. `VERDICT: found` means the query's terms are covered by the spans; `weak` and `none` mean they are not, and the spans below may be the nearest misses rather than the answer. `NO MATCH FOR:` names query terms nothing in the bundle covers - those are yours to go and find, and the honest gap is the point of the line. `FURTHER READING:` lists verified paths that did not fit the budget; open them yourself if the rendered spans fall short. `DROPPED` names hits the verifier refused, `stale` meaning the index pointer no longer matches the file. Note that the verdict is a claim about term coverage, not about correctness: a `found` bundle can still be missing the piece you need, and the way to tell is to read it.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "required": [
+          "query"
+        ],
+        "type": "object",
+        "properties": {
+          "query": {
+            "description": "The whole question, in your own words. Write it as you would brief a colleague - several clauses is better than a keyword, because the verdict reports which parts of it the answer did not cover.",
+            "type": "string"
+          },
+          "budget_tokens": {
+            "description": "Roughly how many tokens of source the bundle may carry; default 4000. Spans that do not fit are listed as further reading rather than cut off halfway.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint32",
+            "minimum": 0
+          },
+          "limit": {
+            "description": "How many ranked chunks to consider before verifying and budgeting; default 24. Raising it buys breadth in the further-reading list, not longer spans.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint32",
+            "minimum": 0
+          }
+        }
+      }
+    },
     {
       "name": "expand",
       "description": "Read a search hit in full, plus surrounding context lines. This is the 'now actually read it' step: search returns truncated excerpts, so do not quote or edit code from a search result without expanding it first.",

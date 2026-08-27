@@ -66,6 +66,7 @@ async fn stub_daemon_recording() -> (String, Requests) {
             }),
         )
         .route("/v1/expand", post(|| async { Json(canned_expand()) }))
+        .route("/v1/bundle", post(|| async { Json(canned_bundle()) }))
         .route("/v1/status", get(|| async { Json(canned_status()) }))
         // Every tool call resolves its project first now; without this route
         // the stub would answer nothing at all.
@@ -180,6 +181,69 @@ fn canned_expand() -> ExpandResponse {
                return;\n        Rebuild();\n        _dirty = false;\n    }\n"
             .into(),
         file_lines: 412,
+    }
+}
+
+/// A bundle whose header carries every line an agent has to read before the
+/// code: a `weak` verdict, the uncovered half of the query, a hit the verifier
+/// refused as stale, and an overflow pointer. The proxy passes `text` through
+/// untouched, so this snapshot is really an assertion that it does not
+/// reformat, wrap or annotate what the daemon rendered.
+fn canned_bundle() -> lore_core::BundleResponse {
+    let text = "VERDICT: weak (1 verified span(s), but only 1 of 2 query terms appear in them -- \
+                treat as partial, and find the rest yourself)\n\
+                NO MATCH FOR: rebuild\n\
+                DROPPED (stale, 1): design/99_Scratch/2026-08-14_notes.md:3-9\n\
+                === Assets/Scripts/Board.cs:118-126 [Board.Update] ===\n\
+                118      private bool _dirty;\n\
+                119  \n\
+                120      void Update()\n\
+                121      {\n\
+                122          if (!_dirty) return;\n\
+                123          Rebuild();\n\
+                124          _dirty = false;\n\
+                125      }\n\
+                126  \n\
+                FURTHER READING: design/4_Interfaces/4.1_MCP_Surface.md:15-18\n";
+    lore_core::BundleResponse {
+        text: text.into(),
+        query: "board update rebuild".into(),
+        verdict: "weak".into(),
+        verdict_detail: "1 verified span(s), but only 1 of 2 query terms appear in them".into(),
+        coverage: 0.5,
+        terms: vec!["board".into(), "rebuild".into()],
+        terms_covered: vec!["board".into()],
+        terms_uncovered: vec!["rebuild".into()],
+        lexical_only: false,
+        hits_returned: 3,
+        hits_verified: 2,
+        hits_rejected: 1,
+        dropped: vec![lore_core::BundleDropped {
+            reason: "stale".into(),
+            count: 1,
+            paths: vec!["design/99_Scratch/2026-08-14_notes.md:3-9".into()],
+        }],
+        spans: vec![lore_core::BundleSpan {
+            path: "Assets/Scripts/Board.cs".into(),
+            line_start: 118,
+            line_end: 126,
+            label: Some("Board.Update".into()),
+            merged: 1,
+            chunk_id: "4e77ba0193ab0123456789abcdef0123456789abcdef0123456789abcdef0123".into(),
+        }],
+        further_reading: vec![lore_core::BundleSpanRef {
+            path: "design/4_Interfaces/4.1_MCP_Surface.md".into(),
+            line_start: 15,
+            line_end: 18,
+        }],
+        spans_widened: 1,
+        spans_after_merge: 2,
+        spans_oversized: 0,
+        top_score: Some(0.61208),
+        bundle_chars: text.len() as u32,
+        bundle_tokens_est: (text.len() as u32).div_ceil(4),
+        budget_tokens: 4000,
+        limit: 24,
     }
 }
 
@@ -339,6 +403,20 @@ async fn search_renders_vault_authority_and_a_truncated_code_hit() {
     )
     .await;
     insta::assert_snapshot!("search_vault_and_code", rendered);
+}
+
+/// The bundle reaches the agent exactly as the daemon rendered it: verdict,
+/// gap, refusals, spans, further reading. Nothing here re-renders it, which is
+/// the property this snapshot exists to hold.
+#[tokio::test]
+async fn bundle_passes_the_daemons_rendered_block_through_untouched() {
+    let rendered = call_tool(
+        against_stub().await,
+        "bundle",
+        json!({ "query": "board update rebuild", "budget_tokens": 4000 }),
+    )
+    .await;
+    insta::assert_snapshot!("bundle_evidence", rendered);
 }
 
 /// The agent cannot ask for a project, so the server has to supply one — and

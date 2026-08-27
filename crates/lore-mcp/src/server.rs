@@ -1,5 +1,10 @@
-//! The MCP surface (design 4.1): `search`, `expand`, `status`. Three tools,
-//! because those three compose — not because of a tool-count budget.
+//! The MCP surface (design 4.1): `search`, `expand`, `status`, and `bundle`.
+//! The first three compose — search, then read, then diagnose — which is why
+//! there are three of them and not a tool-count budget. `bundle` sits
+//! *alongside* them rather than replacing any: it answers a question outright
+//! where they let an agent steer, and the two are meant to be compared by hosts
+//! rather than silently switched between
+//! (`design/4_Interfaces/2026-08-27_bundle-mcp-tool.md`).
 //!
 //! Registration and reindex are deliberately absent: they are CLI-only
 //! (`lore add`, `lore index`), so an agent cannot enroll a random directory
@@ -38,7 +43,7 @@ use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::Deserialize;
 use tokio::sync::OnceCell;
 
-use lore_core::{ExpandRequest, ProjectInfo, SearchRequest};
+use lore_core::{BundleRequest, ExpandRequest, ProjectInfo, SearchRequest};
 
 use crate::daemon::{DaemonClient, DaemonError, Endpoint};
 use crate::render;
@@ -164,6 +169,43 @@ pub struct ExpandParams {
                        a default and a ceiling."
     )]
     pub context_lines: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BundleParams {
+    #[schemars(
+        description = "The whole question, in your own words. Write it as you would brief a \
+                       colleague - several clauses is better than a keyword, because the verdict \
+                       reports which parts of it the answer did not cover."
+    )]
+    pub query: String,
+    #[schemars(
+        description = "Roughly how many tokens of source the bundle may carry; default 4000. \
+                       Spans that do not fit are listed as further reading rather than cut off \
+                       halfway."
+    )]
+    pub budget_tokens: Option<u32>,
+    #[schemars(
+        description = "How many ranked chunks to consider before verifying and budgeting; \
+                       default 24. Raising it buys breadth in the further-reading list, not \
+                       longer spans."
+    )]
+    pub limit: Option<u32>,
+}
+
+impl BundleParams {
+    /// The wire request, scoped to the project this server resolved. Same rule
+    /// as [`SearchParams::into_request`]: the key goes on the wire and the
+    /// ambiguous display name is left out.
+    fn into_request(self, project_key: &str) -> BundleRequest {
+        BundleRequest {
+            query: self.query,
+            project: None,
+            project_key: Some(project_key.to_string()),
+            budget_tokens: self.budget_tokens,
+            limit: self.limit,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -321,6 +363,43 @@ impl LoreServer {
     }
 
     #[tool(
+        description = "One call that answers a retrieval question outright: instead of ranked \
+                       pointers you get a finished evidence bundle - a verdict line, then the \
+                       verified source spans themselves, line-numbered and read from the files \
+                       on disk at the moment you asked. Use it when you want the answer rather \
+                       than a place to start looking; use `search` when you want to steer the \
+                       retrieval yourself (path/language/status filters, or several narrowing \
+                       passes). Everything in the bundle has been checked mechanically: the path \
+                       resolves inside the project, the line range exists, and the text shown is \
+                       what is in the working tree - so you may quote and edit from it without \
+                       expanding first, which is the one thing `search` results never permit. \
+                       Read the header before the code. `VERDICT: found` means the query's terms \
+                       are covered by the spans; `weak` and `none` mean they are not, and the \
+                       spans below may be the nearest misses rather than the answer. \
+                       `NO MATCH FOR:` names query terms nothing in the bundle covers - those \
+                       are yours to go and find, and the honest gap is the point of the line. \
+                       `FURTHER READING:` lists verified paths that did not fit the budget; open \
+                       them yourself if the rendered spans fall short. `DROPPED` names hits the \
+                       verifier refused, `stale` meaning the index pointer no longer matches the \
+                       file. Note that the verdict is a claim about term coverage, not about \
+                       correctness: a `found` bundle can still be missing the piece you need, \
+                       and the way to tell is to read it."
+    )]
+    async fn bundle(&self, Parameters(params): Parameters<BundleParams>) -> CallToolResult {
+        let scope = match self.scope().await {
+            Ok(scope) => scope,
+            Err(err) => return failed(&err),
+        };
+        // The text is the daemon's, verbatim. Rendering a bundle here would put
+        // a second renderer in front of the same content, and the one that
+        // verified the spans is the one that should describe them.
+        match self.client.bundle(&params.into_request(&scope.key)).await {
+            Ok(response) => text(response.text),
+            Err(err) => failed(&err),
+        }
+    }
+
+    #[tool(
         description = "Index health for this session's project: daemon version, index \
                        generation, the project's file/chunk/embedding coverage, and the \
                        embedding endpoint's state. Check this when search comes back empty, \
@@ -447,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn all_three_tools_are_registered_and_registration_tools_are_not() {
+    fn every_query_tool_is_registered_and_registration_tools_are_not() {
         let router = LoreServer::tool_router();
         let mut names: Vec<String> = router
             .list_all()
@@ -455,7 +534,24 @@ mod tests {
             .map(|tool| tool.name.to_string())
             .collect();
         names.sort();
-        assert_eq!(names, ["expand", "search", "status"]);
+        assert_eq!(names, ["bundle", "expand", "search", "status"]);
+    }
+
+    #[test]
+    fn bundle_params_map_onto_the_wire_request_and_carry_the_servers_scope() {
+        let request = BundleParams {
+            query: "how does the indexer decide what to re-chunk".into(),
+            budget_tokens: Some(2000),
+            limit: None,
+        }
+        .into_request("lore-9a1c");
+
+        assert_eq!(request.project_key.as_deref(), Some("lore-9a1c"));
+        assert_eq!(request.project, None);
+        assert_eq!(request.budget_tokens, Some(2000));
+        // Absent rather than guessed here: the daemon owns the default, so the
+        // proxy and the CLI cannot drift apart on what it is.
+        assert_eq!(request.limit, None);
     }
 
     #[test]
@@ -476,6 +572,10 @@ mod tests {
         assert!(described("search").contains("still active in the project's ledger"));
         assert!(described("expand").contains("truncated"));
         assert!(described("status").contains("lexical-only"));
+        // The bundle's contract is its header, and an agent that skips the
+        // header reads nearest misses as answers.
+        assert!(described("bundle").contains("NO MATCH FOR:"));
+        assert!(described("bundle").contains("VERDICT: found"));
     }
 
     #[test]

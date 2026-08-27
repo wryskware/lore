@@ -15,8 +15,9 @@
 //!
 //! # Scoping
 //!
-//! Every *query* is scoped to exactly one project: `search` and `expand`
-//! reject a request that names none, with an error that says how to name one
+//! Every *query* is scoped to exactly one project: `search`, `expand` and
+//! `bundle` reject a request that names none, with an error that says how to
+//! name one
 //! (`design/4_Interfaces/2026-08-16_project-scoping-decision-brief.md`,
 //! "Resolution"). `GET /v1/status?project=` narrows the same way.
 //!
@@ -51,8 +52,8 @@ use lore_core::snapshot::{
     PushRenewRequest, PushSessionId, malformed_path,
 };
 use lore_core::{
-    DaemonStatus, ExpandRequest, IndexRequest, IndexResponse, ProjectInfo, ProjectList,
-    RegisterProjectRequest, RemoveProjectResponse, SearchRequest,
+    BundleRequest, DaemonStatus, ExpandRequest, IndexRequest, IndexResponse, ProjectInfo,
+    ProjectList, RegisterProjectRequest, RemoveProjectResponse, SearchRequest,
 };
 
 use crate::config::Config;
@@ -65,7 +66,7 @@ use super::queue::IndexQueue;
 use super::snapshot::{Scope, Snapshot};
 use super::store_handle::StoreHandle;
 use super::watch::{WatchCommand, WatchSender, WatchStatus};
-use super::{expand, index, paths, push, search};
+use super::{bundle, expand, index, paths, push, search};
 
 /// Request bodies are small JSON documents; a megabyte is generous for the
 /// largest realistic one (a pasted query) and cheap insurance otherwise.
@@ -126,6 +127,7 @@ pub fn router(state: AppState) -> Router {
         .route("/shutdown", post(shutdown))
         .route("/search", post(search_route))
         .route("/expand", post(expand_route))
+        .route("/bundle", post(bundle_route))
         // The push surface (D-0015). Same `/v1`, same loopback listener, same
         // absence of authentication: a lease is a consistency primitive, and
         // a deployment that serves more than one trusting party authenticates
@@ -877,6 +879,95 @@ async fn expand_route(
         expand::ExpandError::Store(err) => ApiErr::internal("expand", err),
         err => ApiErr::bad_request(err.to_string()),
     })
+}
+
+/// `POST /v1/bundle` — one query in, a finished evidence bundle out.
+///
+/// The route is `search` plus everything a caller would otherwise do with the
+/// answer: verify each hit against the file on disk, widen and merge the spans,
+/// fit them to a token budget, and put an honest verdict on top. It lives here
+/// rather than in a client for the reason D-0003 gives — the daemon is the one
+/// owner of index state, and it is also the only process that can read the
+/// corpus knowing what the index currently believes about it.
+///
+/// Two stages, deliberately separated: the store answers the query and the lock
+/// is released, and only then does assembly touch the filesystem, on the
+/// blocking pool. Holding the store across two dozen file reads would make
+/// every other query wait on this one's IO.
+async fn bundle_route(
+    State(state): State<AppState>,
+    ApiJson(request): ApiJson<BundleRequest>,
+) -> ApiResult<lore_core::BundleResponse> {
+    let started = std::time::Instant::now();
+
+    // Same scoping requirement as `search`, and resolved to the *project* here
+    // rather than passed through as a label, because assembly needs the root
+    // the paths in the answer are relative to.
+    let scope = request
+        .project_key
+        .as_deref()
+        .or(request.project.as_deref())
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .ok_or_else(|| {
+            ApiErr::bad_request(format!(
+                "bundle is scoped to one project: pass `project` (or `project_key`) and \
+                 {NAME_A_PROJECT}"
+            ))
+        })?
+        .to_string();
+    let projects = projects_of(&state).await?;
+    let project = super::resolve_project_key(&projects, &scope)
+        .or_else(|| super::resolve_project(&projects, &scope))
+        .ok_or_else(|| ApiErr::not_found(format!("unknown project `{scope}`; {NAME_A_PROJECT}")))?
+        .clone();
+
+    let limit = request
+        .limit
+        .unwrap_or(bundle::DEFAULT_LIMIT)
+        .min(search::MAX_LIMIT);
+    let budget_tokens = request
+        .budget_tokens
+        .unwrap_or(bundle::DEFAULT_BUDGET_TOKENS);
+    let search_request = SearchRequest {
+        query: request.query.clone(),
+        project_key: Some(project.key.clone()),
+        limit: Some(limit),
+        ..SearchRequest::default()
+    };
+
+    // Network I/O before the store lock, exactly as `search` does it; `None`
+    // means this bundle runs lexical-only (D-0007) and says so in its header.
+    let query_vector = state.embeddings.embed_query(&search_request.query).await;
+    let results = state
+        .store
+        .with(move |store| search::execute(store, &search_request, query_vector.as_deref()))
+        .await
+        .map_err(|err| ApiErr::internal("bundle", err))?
+        // The project was resolved above, so the scoping variants are
+        // unreachable here; they are still mapped rather than swallowed into a
+        // 500, because a project removed between the two calls is the caller's
+        // answer to have.
+        .map_err(|err| match err {
+            err @ (search::SearchError::UnknownProject(_)
+            | search::SearchError::UnknownProjectKey(_)) => ApiErr::not_found(err.to_string()),
+            err => ApiErr::internal("bundle", err),
+        })?;
+
+    let query = request.query;
+    let root = project.root.clone();
+    let response = tokio::task::spawn_blocking(move || {
+        // Loaded per request rather than cached: every other pass reads
+        // `.lore.toml` fresh, and a bundle resolving paths against a stale
+        // extent would quote files from a mount the project no longer declares.
+        let sources = crate::sources::Sources::load(&root);
+        bundle::assemble(&query, &results, &sources, budget_tokens, limit)
+    })
+    .await
+    .map_err(|err| ApiErr::internal("bundle", err))?;
+
+    state.latency.record("bundle", started.elapsed());
+    Ok(Json(response))
 }
 
 // ---------------------------------------------------------------------------

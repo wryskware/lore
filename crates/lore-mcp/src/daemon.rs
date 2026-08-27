@@ -15,8 +15,8 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use lore_core::discovery;
 use lore_core::{
-    ApiError, DaemonStatus, ExpandRequest, ExpandResponse, ProjectInfo, SearchRequest,
-    SearchResponse,
+    ApiError, BundleRequest, BundleResponse, DaemonStatus, ExpandRequest, ExpandResponse,
+    ProjectInfo, SearchRequest, SearchResponse,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -164,6 +164,13 @@ impl DaemonClient {
 
     pub async fn expand(&self, request: &ExpandRequest) -> Result<ExpandResponse, DaemonError> {
         self.post("expand", request).await
+    }
+
+    /// A finished evidence bundle. Assembly is entirely the daemon's — this
+    /// crate does not verify spans, does not read the corpus, and does not
+    /// render the block it hands on (D-0007).
+    pub async fn bundle(&self, request: &BundleRequest) -> Result<BundleResponse, DaemonError> {
+        self.post("bundle", request).await
     }
 
     /// `status` for one project. Never the machine-wide view: that is the
