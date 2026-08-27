@@ -574,7 +574,9 @@ pub struct BundleRequest {
     pub limit: Option<u32>,
     /// Symbol following: when a doc or sample near the top of the ranking
     /// *names* a symbol, pull that symbol's definition in beside it. Absent
-    /// means on.
+    /// means **off** — the 2026-08-27 retrieval eval came in under the
+    /// pre-registered recall bar, so the extra tokens are opt-in until a
+    /// consumption-side result earns the default (see `daemon::http`).
     ///
     /// Followed definitions are labelled with the span that named them
     /// ([`BundleSpan::via`]), are paid for out of an allowance **on top of**

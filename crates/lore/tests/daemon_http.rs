@@ -1664,11 +1664,10 @@ async fn a_bundle_follows_a_doc_to_the_definition_it_names() {
     let (status, body) = post(
         &h.router,
         "/v1/bundle",
-        json!({ "query": SIGNPOST_QUERY, "project": "demo" }),
+        json!({ "query": SIGNPOST_QUERY, "project": "demo", "follow": true }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    // On by default: the caller said nothing about following.
     assert_eq!(body["followed"], 1, "{body}");
 
     let spans = body["spans"].as_array().unwrap();
@@ -1699,16 +1698,19 @@ async fn follow_false_removes_the_definitions_and_changes_nothing_else() {
     let (_, on) = post(
         &h.router,
         "/v1/bundle",
-        json!({ "query": SIGNPOST_QUERY, "project": "demo" }),
+        json!({ "query": SIGNPOST_QUERY, "project": "demo", "follow": true }),
     )
     .await;
     let (_, off) = post(
         &h.router,
         "/v1/bundle",
-        json!({ "query": SIGNPOST_QUERY, "project": "demo", "follow": false }),
+        json!({ "query": SIGNPOST_QUERY, "project": "demo" }),
     )
     .await;
     assert_eq!(on["followed"], 1, "{on}");
+
+    // Off by default: an unadorned request follows nothing (the 2026-08-27
+    // eval came in under the pre-registered bar; see `daemon::http`).
 
     // The counters are absent rather than zero, so a bundle with nothing
     // followed is byte-identical to one from a daemon that predates the field.
@@ -1795,7 +1797,7 @@ async fn search_is_untouched_by_following() {
     let (_, bundle) = post(
         &h.router,
         "/v1/bundle",
-        json!({ "query": SIGNPOST_QUERY, "project": "demo" }),
+        json!({ "query": SIGNPOST_QUERY, "project": "demo", "follow": true }),
     )
     .await;
     assert_eq!(bundle["followed"], 1, "the corpus really does follow");

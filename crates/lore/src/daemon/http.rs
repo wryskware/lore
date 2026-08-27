@@ -936,12 +936,18 @@ async fn bundle_route(
         ..SearchRequest::default()
     };
 
-    // Following is on unless the caller says otherwise. It is one more
-    // statement inside the *same* store acquisition as the search itself, which
-    // is the whole reason it lives here and not in a second `store.with`:
-    // taking the lock twice would let the index move between the ranking and
-    // the definitions it named.
-    let follow = request.follow.unwrap_or(true);
+    // Following is OFF unless the caller asks for it. The design pre-committed
+    // to a bar (primary span_recall_half +0.10 on the follow pair) before the
+    // measurement ran; the 2026-08-27 retrieval eval came in under it — verdicts
+    // and distractors held perfectly, tokens +9-11%, but primary half-coverage
+    // did not move on n=18. "Below that bar the feature is not worth its tokens
+    // and should not default on." A consumption-side result (an answerer round
+    // with follow on) is what would earn the default back.
+    //
+    // When it does run, it is one more statement inside the *same* store
+    // acquisition as the search itself: taking the lock twice would let the
+    // index move between the ranking and the definitions it named.
+    let follow = request.follow.unwrap_or(false);
     let project_id = project.id;
 
     // Network I/O before the store lock, exactly as `search` does it; `None`

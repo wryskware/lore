@@ -90,12 +90,21 @@ Two implementation traps the prototype hit, preserved as requirements:
 the code chunker stores dedented text (compare dedented, render raw), and
 files may carry a BOM (strip before compare).
 
-## Symbol following (implemented 2026-08-27; not yet evaluated)
+## Symbol following (implemented and measured 2026-08-27)
 
-*Status: shipped behind `follow`, default on. The eval that decides
-whether it stays on has not run — see
-`design/99_Scratch/2026-08-27_symbol-following-design.md` §7 for the
-success bar stated before the run.*
+*Status: shipped behind `follow`, **default off**. The success bar was
+stated before the measurement
+(`design/99_Scratch/2026-08-27_symbol-following-design.md` §7: primary
+span_recall_half +0.10, distractors flat, tokens ≤+35%, verdicts
+identical) and the retrieval eval came in under it: every guard held
+perfectly — verdict distributions bit-identical, distractors flat,
+tokens +9–11%, 0 of 35 follow-ins dropped — but primary half-coverage
+did not move (span_any rose only +.02–.04, ≈2 gold items, n=18). Per
+the pre-commitment, the extra tokens are opt-in. The path back to
+default-on is a consumption-side result: an RCB answerer round with
+`follow: true` showing wall/token/quality gains, not a recall metric.
+Numbers: `bench/rcb/scores/retrieval_eval.integrated.jsonl`
+(`dbundle` vs `dbundle+follow` pairs).*
 
 Natural-language queries match natural language, and both ranking arms
 reward that. On the RCB corpus, span recall for **primary implementing
@@ -114,7 +123,7 @@ change, no new table, no re-index, one batched FTS statement.
 Contract additions, all serde-skipped when absent, so a bundle with
 nothing followed is byte-identical to one from before this existed:
 
-- request: `follow` (bool, default true);
+- request: `follow` (bool, default false — see status above);
 - `spans[]` / `further_reading[]`: `via { path, line_start, line_end,
   symbol }`, present **only** on a followed span;
 - response: `followed`, `followed_dropped`;
