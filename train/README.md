@@ -375,6 +375,56 @@ dataset. Training it is a separate concern with a separate failure surface.
 
 ---
 
+## Tests
+
+```bash
+python -m pytest train/tests -q      # ~3 s, no network, no GPU, no daemon
+```
+
+Python **3.11 or newer** (`common.py` uses `tomllib`) plus `pytest`. Nothing
+else: every external service is fixtured, and the tests write only into pytest's
+own tmpdir.
+
+They were written as a separate pass, against README.md rather than against the
+implementation, on the principle that a worker's own green tests only confirm
+its own understanding. Where the two disagree the test asserts this document and
+is marked `xfail` with the discrepancy named in its reason string, so the gate
+stays green and the disagreement stays visible.
+
+| file | seam |
+|---|---|
+| `test_paths.py` | Decision 5 — snapshot-root rewriting, the leak gate, and the detector's positive and negative controls (`https://` is not drive `s:`; `and/or` and `src/qibo/` are not rooted) |
+| `test_grading.py` | Decision 4 — component-wise suffix path matching, the ±20 line tolerance at its boundaries, the 0.5 / 0.34 thresholds, and the ungradeable reference |
+| `test_opencode_parse.py` | Decision 3 — reconstruction from the event stream: one call, parallel calls in one `messageID`, interleaved parts, a torn log, a `tool_use` with no `state.output`; plus every structural gate |
+| `test_question_echo.py` | the 80-character echo threshold, at and either side of the boundary, checked against the validator rule it is pinned to |
+| `test_row_structure.py` | the emitted row against the output gate — string `arguments`, byte-identical `tools`, string `content`, a byte-stable JSON round trip, and the mask |
+| `test_manifest.py` | Decision 2 — what the pin records, what rides in `meta`, and each stage's refusal to run without its inputs |
+| `test_config.py` | the shipped example config and the documented default thresholds |
+| `test_dry_run_e2e.py` | `--dry-run` through all three stages in a subprocess, in a tmpdir |
+
+`tests/emission_spec.py` replicates the checks of `~/lora-prep/validate_dataset.py`
+that a unit test can own honestly: the schema and role grammar, string-only
+`arguments` with no null-valued keys, and a character-level reproduction of the
+render so the mask can be asserted — at least one supervised span, one per
+assistant message, tool calls and `<|im_end|>` supervised, and the system
+prompt, tool schemas, user question and every `<tool_response>` payload never
+supervised. It is a second opinion, not a substitute: **token counts,
+`max_length` and the Arrow round trip need the real tokenizer and `datasets`,
+so those remain the referenced validator's job** and are checked only when a
+real batch is converted.
+
+### Residual risk the tests cannot reach
+
+Everything under "Real but never yet executed" stays unverified here, by
+construction: the `opencode` invocation and its per-cell tool gate, snapshot
+checkout, the daemon preflight against `/v1/resolve` and `/v1/status`, and
+whether `lore-mcp` really surfaces `bundle`/`search` under `LORE_PROJECT`. The
+tests fixture the *shape* of an opencode event stream taken from the README's
+description of it; if the real stream differs, they will not notice. The first
+real cell is still the first time any of that runs.
+
+---
+
 ## The pilot
 
 One repository, five questions. Its job is to produce the numbers this design

@@ -1,0 +1,4 @@
+{"type":"text","timestamp":0,"sessionID":"ses_fx","part":{"messageID":"m1","type":"text","text":"Starting from the index bundle."}}
+{"type":"tool_use","timestamp":0,"sessionID":"ses_fx","part":{"messageID":"m1","type":"tool_use","tool":"lore_bundle","callID":"call_1","state":{"status":"completed","input":{"query":"chunker plugin registry construction and its default registrations"},"output":"VERDICT: found\n"}}}
+{"type":"tool_use","timestamp":0,"sessionID":"ses_fx","part":{"messageID":"m2","type":"tool_use","tool":"webfetch","callID":"call_2","state":{"status":"completed","input":{"url":"https://example.invalid/docs"},"output":"<html>"}}}
+{"type":"text","timestamp":0,"sessionID":"ses_fx","part":{"messageID":"m3","type":"text","text":"Built in ChunkerRegistry.__init__ at src/registry.py:21-25."}}

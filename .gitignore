@@ -2,3 +2,4 @@
 design/.obsidian/workspace.json
 .claude/settings.local.json
 .claude/worktrees/
+.pytest_cache/
