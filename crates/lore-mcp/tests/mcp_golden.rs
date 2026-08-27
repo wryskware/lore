@@ -230,11 +230,13 @@ fn canned_bundle() -> lore_core::BundleResponse {
             label: Some("Board.Update".into()),
             merged: 1,
             chunk_id: "4e77ba0193ab0123456789abcdef0123456789abcdef0123456789abcdef0123".into(),
+            via: None,
         }],
         further_reading: vec![lore_core::BundleSpanRef {
             path: "design/4_Interfaces/4.1_MCP_Surface.md".into(),
             line_start: 15,
             line_end: 18,
+            via: None,
         }],
         spans_widened: 1,
         spans_after_merge: 2,
@@ -244,6 +246,8 @@ fn canned_bundle() -> lore_core::BundleResponse {
         bundle_tokens_est: (text.len() as u32).div_ceil(4),
         budget_tokens: 4000,
         limit: 24,
+        followed: 0,
+        followed_dropped: 0,
     }
 }
 

@@ -111,6 +111,11 @@ fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 
+/// [`is_zero`] for the narrower counters on the bundle surface.
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
 /// `skip_serializing_if` predicate for additive flags whose default is off.
 fn is_false(value: &bool) -> bool {
     !*value
@@ -567,6 +572,16 @@ pub struct BundleRequest {
     /// what the budget renders on purpose: merging collapses hits, and the
     /// surplus becomes further reading rather than being discarded.
     pub limit: Option<u32>,
+    /// Symbol following: when a doc or sample near the top of the ranking
+    /// *names* a symbol, pull that symbol's definition in beside it. Absent
+    /// means on.
+    ///
+    /// Followed definitions are labelled with the span that named them
+    /// ([`BundleSpan::via`]), are paid for out of an allowance **on top of**
+    /// [`Self::budget_tokens`], and never feed the verdict — so turning it off
+    /// removes text and changes nothing else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow: Option<bool>,
 }
 
 /// The bundle: a rendered text block for an agent, and the same content in
@@ -616,6 +631,28 @@ pub struct BundleResponse {
     pub budget_tokens: u32,
     /// The chunk limit actually applied, after defaulting and clamping.
     pub limit: u32,
+    /// Followed definitions actually rendered (see [`BundleRequest::follow`]).
+    /// Absent when nothing followed, which is every bundle from a daemon that
+    /// predates the field.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub followed: u32,
+    /// Definitions that resolved but failed verification, and are therefore
+    /// counted in [`Self::dropped`] under a `follow:`-prefixed reason. Reported
+    /// because a count nobody can see is a claim nobody can check.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub followed_dropped: u32,
+}
+
+/// Why a span is in the bundle when the ranking did not put it there: the
+/// doc or sample span that named the symbol, and the reference that resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BundleVia {
+    /// Project-relative path of the *referring* span.
+    pub path: String,
+    pub line_start: u32,
+    pub line_end: u32,
+    /// The reference as it was written in that span, e.g. `AgentThread.RunAsync`.
+    pub symbol: String,
 }
 
 /// One rendered span.
@@ -634,6 +671,11 @@ pub struct BundleSpan {
     pub merged: u32,
     /// The highest-ranked member's chunk id, so a caller can `expand` it.
     pub chunk_id: String,
+    /// Present exactly on a **followed** span: the ranking did not return this
+    /// chunk, a doc or sample span above it named the symbol. Absent on every
+    /// ranked span, so a consumer that ignores it sees today's shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<BundleVia>,
 }
 
 /// A pointer to something verified but not rendered.
@@ -642,6 +684,10 @@ pub struct BundleSpanRef {
     pub path: String,
     pub line_start: u32,
     pub line_end: u32,
+    /// See [`BundleSpan::via`]: a followed definition that did not fit its
+    /// allowance is still a followed definition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<BundleVia>,
 }
 
 /// Hits refused by verification, by reason: `missing`, `unreadable`, `range`

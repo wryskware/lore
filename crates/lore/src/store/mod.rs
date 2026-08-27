@@ -279,6 +279,26 @@ pub struct SearchHit {
     pub score: f32,
 }
 
+/// A chunk that carries a given name somewhere in its structural anchor, as
+/// [`Store::symbol_anchor_candidates`] reports it.
+///
+/// Deliberately **without the chunk text**: a common name can be a segment of
+/// hundreds of symbol paths, and hydrating all of them would be the only
+/// expensive thing about following a reference. The caller narrows this list in
+/// Rust and then reads the few winners with [`Store::get_chunk`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnchorCandidate {
+    pub chunk_id: ChunkId,
+    pub path: Utf8PathBuf,
+    pub kind: ChunkKind,
+    pub line_start: u32,
+    pub line_end: u32,
+    /// Effective authority as stored, so a hydrated candidate can be turned
+    /// into a search result that reports the same authority any other hit on
+    /// that chunk would have reported.
+    pub authority: Authority,
+}
+
 /// A chunk awaiting embedding, with everything the embed pipeline needs to
 /// build its prefixed embedding text (language, path, symbol/heading anchor).
 #[derive(Debug, Clone, PartialEq)]
@@ -1494,6 +1514,96 @@ impl Store {
             Some(row) => Ok(Some(row_to_chunk(row)?)),
             None => Ok(None),
         }
+    }
+
+    /// Chunks whose structural anchor contains any of `names`, cheaply.
+    ///
+    /// This is the lookup behind bundle-side symbol following: a doc says
+    /// `` `RunAsync` ``, and this answers "which chunks in this project are
+    /// anchored on something called RunAsync?". Every chunk already writes an
+    /// `anchor` ([`ChunkKind::anchor`]) into the FTS index, and the tokenizer
+    /// treats `.`, `:` and `#` as separators — so `code:Agents.Thread.RunAsync`
+    /// is already indexed under the token `RunAsync`, and a column-scoped MATCH
+    /// finds it with **no new table, no new column and no re-index**. Adding a
+    /// symbol table instead would bump the schema version, and under D-0018
+    /// that discards and rebuilds the whole database — a re-chunk *and* a
+    /// re-embed of every project, to buy a lookup this already answers.
+    ///
+    /// One statement for the whole batch, on purpose: it runs inside the store
+    /// lock, and a dozen round trips there would be the wrong shape even if
+    /// each were fast.
+    ///
+    /// The match is the tokenizer's, so it is case-insensitive and it hits any
+    /// *segment* of a symbol path. Deciding which rows are really a definition
+    /// of the name asked for is the caller's, on these narrow rows
+    /// ([`AnchorCandidate`] deliberately carries no chunk text). `limit` caps
+    /// the scan: a hot token costs a missed follow-in, never a slow query.
+    ///
+    /// Names are expected to be `[A-Za-z0-9_]+`; anything else is dropped
+    /// rather than quoted into the expression, which is what makes the
+    /// double-quoting here unreachable-safe.
+    pub fn symbol_anchor_candidates(
+        &self,
+        filter: &SearchFilter,
+        names: &[String],
+        limit: usize,
+    ) -> Result<Vec<AnchorCandidate>> {
+        let mut terms: Vec<String> = Vec::new();
+        for name in names {
+            let usable = !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+            let quoted = format!("\"{name}\"");
+            if usable && !terms.contains(&quoted) {
+                terms.push(quoted);
+            }
+        }
+        if terms.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let f = filter_sql(filter);
+        let sql = format!(
+            "SELECT c.chunk_id, c.path, c.kind, c.line_start, c.line_end, \
+                    c.effective_tier, c.demotion
+             FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid
+             WHERE chunks_fts MATCH ?{}
+             ORDER BY c.path, c.line_start, c.chunk_id
+             LIMIT ?",
+            f.sql
+        );
+        // Ordered rather than left to the FTS posting order so that hitting
+        // `limit` truncates the same way twice: two runs of one query must
+        // produce the same bundle.
+        let mut params: Vec<Value> = vec![Value::Text(format!(
+            "{{anchor}} : ({})",
+            terms.join(" OR ")
+        ))];
+        params.extend(f.params);
+        params.push(Value::Integer(limit as i64));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(params))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let kind_json: String = row.get(2)?;
+            out.push(AnchorCandidate {
+                chunk_id: ChunkId(row.get(0)?),
+                path: Utf8PathBuf::from(row.get::<_, String>(1)?),
+                kind: serde_json::from_str(&kind_json)?,
+                line_start: row.get(3)?,
+                line_end: row.get(4)?,
+                authority: Authority {
+                    tier: row.get(5)?,
+                    demotion: row
+                        .get::<_, Option<String>>(6)?
+                        .as_deref()
+                        .and_then(Demotion::from_code),
+                },
+            });
+        }
+        Ok(out)
     }
 
     /// Resolve a chunk id **or a prefix of one** within a project.

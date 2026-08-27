@@ -49,6 +49,28 @@
 //! Nothing here judges relevance and no model is called; the order search
 //! ranked in is preserved throughout.
 //!
+//! # Followed definitions
+//!
+//! [`super::follow`] may hand over definitions the ranking did not return,
+//! because a doc or sample near the top of it *named* them. They are the one
+//! thing in a bundle that is not ranked: each is placed immediately after the
+//! span that referred to it — so the bundle reads signpost → implementation —
+//! and labelled `via <that span>`, which makes them interleaved by provenance
+//! rather than by score. Three fences keep them from changing what a bundle
+//! means:
+//!
+//! - **Strictly additive.** Ranked spans are widened, merged and budgeted
+//!   exactly as they are with following off; a definition is never merged into
+//!   one, and one that lands on top of a ranked span is dropped rather than
+//!   shown twice. Nothing that would have rendered loses its slot.
+//! - **Paid for separately.** Follow-ins come out of an allowance *on top of*
+//!   `budget_tokens` ([`super::follow::FOLLOW_BUDGET_SHARE`]), disclosed in the
+//!   header, so the caller can see the extra tokens it did not ask for.
+//! - **Never evidence.** Coverage, and therefore the verdict, is computed from
+//!   the ranked spans alone. The thresholds below were calibrated on twenty
+//!   judged cells with no follow-ins in them, and a bundle that pulls in extra
+//!   text and then grades itself on that text can talk a `none` into a `weak`.
+//!
 //! # The two normalization traps
 //!
 //! Both were found by the prototype and both are requirements, not tidiness:
@@ -62,11 +84,13 @@ use std::collections::BTreeMap;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use lore_core::{
-    BundleDropped, BundleResponse, BundleSpan, BundleSpanRef, SearchResponse, SearchResult,
+    BundleDropped, BundleResponse, BundleSpan, BundleSpanRef, BundleVia, SearchResponse,
+    SearchResult,
 };
 
 use crate::sources::Sources;
 
+use super::follow::{FOLLOW_BUDGET_SHARE, Followed};
 use super::paths;
 
 // ---------------------------------------------------------------------------
@@ -367,7 +391,11 @@ const STOPWORDS: &[&str] = &[
     "yourself",
 ];
 
-fn is_stopword(word: &str) -> bool {
+/// `pub(crate)` for [`super::follow`], which applies the same floor to the
+/// identifiers it extracts from a doc — one table, so `run` and `get` cannot be
+/// glue on one side of the module boundary and a symbol worth chasing on the
+/// other.
+pub(crate) fn is_stopword(word: &str) -> bool {
     STOPWORDS.binary_search(&word).is_ok()
 }
 
@@ -432,7 +460,11 @@ fn words(text: &str) -> Vec<&str> {
 /// [a-z0-9]+`: a run of capitals is its own word except for the last capital
 /// when a lowercase letter follows it, which belongs to the word starting
 /// there. `HTTPServer` is therefore `HTTP` + `Server`, not `HTTPS` + `erver`.
-fn case_parts(chunk: &str) -> Vec<&str> {
+///
+/// `pub(crate)` for [`super::follow`]'s specificity rule ("is this token
+/// multi-part, or one ordinary word?"). A second splitter would be a second
+/// answer to the same question.
+pub(crate) fn case_parts(chunk: &str) -> Vec<&str> {
     let bytes = chunk.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -520,6 +552,16 @@ struct Span {
     chunk_id: String,
     /// Ranked hits folded into this span, 1 before any merge.
     merged: u32,
+    /// Rank index of the hit this span came from — for a follow-in, of the hit
+    /// that *named* it. Merging keeps the lowest, so the value stays the
+    /// span's own position in the ranking and placement can use it directly.
+    origin: usize,
+    /// `Some` exactly on a followed definition: the span that named it.
+    via: Option<BundleVia>,
+    /// `1 of 3 definitions`, printed beside the `via` when the name was
+    /// ambiguous. Not on the wire — ambiguity is a rendering disclosure, and
+    /// [`BundleVia`] is a pointer.
+    via_note: Option<String>,
 }
 
 impl Span {
@@ -651,6 +693,9 @@ fn verify(hit: &SearchResult, sources: &Sources) -> Result<Span, (Refusal, Strin
         score: hit.score,
         chunk_id: hit.chunk_id.clone(),
         merged: 1,
+        origin: 0,
+        via: None,
+        via_note: None,
     })
 }
 
@@ -735,6 +780,11 @@ fn merge(spans: Vec<Span>) -> Vec<Span> {
             existing.start = low;
             existing.end = high;
             existing.merged += 1;
+            // The earlier member is the higher-ranked one, so the merged span
+            // keeps its position: placement reads `origin` to decide where a
+            // followed definition goes, and it must be the rank the reader
+            // sees this block at.
+            existing.origin = existing.origin.min(span.origin);
             continue 'next;
         }
         out.push(span);
@@ -746,7 +796,12 @@ fn merge(spans: Vec<Span>) -> Vec<Span> {
 // Rendering
 // ---------------------------------------------------------------------------
 
-/// The span's real lines, numbered, under a `path:start-end [label]` header.
+/// The span's real lines, numbered, under a `path:start-end [label]` header —
+/// plus, on a followed definition, ` (via <the span that named it>)`.
+///
+/// The `via` is the honesty requirement: a reader must be able to tell a span
+/// the query ranked from one lore chose to add, and be told exactly why it was
+/// added, without parsing the JSON.
 ///
 /// Read from disk *again*, at render time. `None` when the file became
 /// unreadable or shrank since verification — the one case where a span that
@@ -763,6 +818,16 @@ fn render_span(span: &Span) -> Option<String> {
     out.push_str(&format!(":{}-{}", span.start, span.end));
     if !span.label.is_empty() {
         out.push_str(&format!(" [{}]", span.label));
+    }
+    if let Some(via) = &span.via {
+        out.push_str(&format!(
+            " (via {}:{}-{}",
+            via.path, via.line_start, via.line_end
+        ));
+        if let Some(note) = &span.via_note {
+            out.push_str(&format!(", {note}"));
+        }
+        out.push(')');
     }
     out.push_str(" ===");
     for (offset, line) in lines[(span.start - 1) as usize..span.end as usize]
@@ -786,6 +851,7 @@ fn render_span(span: &Span) -> Option<String> {
 pub fn assemble(
     query: &str,
     results: &SearchResponse,
+    followed: &[Followed],
     sources: &Sources,
     budget_tokens: u32,
     limit: u32,
@@ -793,19 +859,49 @@ pub fn assemble(
     let mut good: Vec<Span> = Vec::new();
     // Ordered so the `DROPPED` lines come out in a stable order rather than a
     // hash order that changes between runs.
-    let mut refused: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
-    for hit in &results.results {
+    let mut refused: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // The prototype names a nameless hit `?` rather than printing a `DROPPED`
+    // line that ends at the colon.
+    let named = |where_: String| {
+        if where_.is_empty() {
+            "?".into()
+        } else {
+            where_
+        }
+    };
+    for (rank, hit) in results.results.iter().enumerate() {
         match verify(hit, sources) {
-            Ok(span) => good.push(span),
+            Ok(mut span) => {
+                span.origin = rank;
+                good.push(span);
+            }
+            Err((reason, where_)) => refused
+                .entry(reason.as_str().to_string())
+                .or_default()
+                .push(named(where_)),
+        }
+    }
+
+    // A followed definition goes through the very same `verify`: the bundle's
+    // core guarantee — rendered text came from disk — applies to it with no new
+    // code. Its refusals are tallied under a `follow:`-prefixed reason so the
+    // ranked-hit DROPPED tally stays readable.
+    let mut follow_verified: Vec<Span> = Vec::new();
+    let mut followed_dropped = 0u32;
+    for definition in followed {
+        match verify(&definition.hit, sources) {
+            Ok(mut span) => {
+                span.origin = definition.origin;
+                span.via = Some(definition.via.clone());
+                span.via_note = definition.note.clone();
+                follow_verified.push(span);
+            }
             Err((reason, where_)) => {
-                // The prototype names a nameless hit `?` rather than printing a
-                // `DROPPED` line that ends at the colon.
-                let where_ = if where_.is_empty() {
-                    "?".to_string()
-                } else {
-                    where_
-                };
-                refused.entry(reason.as_str()).or_default().push(where_)
+                followed_dropped += 1;
+                refused
+                    .entry(format!("follow:{}", reason.as_str()))
+                    .or_default()
+                    .push(named(where_));
             }
         }
     }
@@ -822,6 +918,25 @@ pub fn assemble(
         .partition(|span| span.width() <= MAX_SPAN_LINES);
     let spans_oversized = oversized.len() as u32;
 
+    // Follow-ins widen and merge among *themselves*. Merging one into a ranked
+    // span would move a block that would have rendered anyway, and strict
+    // additivity is the guarantee this feature is fenced by; merging them with
+    // each other is still wanted, because two windows of one split definition
+    // should arrive as one readable block.
+    widen(&mut follow_verified);
+    let (follow_spans, follow_oversized): (Vec<Span>, Vec<Span>) = merge(follow_verified)
+        .into_iter()
+        // A definition that lands on top of a ranked span is dropped outright:
+        // the highest-value case (a doc next to its own implementation) is
+        // exactly the one that would otherwise render twice.
+        .filter(|definition| {
+            !spans
+                .iter()
+                .chain(oversized.iter())
+                .any(|span| overlaps(span, definition))
+        })
+        .partition(|span| span.width() <= MAX_SPAN_LINES);
+
     let budget_chars = budget_tokens as usize * CHARS_PER_TOKEN;
     let mut rendered: Vec<(Span, String)> = Vec::new();
     let mut overflow: Vec<Span> = oversized.clone();
@@ -829,7 +944,7 @@ pub fn assemble(
     for span in spans {
         let Some(block) = render_span(&span) else {
             refused
-                .entry(Refusal::Unreadable.as_str())
+                .entry(Refusal::Unreadable.as_str().to_string())
                 .or_default()
                 .push(span.path.clone());
             continue;
@@ -846,6 +961,13 @@ pub fn assemble(
     // Coverage is measured on what was RENDERED, plus the paths of everything
     // that came back: a term that only appears in an overflowed path is
     // honestly "we found something, it did not fit", not "covered".
+    //
+    // **Followed definitions are deliberately absent from this blob, and from
+    // everything computed out of it.** This is not an oversight to tidy up: the
+    // 0.65/0.45 cuts were calibrated over twenty judged cells that contained no
+    // follow-ins, and letting text lore chose to add count towards coverage
+    // would let a bundle talk its own `none` into a `weak`. The verdict is a
+    // claim about what the *retrieval* found.
     let mut blob = rendered
         .iter()
         .map(|(_, block)| block.as_str())
@@ -927,6 +1049,66 @@ pub fn assemble(
         rendered = keep;
     }
 
+    // Only now, with every ranked span placed, do the follow-ins get their
+    // turn — out of a pot of their own, so a span that would have rendered
+    // never loses its slot to a definition. A `none` bundle spends nothing on
+    // them: it has just disclaimed its own evidence, and paying 35% more to
+    // chase names out of disclaimed prose is the waste this route exists to
+    // remove.
+    let follow_budget = if verdict == "none" {
+        0
+    } else {
+        (budget_tokens as f64 * FOLLOW_BUDGET_SHARE) as usize * CHARS_PER_TOKEN
+    };
+    let mut follow_rendered: Vec<(Span, String)> = Vec::new();
+    let mut follow_overflow: Vec<Span> = Vec::new();
+    let mut follow_used = 0usize;
+    for mut span in follow_spans.into_iter().chain(follow_oversized) {
+        // The printed pointer must name the block the reader can actually see
+        // above, not the pre-widening hit that produced it.
+        retarget_via(&mut span, &rendered);
+        if span.width() > MAX_SPAN_LINES {
+            follow_overflow.push(span);
+            continue;
+        }
+        let Some(block) = render_span(&span) else {
+            followed_dropped += 1;
+            refused
+                .entry(format!("follow:{}", Refusal::Unreadable.as_str()))
+                .or_default()
+                .push(span.path.clone());
+            continue;
+        };
+        let cost = block.chars().count() + 2;
+        // No "the first one always renders" exemption here, unlike the ranked
+        // budget: a follow-in is a bonus, and the caller was promised the
+        // allowance is a ceiling.
+        if follow_used + cost > follow_budget {
+            follow_overflow.push(span);
+            continue;
+        }
+        follow_used += cost;
+        follow_rendered.push((span, block));
+    }
+    let followed_rendered = follow_rendered.len() as u32;
+    overflow.extend(follow_overflow);
+
+    // Ranked spans keep their order exactly; each definition is placed
+    // immediately after the ranked span that named it. `origin` is the rank
+    // index either way and is non-decreasing across `rendered`, so a stable
+    // sort on `(origin, is a follow-in)` is that placement — and a definition
+    // whose referring span did not survive lands after the last one that did.
+    let mut placed: Vec<(usize, bool, Span, String)> = rendered
+        .into_iter()
+        .map(|(span, block)| (span.origin, false, span, block))
+        .chain(
+            follow_rendered
+                .into_iter()
+                .map(|(span, block)| (span.origin, true, span, block)),
+        )
+        .collect();
+    placed.sort_by_key(|(origin, is_follow, _, _)| (*origin, *is_follow));
+
     let mut parts: Vec<String> = vec![format!("VERDICT: {verdict} ({detail})")];
     if !uncovered.is_empty() {
         parts.push(format!("NO MATCH FOR: {}", uncovered.join(", ")));
@@ -955,7 +1137,18 @@ pub fn assemble(
         })
         .collect();
 
-    parts.extend(rendered.iter().map(|(_, block)| block.clone()));
+    // The extra tokens are named, not merely spent: the allowance sits on top
+    // of the caller's budget, and a cost nobody can see is a cost nobody
+    // agreed to.
+    if followed_rendered > 0 {
+        parts.push(format!(
+            "FOLLOWED: {followed_rendered} definition(s) pulled in because a doc or sample above \
+             names them, costing {} tokens on top of the {budget_tokens}-token budget.",
+            follow_used.div_ceil(CHARS_PER_TOKEN)
+        ));
+    }
+
+    parts.extend(placed.iter().map(|(_, _, _, block)| block.clone()));
     if !overflow.is_empty() {
         parts.push(format!(
             "FURTHER READING: {}",
@@ -983,15 +1176,16 @@ pub fn assemble(
         hits_verified,
         hits_rejected: dropped.iter().map(|drop| drop.count).sum(),
         dropped,
-        spans: rendered
+        spans: placed
             .iter()
-            .map(|(span, _)| BundleSpan {
+            .map(|(_, _, span, _)| BundleSpan {
                 path: span.path.clone(),
                 line_start: span.start,
                 line_end: span.end,
                 label: Some(span.label.clone()).filter(|label| !label.is_empty()),
                 merged: span.merged,
                 chunk_id: span.chunk_id.clone(),
+                via: span.via.clone(),
             })
             .collect(),
         further_reading: overflow
@@ -1000,6 +1194,7 @@ pub fn assemble(
                 path: span.path.clone(),
                 line_start: span.start,
                 line_end: span.end,
+                via: span.via.clone(),
             })
             .collect(),
         spans_widened,
@@ -1010,7 +1205,32 @@ pub fn assemble(
         bundle_tokens_est: chars.div_ceil(CHARS_PER_TOKEN) as u32,
         budget_tokens,
         limit,
+        followed: followed_rendered,
+        followed_dropped,
         text,
+    }
+}
+
+/// Do two spans name overlapping lines of one file?
+fn overlaps(a: &Span, b: &Span) -> bool {
+    a.path == b.path && a.start <= b.end && b.start <= a.end
+}
+
+/// Point a follow-in's `via` at the *rendered* block that named it.
+///
+/// The reference was found in a search hit, but what the reader sees above is
+/// that hit after widening and merging. Printing the hit's own span would hand
+/// back a pointer to lines the bundle never showed.
+fn retarget_via(definition: &mut Span, rendered: &[(Span, String)]) {
+    let Some(via) = &mut definition.via else {
+        return;
+    };
+    let referrer = rendered.iter().map(|(span, _)| span).find(|span| {
+        span.path == via.path && span.start <= via.line_end && via.line_start <= span.end
+    });
+    if let Some(span) = referrer {
+        via.line_start = span.start;
+        via.line_end = span.end;
     }
 }
 
@@ -1051,6 +1271,21 @@ fn round6(value: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every assertion below this line predates symbol following, and every
+    /// one of them must keep meaning what it meant: a bundle with nothing
+    /// followed. Shadowing the real [`super::assemble`] with the no-follow
+    /// arity says that once, here, instead of `&[]` forty times — and the
+    /// tests that *are* about following call `super::assemble` outright.
+    fn assemble(
+        query: &str,
+        results: &SearchResponse,
+        sources: &Sources,
+        budget_tokens: u32,
+        limit: u32,
+    ) -> BundleResponse {
+        super::assemble(query, results, &[], sources, budget_tokens, limit)
+    }
 
     #[test]
     fn stopword_table_is_sorted_for_binary_search() {

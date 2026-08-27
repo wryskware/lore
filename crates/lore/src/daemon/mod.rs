@@ -25,6 +25,7 @@
 
 pub mod bundle;
 pub mod expand;
+pub mod follow;
 pub mod handshake;
 pub mod http;
 pub mod index;

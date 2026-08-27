@@ -204,6 +204,10 @@ impl BundleParams {
             project_key: Some(project_key.to_string()),
             budget_tokens: self.budget_tokens,
             limit: self.limit,
+            // Deliberately not a tool parameter: symbol following is an eval
+            // and escape-hatch knob, not something an agent should be reasoning
+            // about mid-task. The daemon endpoint keeps it either way.
+            follow: None,
         }
     }
 }

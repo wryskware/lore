@@ -542,7 +542,14 @@ fn parse_status(status: &str) -> Option<StatusFilter> {
     })
 }
 
-fn to_result(sources: &HashMap<ProjectId, Project>, hit: SearchHit) -> SearchResult {
+/// One store hit → one wire result.
+///
+/// `pub(crate)` for [`super::follow`], which turns a resolved definition into a
+/// result the bundle assembler can verify. Reusing this is not tidiness:
+/// `bundle::verify` reads `excerpt` and `excerpt_truncated` with exactly the
+/// meanings search gives them, and a second constructor would eventually
+/// disagree about one of them.
+pub(crate) fn to_result(sources: &HashMap<ProjectId, Project>, hit: SearchHit) -> SearchResult {
     let source = sources.get(&hit.project);
     let chunk = hit.chunk;
     let (symbol_path, heading_path) = match &chunk.kind {

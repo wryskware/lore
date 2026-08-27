@@ -66,7 +66,7 @@ use super::queue::IndexQueue;
 use super::snapshot::{Scope, Snapshot};
 use super::store_handle::StoreHandle;
 use super::watch::{WatchCommand, WatchSender, WatchStatus};
-use super::{bundle, expand, index, paths, push, search};
+use super::{bundle, expand, follow, index, paths, push, search};
 
 /// Request bodies are small JSON documents; a megabyte is generous for the
 /// largest realistic one (a pasted query) and cheap insurance otherwise.
@@ -936,12 +936,24 @@ async fn bundle_route(
         ..SearchRequest::default()
     };
 
+    // Following is on unless the caller says otherwise. It is one more
+    // statement inside the *same* store acquisition as the search itself, which
+    // is the whole reason it lives here and not in a second `store.with`:
+    // taking the lock twice would let the index move between the ranking and
+    // the definitions it named.
+    let follow = request.follow.unwrap_or(true);
+    let project_id = project.id;
+
     // Network I/O before the store lock, exactly as `search` does it; `None`
     // means this bundle runs lexical-only (D-0007) and says so in its header.
     let query_vector = state.embeddings.embed_query(&search_request.query).await;
-    let results = state
+    let (results, followed) = state
         .store
-        .with(move |store| search::execute(store, &search_request, query_vector.as_deref()))
+        .with(move |store| {
+            let results = search::execute(store, &search_request, query_vector.as_deref())?;
+            let followed = follow::resolve(store, project_id, &results.results, follow);
+            Ok::<_, search::SearchError>((results, followed))
+        })
         .await
         .map_err(|err| ApiErr::internal("bundle", err))?
         // The project was resolved above, so the scoping variants are
@@ -961,7 +973,7 @@ async fn bundle_route(
         // `.lore.toml` fresh, and a bundle resolving paths against a stale
         // extent would quote files from a mount the project no longer declares.
         let sources = crate::sources::Sources::load(&root);
-        bundle::assemble(&query, &results, &sources, budget_tokens, limit)
+        bundle::assemble(&query, &results, &followed, &sources, budget_tokens, limit)
     })
     .await
     .map_err(|err| ApiErr::internal("bundle", err))?;
