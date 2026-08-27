@@ -149,13 +149,20 @@ def group_messages(events: list[dict]) -> list[dict]:
             by_id[mid]["text"].append(part.get("text") or "")
         else:
             state = part.get("state") or {}
+            output = state.get("output")
+            if output is None:
+                # A failed or interrupted call carries no `output` at all.
+                # `json.dumps(None)` would put the four characters `null` in the
+                # tool result: well-formed, masked, and pure junk conditioning
+                # that no schema or mask check can see.
+                output = ""
+            elif not isinstance(output, str):
+                output = json.dumps(output, ensure_ascii=False)
             by_id[mid]["calls"].append({
                 "id": part.get("callID") or f"call_{len(by_id[mid]['calls'])}",
                 "tool": part.get("tool") or "",
                 "input": state.get("input") or {},
-                "output": state.get("output") if isinstance(
-                    state.get("output"), str) else json.dumps(
-                        state.get("output"), ensure_ascii=False),
+                "output": output,
                 "status": state.get("status"),
             })
     return [by_id[mid] for mid in order]
