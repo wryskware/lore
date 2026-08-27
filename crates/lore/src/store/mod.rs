@@ -2558,7 +2558,7 @@ mod tests {
                 declares(DesignStatus::Exploration, &[]),
             );
             store
-                .replace_file_chunks(proj, path, "h1", &[chunk.clone()])
+                .replace_file_chunks(proj, path, "h1", std::slice::from_ref(&chunk))
                 .unwrap();
             store
                 .upsert_embeddings(&[NewEmbedding {
