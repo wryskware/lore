@@ -797,7 +797,16 @@ pub fn assemble(
     for hit in &results.results {
         match verify(hit, sources) {
             Ok(span) => good.push(span),
-            Err((reason, where_)) => refused.entry(reason.as_str()).or_default().push(where_),
+            Err((reason, where_)) => {
+                // The prototype names a nameless hit `?` rather than printing a
+                // `DROPPED` line that ends at the colon.
+                let where_ = if where_.is_empty() {
+                    "?".to_string()
+                } else {
+                    where_
+                };
+                refused.entry(reason.as_str()).or_default().push(where_)
+            }
         }
     }
 
@@ -1013,12 +1022,30 @@ fn clip(text: &str, max: usize) -> &str {
     }
 }
 
+/// Round-half-to-even on the scaled value, matching Python's `round()` — the
+/// prototype's reported figures are banker's-rounded, and `f64::round` (half
+/// away from zero) disagrees exactly when the scaled value is a binary-exact
+/// half (1/16 -> 0.062 there, 0.063 here). Verdicts never depend on this; the
+/// JSON fields should still not drift from the prototype.
+fn round_ties_even(scaled: f64) -> f64 {
+    let floor = scaled.floor();
+    if scaled - floor == 0.5 {
+        if (floor as i64) % 2 == 0 {
+            floor
+        } else {
+            floor + 1.0
+        }
+    } else {
+        scaled.round()
+    }
+}
+
 fn round3(value: f64) -> f64 {
-    (value * 1_000.0).round() / 1_000.0
+    round_ties_even(value * 1_000.0) / 1_000.0
 }
 
 fn round6(value: f64) -> f64 {
-    (value * 1_000_000.0).round() / 1_000_000.0
+    round_ties_even(value * 1_000_000.0) / 1_000_000.0
 }
 
 #[cfg(test)]
@@ -1465,6 +1492,1247 @@ mod tests {
             "{}",
             bundle.text
         );
+    }
+
+    // =======================================================================
+    // INDEPENDENT VERIFICATION PASS
+    // =======================================================================
+    //
+    // Authored separately from the port, against its two ground truths rather
+    // than against this module's own habits:
+    //
+    //   1. `bench/rcb/sandbox/lore_pkg.py` — the validated prototype, whose
+    //      term rules, calibration constants, widen/merge arithmetic, budget
+    //      demotion, dedent/BOM handling and rendering are the spec;
+    //   2. `design/4_Interfaces/2026-08-27_bundle-mcp-tool.md` — the contract.
+    //
+    // Expectations marked **(oracle)** were produced by EXECUTING the
+    // prototype, never by reading it. Its pure helpers (`_CAMEL_RE.findall`,
+    // `_WORD_RE.findall`, `_stems`, `query_terms`, `coverage`, `_normalize`)
+    // were called directly, and `build_bundle` was driven end to end over a
+    // temporary corpus with `search`/`expand` stubbed out. The `expand` stub
+    // reproduces `super::expand::widen`'s own arithmetic
+    // (`start = max(1, start - ctx)`, `end = min(file_lines, end + ctx)`), so
+    // this module's direct-from-disk widening is being compared against the
+    // span the prototype's round trip would actually have returned.
+    //
+    // Deviations from the prototype that are declared and intentional
+    // (Sources-based resolution, no `expand` round trip, no timing fields,
+    // restructured `dropped`, `Option`-al label) are exercised for behaviour
+    // equivalence, not for identity. Deviations found that are NOT declared
+    // are marked `defect_` and `#[ignore]`d rather than asserted away.
+
+    // -- terms: the camel/underscore splitter -------------------------------
+
+    /// (oracle) `_CAMEL_RE = [A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+`,
+    /// `findall` on each chunk. The awkward cases are the ones where the
+    /// regex engine backtracks out of a greedy capital run, and the ones
+    /// where it does not: `IDs` really is `I` + `Ds`, and `OAuth2Client`
+    /// really is `O` + `Auth2` + `Client`.
+    #[test]
+    fn indep_case_parts_matches_the_prototype_camel_regex() {
+        let expected: &[(&str, &[&str])] = &[
+            ("HTTPServer", &["HTTP", "Server"]),
+            ("ABC", &["ABC"]),
+            ("getURL", &["get", "URL"]),
+            ("Foo2Bar", &["Foo2", "Bar"]),
+            ("HTTP2Server", &["HTTP", "2", "Server"]),
+            ("ABCdef", &["AB", "Cdef"]),
+            ("aB", &["a", "B"]),
+            ("A", &["A"]),
+            ("Ab", &["Ab"]),
+            ("XMLHTTPRequest", &["XMLHTTP", "Request"]),
+            ("IOError", &["IO", "Error"]),
+            ("parseJSONData", &["parse", "JSON", "Data"]),
+            ("a", &["a"]),
+            ("2fa", &["2fa"]),
+            ("snake", &["snake"]),
+            ("ALLCAPS", &["ALLCAPS"]),
+            ("camelCase", &["camel", "Case"]),
+            ("PascalCase", &["Pascal", "Case"]),
+            (
+                "HTTPSProxyURLHandler",
+                &["HTTPS", "Proxy", "URL", "Handler"],
+            ),
+            ("V2", &["V", "2"]),
+            ("v2", &["v2"]),
+            ("MyID", &["My", "ID"]),
+            ("IDs", &["I", "Ds"]),
+            ("OAuth2Client", &["O", "Auth2", "Client"]),
+            ("", &[]),
+        ];
+        for (chunk, want) in expected {
+            assert_eq!(&case_parts(chunk), want, "case_parts({chunk:?})");
+        }
+    }
+
+    /// (oracle) `_WORD_RE = [A-Za-z][A-Za-z0-9_]*`. A token must *start* with
+    /// an ASCII letter, and non-ASCII prose tokenizes on the ASCII runs
+    /// inside it — which is also the case that would panic a byte-index
+    /// scanner that got its boundaries wrong.
+    #[test]
+    fn indep_word_scanner_matches_the_prototype_word_regex() {
+        let expected: &[(&str, &[&str])] = &[
+            ("_foo bar9 9abc a1_b", &["foo", "bar9", "abc", "a1_b"]),
+            ("föö bär", &["f", "b", "r"]),
+            ("x-y_z", &["x", "y_z"]),
+            ("  ", &[]),
+            ("A.B.C", &["A", "B", "C"]),
+            ("", &[]),
+        ];
+        for (text, want) in expected {
+            assert_eq!(&words(text), want, "words({text:?})");
+        }
+    }
+
+    /// (oracle) `_stems`: the term plus one-, two- and three-character
+    /// truncations, each kept only when at least four characters survive.
+    #[test]
+    fn indep_stems_match_the_prototype() {
+        let expected: &[(&str, &[&str])] = &[
+            ("agents", &["agents", "agent", "agen"]),
+            (
+                "orchestrator",
+                &["orchestrator", "orchestrato", "orchestrat", "orchestra"],
+            ),
+            ("span", &["span"]),
+            ("abcd", &["abcd"]),
+            ("abcde", &["abcde", "abcd"]),
+            ("abcdef", &["abcdef", "abcde", "abcd"]),
+            ("abcdefg", &["abcdefg", "abcdef", "abcde", "abcd"]),
+            ("public", &["public", "publi", "publ"]),
+            (
+                "implementation",
+                &[
+                    "implementation",
+                    "implementatio",
+                    "implementati",
+                    "implementat",
+                ],
+            ),
+            ("http", &["http"]),
+        ];
+        for (term, want) in expected {
+            assert_eq!(&stems(term), want, "stems({term:?})");
+        }
+        // The floor is a floor in both directions: a stem must MATCH as a
+        // prefix, so `implement` does not cover `implementation` but
+        // `implementations` does.
+        assert_eq!(
+            coverage(&["implementation".to_string()], "implement"),
+            (vec![], vec!["implementation".to_string()])
+        );
+        assert_eq!(
+            coverage(&["implementation".to_string()], "implementations"),
+            (vec!["implementation".to_string()], vec![])
+        );
+        assert_eq!(
+            coverage(&["span".to_string()], "spa"),
+            (vec![], vec!["span".to_string()])
+        );
+    }
+
+    /// (oracle) Whole-query extraction, including the stopword boundaries the
+    /// prototype argues about in prose: `run`/`runs` are glue but `running`
+    /// and `runner` are not; `apis`/`usage`/`source`/`sources` were promoted
+    /// into the brief list but `api` and `answer`/`answers` deliberately were
+    /// not; `public`, `implementation`, `behavior`, `documentation` and
+    /// `serialization` stay countable.
+    #[test]
+    fn indep_query_terms_match_the_prototype() {
+        let expected: &[(&str, &[&str])] = &[
+            (
+                "CheckpointStorage and parse_HTTPHeader",
+                &[
+                    "checkpointstorage",
+                    "checkpoint",
+                    "storage",
+                    "parse_httpheader",
+                    "parse",
+                    "http",
+                    "header",
+                ],
+            ),
+            (
+                "Identify the exact source locations and cite concrete evidence showing any \
+                 usage examples of retries",
+                &["retries"],
+            ),
+            (
+                "public implementation behavior answer",
+                &["public", "implementation", "behavior", "answer"],
+            ),
+            (
+                "documentation serialization usage",
+                &["documentation", "serialization"],
+            ),
+            (
+                "HTTPServer XMLHttpRequest parse_JSON_data",
+                &[
+                    "httpserver",
+                    "http",
+                    "server",
+                    "xmlhttprequest",
+                    "xml",
+                    "request",
+                    "parse_json_data",
+                    "parse",
+                    "json",
+                    "data",
+                ],
+            ),
+            ("the and for with how does", &[]),
+            ("a ab abc abcd", &["abc", "abcd"]),
+            ("Foo Foo foo FOO", &["foo"]),
+            (
+                "widget_factory WidgetFactory widget factory",
+                &["widget_factory", "widget", "factory", "widgetfactory"],
+            ),
+            (
+                "answers answer sources source apis api",
+                &["answers", "answer", "api"],
+            ),
+            (
+                "IOError handling in read_file_utf8",
+                &[
+                    "ioerror",
+                    "error",
+                    "handling",
+                    "read_file_utf8",
+                    "read",
+                    "file",
+                    "utf8",
+                ],
+            ),
+            ("run runs running runner", &["running", "runner"]),
+            ("", &[]),
+            ("   ", &[]),
+            (
+                "quantum chromodynamics lattice gauge",
+                &["quantum", "chromodynamics", "lattice", "gauge"],
+            ),
+        ];
+        for (query, want) in expected {
+            assert_eq!(query_terms(query), *want, "query_terms({query:?})");
+        }
+    }
+
+    /// The stopword table was diffed as a SET against
+    /// `lore_pkg._STOPWORDS | _BRIEF_STOPWORDS` by running the prototype:
+    /// 218 words each way, symmetric difference empty. This guards the size
+    /// and the entries the prototype's comments call load-bearing, so a
+    /// future edit cannot quietly move a word across the line.
+    #[test]
+    fn indep_stopword_table_is_the_prototypes_union() {
+        assert_eq!(STOPWORDS.len(), 218, "the prototype's union has 218 words");
+        for glue in [
+            "identify",
+            "evidence",
+            "exact",
+            "locations",
+            "source",
+            "sources",
+            "apis",
+            "usage",
+            "repository",
+            "code",
+            "run",
+            "runs",
+            "example",
+            "examples",
+            "task",
+            "point",
+        ] {
+            assert!(is_stopword(glue), "{glue} is brief vocabulary");
+        }
+        for real in [
+            "implementation",
+            "documentation",
+            "serialization",
+            "public",
+            "behavior",
+            "answer",
+            "answers",
+            "api",
+            "running",
+            "runner",
+        ] {
+            assert!(!is_stopword(real), "{real} must stay countable");
+        }
+    }
+
+    // -- verdict cuts -------------------------------------------------------
+
+    /// Twenty four-letter terms, pairwise non-substring so `stems` cannot let
+    /// one cover another; the fixture file carries the first `covered` of
+    /// them, which makes the ratio exactly `covered/20`.
+    const INDEP_TERMS: [&str; 20] = [
+        "qqqa", "wwwb", "eeec", "rrrd", "ttte", "yyyf", "uuug", "iiih", "oooi", "pppj", "aaak",
+        "sssl", "dddm", "fffn", "gggo", "hhhp", "jjjq", "kkkr", "llls", "zzzt",
+    ];
+
+    fn indep_ratio_bundle(covered: usize) -> BundleResponse {
+        let body = format!("{}\n", INDEP_TERMS[..covered].join(" "));
+        let fixture = corpus(&[("z.txt", &body)]);
+        assemble(
+            &INDEP_TERMS.join(" "),
+            &response(&[hit("z.txt", 1, 1, "")]),
+            &fixture.1,
+            40_000,
+            24,
+        )
+    }
+
+    /// (oracle) The cuts are inclusive: 13/20 is exactly 0.65 and must read
+    /// `found`, 9/20 is exactly 0.45 and must read `weak`. The prototype's
+    /// whole calibration argument is about where these two numbers sit, so a
+    /// `>` where it wants `>=` is a silent recalibration.
+    #[test]
+    fn indep_verdict_cuts_are_inclusive_at_exactly_0_65_and_0_45() {
+        let found = indep_ratio_bundle(13);
+        assert_eq!(found.coverage, 0.65);
+        assert_eq!(found.verdict, "found");
+
+        let below = indep_ratio_bundle(12);
+        assert_eq!(below.coverage, 0.6);
+        assert_eq!(below.verdict, "weak");
+
+        let weak = indep_ratio_bundle(9);
+        assert_eq!(weak.coverage, 0.45);
+        assert_eq!(weak.verdict, "weak");
+        assert!(
+            weak.text
+                .contains("weak (1 verified span(s), but only 9 of 20 query terms appear in them"),
+            "{}",
+            weak.text
+        );
+
+        let none = indep_ratio_bundle(8);
+        assert_eq!(none.coverage, 0.4);
+        assert_eq!(none.verdict, "none");
+        assert!(
+            none.text
+                .contains("only 8 of 20 query terms appear anywhere in what came back"),
+            "{}",
+            none.text
+        );
+
+        let all = indep_ratio_bundle(20);
+        assert_eq!(all.coverage, 1.0);
+        assert_eq!(all.verdict, "found");
+        assert!(all.terms_uncovered.is_empty());
+    }
+
+    /// (oracle) Uncovered terms keep the query's order, which is what makes
+    /// `NO MATCH FOR:` readable as "the tail of what you asked".
+    #[test]
+    fn indep_uncovered_terms_keep_query_order() {
+        let weak = indep_ratio_bundle(13);
+        assert_eq!(
+            weak.terms_uncovered,
+            ["fffn", "gggo", "hhhp", "jjjq", "kkkr", "llls", "zzzt"]
+        );
+        assert!(
+            weak.text
+                .contains("NO MATCH FOR: fffn, gggo, hhhp, jjjq, kkkr, llls, zzzt"),
+            "{}",
+            weak.text
+        );
+    }
+
+    /// (oracle) A term that appears only in an *overflowed* or *oversized*
+    /// span's path is covered by the path and not by any text, because the
+    /// prototype folds `spans + oversized` paths into the blob after
+    /// budgeting. `charlie` is covered (its path came back), `line` is not
+    /// (the 300-line block was never rendered).
+    #[test]
+    fn indep_coverage_counts_paths_of_demoted_spans_but_not_their_text() {
+        let oversized = corpus(&[("charlie.txt", &numbered(400, ""))]);
+        let bundle = assemble(
+            "charlie line",
+            &response(&[hit("charlie.txt", 1, 300, "")]),
+            &oversized.1,
+            40_000,
+            24,
+        );
+        assert_eq!(bundle.coverage, 0.5);
+        assert_eq!(bundle.terms_covered, ["charlie"]);
+        assert_eq!(bundle.terms_uncovered, ["line"]);
+
+        // The same rule for a span the *budget* demoted rather than its size.
+        let body = numbered(400, "");
+        let budgeted = corpus(&[("alpha.txt", &body), ("bravo.txt", &body)]);
+        let bundle = assemble(
+            "alpha bravo",
+            &response(&[hit("alpha.txt", 1, 100, ""), hit("bravo.txt", 1, 100, "")]),
+            &budgeted.1,
+            400,
+            24,
+        );
+        assert_eq!(bundle.spans.len(), 1);
+        assert_eq!(bundle.further_reading.len(), 1);
+        assert_eq!(bundle.coverage, 1.0);
+    }
+
+    /// A query made only of stopwords has no terms at all, and the prototype
+    /// calls that vacuously covered (`ratio = 1.0`) rather than a failure.
+    #[test]
+    fn indep_an_all_stopword_query_is_vacuously_covered() {
+        let fixture = corpus(&[("a.txt", "alpha\n")]);
+        let bundle = assemble(
+            "the and for",
+            &response(&[hit("a.txt", 1, 1, "alpha")]),
+            &fixture.1,
+            40_000,
+            24,
+        );
+        assert!(bundle.terms.is_empty());
+        assert_eq!(bundle.coverage, 1.0);
+        assert_eq!(bundle.verdict, "found");
+    }
+
+    // -- staleness, dedent, BOM, line endings -------------------------------
+
+    /// (oracle) The chunker dedents; the file may indent with tabs where the
+    /// excerpt has spaces. Indentation is compared not at all, and the render
+    /// keeps the file's real tabs.
+    #[test]
+    fn indep_tabs_in_the_file_against_spaces_in_the_excerpt_are_not_stale() {
+        let fixture = corpus(&[("m.py", "class C:\n\tdef foo(self):\n\t\treturn 1\n")]);
+        let bundle = assemble(
+            "foo",
+            &response(&[hit("m.py", 2, 3, "def foo(self):\n    return 1")]),
+            &fixture.1,
+            40_000,
+            24,
+        );
+        assert!(bundle.dropped.is_empty(), "{:?}", bundle.dropped);
+        assert_eq!(
+            bundle.text,
+            "VERDICT: found (1 verified span(s) from 1 file(s))\n\
+             === m.py:1-3 ===\n\
+             1  class C:\n\
+             2  \tdef foo(self):\n\
+             3  \t\treturn 1\n"
+        );
+    }
+
+    /// (oracle) A *partial* dedent — the chunker stripped some but not all of
+    /// the common indent — is still not stale, for the same reason.
+    #[test]
+    fn indep_a_partially_dedented_excerpt_is_not_stale() {
+        let fixture = corpus(&[("m.py", "class C:\n    def foo(self):\n        return 1\n")]);
+        let bundle = assemble(
+            "foo",
+            &response(&[hit("m.py", 2, 3, "  def foo(self):\n      return 1")]),
+            &fixture.1,
+            40_000,
+            24,
+        );
+        assert!(bundle.dropped.is_empty(), "{:?}", bundle.dropped);
+        assert_eq!(bundle.spans.len(), 1);
+    }
+
+    /// (oracle) Blank lines are dropped on both sides before comparing, and
+    /// trailing whitespace is trimmed away — neither is "different code".
+    #[test]
+    fn indep_blank_lines_and_trailing_whitespace_are_not_staleness() {
+        let blanks = corpus(&[("m.py", "one\ntwo\nthree\n")]);
+        let bundle = assemble(
+            "two",
+            &response(&[hit("m.py", 1, 3, "one\n\ntwo\n\nthree")]),
+            &blanks.1,
+            40_000,
+            24,
+        );
+        assert!(bundle.dropped.is_empty(), "{:?}", bundle.dropped);
+
+        let trailing = corpus(&[("m.py", "def foo():   \n    pass\t\n")]);
+        let bundle = assemble(
+            "foo",
+            &response(&[hit("m.py", 1, 2, "def foo():\npass")]),
+            &trailing.1,
+            40_000,
+            24,
+        );
+        assert!(bundle.dropped.is_empty(), "{:?}", bundle.dropped);
+    }
+
+    /// (oracle) Interior whitespace is NOT collapsed: `def  foo` and
+    /// `def foo` are different code, and the check exists to catch exactly
+    /// that.
+    #[test]
+    fn indep_interior_whitespace_still_counts_as_moved_text() {
+        let fixture = corpus(&[("m.py", "def  foo():\n    pass\n")]);
+        let bundle = assemble(
+            "foo",
+            &response(&[hit("m.py", 1, 2, "def foo():\npass")]),
+            &fixture.1,
+            40_000,
+            24,
+        );
+        assert_eq!(bundle.dropped.len(), 1);
+        assert_eq!(bundle.dropped[0].reason, "stale");
+        assert_eq!(bundle.dropped[0].paths, ["m.py:1-2"]);
+    }
+
+    /// (oracle) A CRLF file compared against an LF excerpt is not stale, and
+    /// the render carries no carriage returns — the prototype reads in text
+    /// mode (universal newlines) and `str::lines()` lands in the same place.
+    #[test]
+    fn indep_a_crlf_file_against_an_lf_excerpt_is_not_stale() {
+        let fixture = corpus(&[("m.py", "one\r\ntwo\r\nthree\r\n")]);
+        let bundle = assemble(
+            "two",
+            &response(&[hit("m.py", 1, 3, "one\ntwo\nthree")]),
+            &fixture.1,
+            40_000,
+            24,
+        );
+        assert!(bundle.dropped.is_empty(), "{:?}", bundle.dropped);
+        assert_eq!(
+            bundle.text,
+            "VERDICT: found (1 verified span(s) from 1 file(s))\n\
+             === m.py:1-3 ===\n1  one\n2  two\n3  three\n"
+        );
+    }
+
+    /// A byte-order mark inside the *excerpt* is not stripped by either side
+    /// (neither `str::trim` nor Python's `str.strip` treats U+FEFF as
+    /// whitespace), so an index row that stored the mark reads as stale. The
+    /// prototype agrees; this pins the asymmetry deliberately, because
+    /// stripping only the disk side is the whole point of the BOM rule.
+    #[test]
+    fn indep_a_bom_kept_in_the_excerpt_reads_as_stale() {
+        let fixture = corpus(&[("b.md", "\u{feff}# Title\nbody\n")]);
+        let bundle = assemble(
+            "title",
+            &response(&[hit("b.md", 1, 2, "\u{feff}# Title\nbody")]),
+            &fixture.1,
+            40_000,
+            24,
+        );
+        assert_eq!(bundle.dropped.len(), 1);
+        assert_eq!(bundle.dropped[0].reason, "stale");
+    }
+
+    /// **Declared-deviation probe.** `str::lines()` splits on `\n` only, so a
+    /// classic-Mac file whose lines are separated by bare `\r` is one line
+    /// here; the prototype reads through Python's universal-newline
+    /// translation and sees three. This module's answer is the one that
+    /// agrees with the rest of the daemon (`daemon::expand::widen` and the
+    /// chunker both use `str::lines()`), so the divergence is benign — but it
+    /// is a divergence, and it is asserted rather than left to chance.
+    #[test]
+    fn indep_a_bare_cr_is_not_a_line_break_here_though_it_is_in_the_prototype() {
+        let fixture = corpus(&[("cr.txt", "one\rtwo\rthree\n")]);
+        let bundle = assemble(
+            "two",
+            &response(&[hit("cr.txt", 1, 1, "one")]),
+            &fixture.1,
+            40_000,
+            24,
+        );
+        // One line, so line 1 is the whole file and the one-line excerpt does
+        // not match it. The prototype renders `cr.txt:1-3` instead.
+        assert_eq!(bundle.dropped.len(), 1);
+        assert_eq!(bundle.dropped[0].reason, "stale");
+    }
+
+    // -- ranges -------------------------------------------------------------
+
+    /// (oracle) The range check is `1 <= start <= end <= file_lines`, and the
+    /// file's line count excludes the empty string a trailing newline splits
+    /// off.
+    #[test]
+    fn indep_range_edges_match_the_prototype() {
+        let two = corpus(&[("m.py", "one\ntwo\n")]);
+        for (start, end) in [(0u32, 1u32), (2, 1), (1, 3), (3, 3)] {
+            let bundle = assemble(
+                "one",
+                &response(&[hit("m.py", start, end, "")]),
+                &two.1,
+                40_000,
+                24,
+            );
+            assert_eq!(
+                bundle.dropped.first().map(|d| d.reason.as_str()),
+                Some("range"),
+                "{start}-{end} should be out of range"
+            );
+        }
+
+        // A file with no trailing newline still has its last line.
+        let ragged = corpus(&[("m.py", "one\ntwo")]);
+        let bundle = assemble(
+            "two",
+            &response(&[hit("m.py", 2, 2, "two")]),
+            &ragged.1,
+            40_000,
+            24,
+        );
+        assert!(bundle.dropped.is_empty(), "{:?}", bundle.dropped);
+        assert_eq!(
+            (bundle.spans[0].line_start, bundle.spans[0].line_end),
+            (1, 2),
+            "and it widens to the whole two-line file"
+        );
+
+        // An empty file has zero lines, so nothing can be in range.
+        let empty = corpus(&[("m.py", "")]);
+        let bundle = assemble(
+            "one",
+            &response(&[hit("m.py", 1, 1, "")]),
+            &empty.1,
+            40_000,
+            24,
+        );
+        assert_eq!(bundle.dropped[0].reason, "range");
+    }
+
+    // -- widening -----------------------------------------------------------
+
+    /// (oracle, against the prototype driven through a stub of
+    /// `super::expand::widen`) The threshold is `width < 16`, and the context
+    /// is `ceil((28 - width) / 2)` on each side: 15 lines gains 7 a side,
+    /// 1 line gains 14 a side, 16 lines is left exactly as it is.
+    #[test]
+    fn indep_widening_threshold_and_context_match_the_prototype() {
+        let fixture = corpus(&[("f.txt", &numbered(400, ""))]);
+        let cases = [
+            ((100u32, 115u32), (100u32, 115u32), 0u32), // width 16: untouched
+            ((100, 114), (93, 121), 1),                 // width 15: +7 a side
+            ((100, 100), (86, 114), 1),                 // width  1: +14 a side
+            ((100, 112), (92, 120), 1),                 // width 13: +8 a side
+        ];
+        for ((start, end), (want_start, want_end), want_widened) in cases {
+            let bundle = assemble(
+                "line",
+                &response(&[hit("f.txt", start, end, "")]),
+                &fixture.1,
+                40_000,
+                24,
+            );
+            assert_eq!(
+                (
+                    bundle.spans[0].line_start,
+                    bundle.spans[0].line_end,
+                    bundle.spans_widened
+                ),
+                (want_start, want_end, want_widened),
+                "widening {start}-{end}"
+            );
+        }
+    }
+
+    /// (oracle) Widening that clamps to a no-op is not counted as a widening,
+    /// which is what keeps `spans_widened` an honest number rather than "how
+    /// many short spans there were".
+    #[test]
+    fn indep_a_widening_clamped_to_nothing_is_not_counted() {
+        let fixture = corpus(&[("s.txt", "a\nb\nc\n")]);
+        let bundle = assemble(
+            "bbb",
+            &response(&[hit("s.txt", 1, 3, "")]),
+            &fixture.1,
+            40_000,
+            24,
+        );
+        assert_eq!(bundle.spans_widened, 0);
+        assert_eq!(
+            (bundle.spans[0].line_start, bundle.spans[0].line_end),
+            (1, 3)
+        );
+    }
+
+    // -- merging ------------------------------------------------------------
+
+    /// Drive `assemble` over one 400-line file with spans wide enough that
+    /// widening never fires, and report `(start, end, merged)` per span.
+    fn indep_merged(hits: &[(u32, u32)]) -> Vec<(u32, u32, u32)> {
+        let fixture = corpus(&[("f.txt", &numbered(400, ""))]);
+        let results: Vec<SearchResult> = hits
+            .iter()
+            .map(|&(start, end)| hit("f.txt", start, end, ""))
+            .collect();
+        let bundle = assemble("line", &response(&results), &fixture.1, 40_000, 24);
+        bundle
+            .spans
+            .iter()
+            .map(|span| (span.line_start, span.line_end, span.merged))
+            .collect()
+    }
+
+    /// (oracle) `MERGE_GAP` is inclusive: four blank lines between two spans
+    /// merge, five do not.
+    #[test]
+    fn indep_merge_gap_is_inclusive_at_four() {
+        assert_eq!(indep_merged(&[(1, 20), (24, 43)]), [(1, 43, 2)]);
+        assert_eq!(
+            indep_merged(&[(1, 20), (25, 44)]),
+            [(1, 20, 1), (25, 44, 1)]
+        );
+    }
+
+    /// (oracle) Overlap and containment give a negative gap, which must
+    /// always merge; and a later span that starts *before* the one it merges
+    /// into extends it backwards while keeping the earlier span's rank
+    /// position.
+    #[test]
+    fn indep_merge_handles_containment_and_backward_extension() {
+        // 20-30 sits entirely inside 10-40: the union is unchanged.
+        assert_eq!(indep_merged(&[(10, 40), (20, 30)]), [(10, 40, 2)]);
+        // 60-99 abuts 100-140 from below (gap 1) and drags the start back.
+        assert_eq!(indep_merged(&[(100, 140), (60, 99)]), [(60, 140, 2)]);
+        // Exactly adjacent, no gap at all.
+        assert_eq!(indep_merged(&[(1, 20), (21, 40)]), [(1, 40, 2)]);
+    }
+
+    /// (oracle) `MERGE_CAP_LINES` is inclusive too: a union of exactly 140
+    /// lines merges, 141 refuses and the two stay separate.
+    #[test]
+    fn indep_merge_cap_is_inclusive_at_one_hundred_and_forty() {
+        assert_eq!(indep_merged(&[(1, 100), (104, 140)]), [(1, 140, 2)]);
+        assert_eq!(
+            indep_merged(&[(1, 100), (104, 141)]),
+            [(1, 100, 1), (104, 141, 1)]
+        );
+    }
+
+    /// (oracle) Merging is a single forward pass: a span grows as members
+    /// join it, so a third span can reach a span it could not have reached
+    /// before — but the pass never goes back to re-check earlier output, so
+    /// arrival order decides the answer. Both orders are pinned, because
+    /// "fix" the second one and rank order stops meaning anything.
+    #[test]
+    fn indep_merging_chains_forward_but_never_rescans() {
+        // 24-43 joins 1-20 (gap 4), which makes 1-43; 47-66 is then gap 4
+        // from the grown span and joins too.
+        assert_eq!(indep_merged(&[(1, 20), (24, 43), (47, 66)]), [(1, 66, 3)]);
+        // Same three spans, different rank order: 47-66 arrives while 1-20 is
+        // still short, so it stays its own span forever.
+        assert_eq!(
+            indep_merged(&[(1, 20), (47, 66), (24, 43)]),
+            [(1, 43, 2), (47, 66, 1)]
+        );
+    }
+
+    /// Same line numbers, different files: never merged, and `merged` stays 1.
+    #[test]
+    fn indep_spans_in_different_files_never_merge() {
+        let body = numbered(400, "");
+        let fixture = corpus(&[("a.txt", &body), ("b.txt", &body)]);
+        let bundle = assemble(
+            "line",
+            &response(&[hit("a.txt", 1, 20, ""), hit("b.txt", 1, 20, "")]),
+            &fixture.1,
+            40_000,
+            24,
+        );
+        assert_eq!(bundle.spans_after_merge, 2);
+        assert!(bundle.spans.iter().all(|span| span.merged == 1));
+        assert!(
+            bundle
+                .text
+                .starts_with("VERDICT: found (2 verified span(s) from 2 file(s))"),
+            "{}",
+            bundle.text
+        );
+    }
+
+    // -- size and budget ----------------------------------------------------
+
+    /// (oracle) `MAX_SPAN_LINES` is inclusive: 160 lines render, 161 become a
+    /// pointer without ever entering the budget.
+    #[test]
+    fn indep_oversize_cut_is_inclusive_at_one_hundred_and_sixty() {
+        let fixture = corpus(&[("f.txt", &numbered(400, ""))]);
+        let fits = assemble(
+            "line",
+            &response(&[hit("f.txt", 1, 160, "")]),
+            &fixture.1,
+            40_000,
+            24,
+        );
+        assert_eq!(fits.spans_oversized, 0);
+        assert_eq!(fits.spans.len(), 1);
+
+        let over = assemble(
+            "line",
+            &response(&[hit("f.txt", 1, 161, "")]),
+            &fixture.1,
+            40_000,
+            24,
+        );
+        assert_eq!(over.spans_oversized, 1);
+        assert!(over.spans.is_empty());
+        assert_eq!(over.spans_after_merge, 1, "it was still a merged span");
+        assert!(
+            over.text.contains("FURTHER READING: f.txt:1-161"),
+            "{}",
+            over.text
+        );
+    }
+
+    /// (oracle) The budget test is `used + cost > budget_chars`, so a bundle
+    /// that lands exactly on the budget still fits. Two 16-line blocks from
+    /// `a.txt` and `ccc.txt` cost 203 + 205 = 408 characters including the
+    /// two-character joiners; at 102 tokens (408 chars) both render, and four
+    /// characters less demotes the second one whole.
+    #[test]
+    fn indep_the_budget_admits_a_span_that_lands_exactly_on_it() {
+        let body = numbered(400, "");
+        let fixture = corpus(&[("a.txt", &body), ("ccc.txt", &body)]);
+        let hits = [hit("a.txt", 1, 16, ""), hit("ccc.txt", 1, 16, "")];
+
+        let exact = assemble("line", &response(&hits), &fixture.1, 102, 24);
+        assert_eq!(exact.spans.len(), 2, "408 chars is exactly enough");
+        assert!(exact.further_reading.is_empty());
+
+        let short = assemble("line", &response(&hits), &fixture.1, 101, 24);
+        assert_eq!(short.spans.len(), 1);
+        assert_eq!(short.further_reading.len(), 1);
+        assert_eq!(short.further_reading[0].path, "ccc.txt");
+    }
+
+    /// (oracle) Demotion is per span and does not stop the scan: a big span
+    /// that will not fit is skipped, and a later smaller one still renders.
+    /// The alternative — stopping at the first overflow — would silently make
+    /// the bundle a prefix of the ranking rather than the best of it.
+    #[test]
+    fn indep_a_smaller_later_span_still_fits_after_a_bigger_one_is_demoted() {
+        let body = numbered(400, "");
+        let fixture = corpus(&[("a.txt", &body), ("b.txt", &body), ("c.txt", &body)]);
+        let bundle = assemble(
+            "line",
+            &response(&[
+                hit("a.txt", 1, 20, ""),
+                hit("b.txt", 1, 200, ""),
+                hit("c.txt", 1, 20, ""),
+            ]),
+            &fixture.1,
+            200,
+            24,
+        );
+        assert_eq!(bundle.spans_after_merge, 3);
+        assert_eq!(bundle.spans_oversized, 1);
+        let paths: Vec<&str> = bundle.spans.iter().map(|s| s.path.as_str()).collect();
+        assert_eq!(paths, ["a.txt", "c.txt"]);
+        assert_eq!(bundle.further_reading.len(), 1);
+        assert_eq!(bundle.further_reading[0].path, "b.txt");
+    }
+
+    /// (oracle) Twenty-five verified spans, one budgeted in: the header names
+    /// twenty pointers and no more, while the structured field keeps all
+    /// twenty-four.
+    #[test]
+    fn indep_further_reading_prints_at_most_twenty_pointers() {
+        let body = numbered(400, "");
+        let files: Vec<(String, String)> = (0..25)
+            .map(|i| (format!("f{i:02}.txt"), body.clone()))
+            .collect();
+        let borrowed: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(name, body)| (name.as_str(), body.as_str()))
+            .collect();
+        let fixture = corpus(&borrowed);
+        let hits: Vec<SearchResult> = (0..25)
+            .map(|i| hit(&format!("f{i:02}.txt"), 1, 20, ""))
+            .collect();
+
+        let bundle = assemble("line", &response(&hits), &fixture.1, 100, 24);
+        assert_eq!(bundle.spans.len(), 1);
+        assert_eq!(bundle.further_reading.len(), 24);
+        let line = bundle
+            .text
+            .lines()
+            .find(|line| line.starts_with("FURTHER READING:"))
+            .expect("a further-reading line");
+        assert_eq!(line.matches(", ").count(), 19, "{line}");
+        assert!(line.ends_with("f20.txt:1-20"), "{line}");
+    }
+
+    /// (oracle) The `none` trim runs on a budget of its own and keeps the
+    /// first span whatever it costs — a 150-line block is ~5.9k characters,
+    /// well past the 4.8k the trim allows, and it still renders because a
+    /// bundle that trimmed itself to nothing would be claiming something
+    /// different from what happened.
+    #[test]
+    fn indep_the_none_trim_keeps_its_first_span_past_its_own_budget() {
+        let body = numbered(400, " padding padding padding");
+        let fixture = corpus(&[("a.txt", &body), ("b.txt", &body)]);
+        let bundle = assemble(
+            "quantum chromodynamics lattice gauge",
+            &response(&[hit("a.txt", 1, 150, ""), hit("b.txt", 1, 150, "")]),
+            &fixture.1,
+            4000,
+            24,
+        );
+        assert_eq!(bundle.verdict, "none");
+        assert_eq!(bundle.spans.len(), 1);
+        assert_eq!(bundle.further_reading.len(), 1);
+        assert!(
+            bundle.bundle_tokens_est > NONE_BUDGET_TOKENS,
+            "the first span is kept whole: {}",
+            bundle.bundle_tokens_est
+        );
+        // ...and the coverage is NOT re-measured after the trim, or the
+        // verdict that caused it could flip underneath itself.
+        assert_eq!(bundle.coverage, 0.0);
+    }
+
+    /// A `weak` bundle is not trimmed — only `none` is.
+    #[test]
+    fn indep_only_a_none_verdict_is_trimmed() {
+        let body = format!("{}\n", INDEP_TERMS[..10].join(" "));
+        let padding = numbered(300, " padding padding padding padding");
+        let fixture = corpus(&[("z.txt", &body), ("pad.txt", &padding)]);
+        let bundle = assemble(
+            &INDEP_TERMS.join(" "),
+            &response(&[hit("z.txt", 1, 1, ""), hit("pad.txt", 1, 150, "")]),
+            &fixture.1,
+            4000,
+            24,
+        );
+        assert_eq!(bundle.verdict, "weak");
+        assert_eq!(bundle.spans.len(), 2, "no trim at `weak`");
+        assert!(bundle.bundle_tokens_est > NONE_BUDGET_TOKENS);
+    }
+
+    // -- the DROPPED header -------------------------------------------------
+
+    /// (oracle) The count is of hits, the list is of distinct paths sorted:
+    /// three refusals over two paths print as `(missing, 3)` with two names.
+    #[test]
+    fn indep_dropped_counts_hits_but_lists_distinct_sorted_paths() {
+        let fixture = corpus(&[("m.py", "one\ntwo\n")]);
+        let bundle = assemble(
+            "one",
+            &response(&[
+                hit("gone.py", 1, 1, ""),
+                hit("gone.py", 1, 1, ""),
+                hit("also-gone.py", 1, 1, ""),
+            ]),
+            &fixture.1,
+            40_000,
+            24,
+        );
+        assert_eq!(bundle.hits_rejected, 3);
+        assert_eq!(bundle.dropped.len(), 1);
+        assert_eq!(bundle.dropped[0].count, 3);
+        assert_eq!(bundle.dropped[0].paths, ["also-gone.py", "gone.py"]);
+        assert!(
+            bundle
+                .text
+                .contains("DROPPED (missing, 3): also-gone.py, gone.py"),
+            "{}",
+            bundle.text
+        );
+    }
+
+    /// (oracle) Header order in full: verdict, then `NO MATCH FOR`, then the
+    /// lexical-only note, then one `DROPPED` line per reason in alphabetical
+    /// order. Asserted as whole text, because the order is the contract's and
+    /// not this module's.
+    #[test]
+    fn indep_the_header_is_assembled_in_the_prototypes_order() {
+        let fixture = corpus(&[("m.py", "one\ntwo\n")]);
+        let mut results = response(&[
+            hit("m.py", 1, 99, ""),
+            hit("gone.py", 1, 1, ""),
+            hit("m.py", 1, 2, "not what is there"),
+        ]);
+        results.lexical_only = true;
+        let bundle = assemble("zzzt", &results, &fixture.1, 40_000, 24);
+        assert_eq!(
+            bundle.text,
+            "VERDICT: none (nothing relevant found for: zzzt)\n\
+             NO MATCH FOR: zzzt\n\
+             NOTE: the index answered without its vector arm (lexical-only degradation); \
+             recall may be lower than usual.\n\
+             DROPPED (missing, 1): gone.py\n\
+             DROPPED (range, 1): m.py\n\
+             DROPPED (stale, 1): m.py:1-2\n"
+        );
+    }
+
+    /// **Defect (cosmetic, low severity).** The prototype names an empty
+    /// indexed path `?` in the `DROPPED` line (`where = path or "?"`); this
+    /// port prints the empty string, so the line reads `DROPPED (missing, 1):`
+    /// with nothing after the colon. Ignored rather than deleted: the
+    /// assertion below is what the prototype does, and the port should be
+    /// changed to match rather than the test relaxed.
+    #[test]
+    fn defect_an_empty_indexed_path_should_be_named_in_the_dropped_line() {
+        let fixture = corpus(&[("m.py", "one\n")]);
+        let bundle = assemble(
+            "one",
+            &response(&[hit("", 1, 1, "")]),
+            &fixture.1,
+            40_000,
+            24,
+        );
+        assert_eq!(bundle.dropped[0].paths, ["?"]);
+        assert!(
+            bundle.text.contains("DROPPED (missing, 1): ?"),
+            "{}",
+            bundle.text
+        );
+    }
+
+    /// **Defect (cosmetic, low severity).** `round3` rounds half away from
+    /// zero; the prototype's `round(ratio, 3)` rounds half to even. They
+    /// disagree whenever `ratio * 1000` is exactly `n + 0.5` and exactly
+    /// representable — 1/16 is 0.0625, which the prototype reports as 0.062
+    /// and this port as 0.063. Only the reported `coverage` field moves; the
+    /// verdict is taken from the unrounded ratio, so no cut is affected.
+    #[test]
+    fn defect_coverage_rounding_should_match_the_prototypes_half_to_even() {
+        let body = format!("{}\n", INDEP_TERMS[0]);
+        let fixture = corpus(&[("z.txt", &body)]);
+        let bundle = assemble(
+            &INDEP_TERMS[..16].join(" "),
+            &response(&[hit("z.txt", 1, 1, "")]),
+            &fixture.1,
+            40_000,
+            24,
+        );
+        assert_eq!(bundle.terms.len(), 16);
+        assert_eq!(bundle.terms_covered.len(), 1);
+        assert_eq!(bundle.coverage, 0.062, "1/16 == 0.0625, half to even");
+    }
+
+    // -- containment: the adversarial cases ---------------------------------
+
+    /// A link to a directory in whatever form the platform makes one — a
+    /// junction on Windows (needs no privilege, unlike a file symlink), an
+    /// ordinary symlink on POSIX. Same shape as `super::paths`' own tests.
+    #[cfg(windows)]
+    fn indep_link_dir(link: &Utf8Path, target: &Utf8Path) {
+        let out = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J", link.as_str(), target.as_str()])
+            .output()
+            .expect("mklink is available");
+        assert!(out.status.success(), "mklink /J failed: {out:?}");
+    }
+
+    #[cfg(unix)]
+    fn indep_link_dir(link: &Utf8Path, target: &Utf8Path) {
+        std::os::unix::fs::symlink(target, link).expect("a POSIX symlink needs no privilege");
+    }
+
+    /// The adversarial containment case the `..` test cannot reach: a link
+    /// that lives *inside* the project root and points out of it. Every
+    /// component of the logical path is innocent, and only realpath resolution
+    /// reveals the escape — which is exactly why the check is realpath against
+    /// realpath and not a string prefix on the logical path.
+    #[test]
+    fn indep_a_link_inside_the_root_pointing_out_of_it_cannot_be_quoted() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let outer = paths::canonicalize_root(dir.path()).expect("a canonical root");
+        let secrets = outer.join("secrets");
+        std::fs::create_dir(&secrets).expect("creating the outside directory");
+        std::fs::write(secrets.join("secret.env"), "TOKEN=hunter2\n").expect("the outside file");
+
+        let root = outer.join("proj");
+        std::fs::create_dir(&root).expect("creating the project root");
+        std::fs::write(root.join("a.txt"), "alpha\n").expect("a fixture file");
+        indep_link_dir(&root.join("escape"), &secrets);
+        let sources = Sources::from_declared(&root, &[]);
+
+        // Sanity: the link really does lead to the file, so the refusal below
+        // is containment doing its job and not the path simply being wrong.
+        assert!(root.join("escape").join("secret.env").is_file());
+
+        let bundle = assemble(
+            "token",
+            &response(&[hit("escape/secret.env", 1, 1, "")]),
+            &sources,
+            40_000,
+            24,
+        );
+        assert_eq!(bundle.hits_verified, 0);
+        assert_eq!(bundle.dropped[0].reason, "missing");
+        assert_eq!(bundle.dropped[0].paths, ["escape/secret.env"]);
+        assert!(!bundle.text.contains("hunter2"), "{}", bundle.text);
+    }
+
+    /// `..` in the middle of an otherwise ordinary path, through a directory
+    /// that really exists — the form a naive "does it start with `..`?" guard
+    /// would wave through.
+    #[test]
+    fn indep_a_dotdot_in_the_middle_of_a_path_cannot_escape_either() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let outer = paths::canonicalize_root(dir.path()).expect("a canonical root");
+        std::fs::write(outer.join("secret.env"), "TOKEN=hunter2\n").expect("the outside file");
+        let root = outer.join("proj");
+        std::fs::create_dir(&root).expect("creating the project root");
+        std::fs::create_dir(root.join("sub")).expect("creating a real subdirectory");
+        std::fs::write(root.join("a.txt"), "alpha\n").expect("a fixture file");
+        let sources = Sources::from_declared(&root, &[]);
+
+        let bundle = assemble(
+            "token",
+            &response(&[
+                hit("sub/../../secret.env", 1, 1, ""),
+                // ...while a `..` that lands back inside is still served, so
+                // the guard is containment and not a ban on the characters.
+                hit("sub/../a.txt", 1, 1, "alpha"),
+            ]),
+            &sources,
+            40_000,
+            24,
+        );
+        assert_eq!(bundle.hits_verified, 1);
+        assert_eq!(bundle.spans[0].path, "sub/../a.txt");
+        assert_eq!(bundle.dropped[0].reason, "missing");
+        assert!(!bundle.text.contains("hunter2"), "{}", bundle.text);
+    }
+
+    /// An absolute path arriving from the index. On Windows it joins over the
+    /// root and resolves to a real file outside it; on POSIX the leading
+    /// separator is stripped and it resolves to nothing. Either way it is
+    /// refused, which is the property worth asserting.
+    #[test]
+    fn indep_an_absolute_indexed_path_is_refused() {
+        let outside = tempfile::tempdir().expect("a temporary directory");
+        let outside = paths::canonicalize_root(outside.path()).expect("a canonical root");
+        std::fs::write(outside.join("secret.env"), "TOKEN=hunter2\n").expect("the outside file");
+        let fixture = corpus(&[("a.txt", "alpha\n")]);
+
+        let absolute = outside.join("secret.env").as_str().replace('\\', "/");
+        let bundle = assemble(
+            "token",
+            &response(&[hit(&absolute, 1, 1, "")]),
+            &fixture.1,
+            40_000,
+            24,
+        );
+        assert_eq!(bundle.hits_verified, 0);
+        assert_eq!(bundle.dropped[0].reason, "missing");
+        assert!(!bundle.text.contains("hunter2"), "{}", bundle.text);
+    }
+
+    /// (oracle) A leading separator, and Windows separators, are normalized
+    /// away for *resolution* — but the path the bundle prints is the index's
+    /// own, slashes swapped and nothing else. The prototype does the same, and
+    /// it matters: the printed pointer is what the reader pastes back.
+    #[test]
+    fn indep_a_leading_separator_resolves_but_is_kept_in_the_printed_pointer() {
+        let fixture = corpus(&[("m.py", "one\ntwo\n")]);
+        for indexed in ["/m.py", "\\m.py"] {
+            let bundle = assemble(
+                "two",
+                &response(&[hit(indexed, 1, 2, "one\ntwo")]),
+                &fixture.1,
+                40_000,
+                24,
+            );
+            assert_eq!(bundle.hits_verified, 1, "{indexed}");
+            assert_eq!(bundle.spans[0].path, "/m.py", "{indexed}");
+            assert!(bundle.text.contains("=== /m.py:1-2 ==="), "{}", bundle.text);
+        }
+    }
+
+    // -- rendering ----------------------------------------------------------
+
+    /// (oracle) The gutter is as wide as the LAST line number and
+    /// right-aligned, with two spaces before the source. Full-text assertion,
+    /// because the block shape is what the consuming agent parses.
+    #[test]
+    fn indep_the_gutter_is_sized_by_the_last_line_number() {
+        let fixture = corpus(&[("f.txt", &numbered(400, ""))]);
+        let bundle = assemble(
+            "line",
+            &response(&[hit("f.txt", 98, 102, "")]),
+            &fixture.1,
+            40_000,
+            24,
+        );
+        let mut want = String::from(
+            "VERDICT: found (1 verified span(s) from 1 file(s))\n=== f.txt:86-114 ===\n",
+        );
+        for n in 86..=114 {
+            want.push_str(&format!("{n:>3}  line {n}\n"));
+        }
+        assert_eq!(bundle.text, want);
+    }
+
+    /// (oracle) A synthetic `#s0` symbol is dropped in favour of the heading
+    /// trail, and empty headings are skipped rather than printed as `> >`.
+    #[test]
+    fn indep_a_heading_trail_skips_its_empty_members() {
+        let fixture = corpus(&[("a.txt", "alpha\n")]);
+        let mut row = hit("a.txt", 1, 1, "alpha");
+        row.symbol_path = Some("#s0".into());
+        row.heading_path = Some(vec!["Guide".into(), String::new(), "Setup".into()]);
+        let bundle = assemble("alpha", &response(&[row]), &fixture.1, 40_000, 24);
+        assert_eq!(
+            bundle.text,
+            "VERDICT: found (1 verified span(s) from 1 file(s))\n\
+             === a.txt:1-1 [Guide > Setup] ===\n1  alpha\n"
+        );
+        assert_eq!(bundle.spans[0].label.as_deref(), Some("Guide > Setup"));
+    }
+
+    /// A label that is only whitespace, and a heading trail that is only
+    /// empty strings, both come out as *no* label — and the structured field
+    /// says `None` rather than `Some("")`.
+    #[test]
+    fn indep_an_empty_label_is_absent_rather_than_empty() {
+        let fixture = corpus(&[("a.txt", "alpha\n")]);
+        let mut blank = hit("a.txt", 1, 1, "alpha");
+        blank.symbol_path = Some("   ".into());
+        blank.heading_path = Some(vec![String::new(), String::new()]);
+        let bundle = assemble("alpha", &response(&[blank]), &fixture.1, 40_000, 24);
+        assert_eq!(bundle.spans[0].label, None);
+        assert!(
+            bundle.text.contains("=== a.txt:1-1 ===\n"),
+            "{}",
+            bundle.text
+        );
+    }
+
+    /// (oracle) `clip` is 200 *characters* of the trimmed query, and the
+    /// boundary must be a character boundary — a multi-byte query that is cut
+    /// mid-character would panic rather than truncate.
+    #[test]
+    fn indep_the_none_detail_clips_the_query_at_two_hundred_characters() {
+        let fixture = corpus(&[("a.txt", "alpha\n")]);
+        let query = format!("  {}  ", "é".repeat(250));
+        let bundle = assemble(&query, &response(&[]), &fixture.1, 40_000, 24);
+        assert_eq!(
+            bundle.verdict_detail,
+            format!("nothing relevant found for: {}", "é".repeat(200))
+        );
+    }
+
+    /// The reported counts are of the *hits*, not of what survived: a hit
+    /// verified and then folded into another span still counts once as
+    /// verified, and `hits_returned` counts what search handed over.
+    #[test]
+    fn indep_the_reported_counts_describe_the_hits_not_the_survivors() {
+        let fixture = corpus(&[("f.txt", &numbered(400, ""))]);
+        let bundle = assemble(
+            "line",
+            &response(&[
+                hit("f.txt", 1, 20, ""),
+                hit("f.txt", 24, 43, ""),
+                hit("gone.py", 1, 1, ""),
+            ]),
+            &fixture.1,
+            40_000,
+            24,
+        );
+        assert_eq!(bundle.hits_returned, 3);
+        assert_eq!(bundle.hits_verified, 2);
+        assert_eq!(bundle.hits_rejected, 1);
+        assert_eq!(bundle.spans_after_merge, 1);
+        assert_eq!(bundle.spans.len(), 1);
+        assert_eq!(bundle.spans[0].merged, 2);
+        // `top_score` is the first VERIFIED hit's score, and rounding it must
+        // not change it.
+        assert_eq!(bundle.top_score, Some(0.03));
     }
 
     // -- fixtures ----------------------------------------------------------
