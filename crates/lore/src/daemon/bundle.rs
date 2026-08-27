@@ -2970,6 +2970,431 @@ mod tests {
         assert_eq!(bundle.top_score, Some(0.03));
     }
 
+    // =======================================================================
+    // SYMBOL FOLLOWING
+    // =======================================================================
+    //
+    // These call `super::assemble` outright: the shadow at the top of this
+    // module is the follow-off arity, and the whole point here is what the
+    // extra argument does.
+
+    /// A definition `symbol` was followed to, named by `referrer`, which is the
+    /// hit at rank `origin`.
+    fn definition(
+        found: SearchResult,
+        symbol: &str,
+        referrer: &SearchResult,
+        origin: usize,
+    ) -> Followed {
+        Followed {
+            hit: found,
+            via: BundleVia {
+                path: referrer.path.clone(),
+                line_start: referrer.line_start,
+                line_end: referrer.line_end,
+                symbol: symbol.to_string(),
+            },
+            note: None,
+            origin,
+        }
+    }
+
+    /// `(path, start, end)` of the spans the ranking put in the bundle.
+    fn ranked_spans(bundle: &BundleResponse) -> Vec<(String, u32, u32)> {
+        bundle
+            .spans
+            .iter()
+            .filter(|span| span.via.is_none())
+            .map(|span| (span.path.clone(), span.line_start, span.line_end))
+            .collect()
+    }
+
+    #[test]
+    fn a_followed_definition_renders_after_the_span_that_named_it() {
+        let fixture = corpus(&[
+            ("guide.md", "Call `RunAsync` to start the thread.\n"),
+            ("Thread.cs", &numbered(60, "")),
+        ]);
+        let doc = hit("guide.md", 1, 1, "Call `RunAsync` to start the thread.");
+        let mut found = hit("Thread.cs", 20, 40, "");
+        found.chunk_id = "definition".into();
+        found.symbol_path = Some("Agents.Thread.RunAsync".into());
+
+        let bundle = super::assemble(
+            "RunAsync thread",
+            &response(&[doc.clone()]),
+            &[definition(found, "RunAsync", &doc, 0)],
+            &fixture.1,
+            40_000,
+            24,
+        );
+        assert_eq!(bundle.followed, 1);
+        assert_eq!(bundle.followed_dropped, 0);
+        // Signpost first, implementation immediately after it.
+        assert_eq!(bundle.spans.len(), 2);
+        assert_eq!(bundle.spans[0].path, "guide.md");
+        assert_eq!(bundle.spans[0].via, None, "a ranked span carries no via");
+        let via = bundle.spans[1]
+            .via
+            .as_ref()
+            .expect("the followed span's via");
+        assert_eq!(via.symbol, "RunAsync");
+        assert_eq!(via.path, "guide.md");
+        // The text says both what was added and what it cost.
+        assert!(
+            bundle.text.contains(
+                "FOLLOWED: 1 definition(s) pulled in because a doc or sample above names them, \
+                 costing "
+            ),
+            "{}",
+            bundle.text
+        );
+        assert!(
+            bundle
+                .text
+                .contains("=== Thread.cs:20-40 [Agents.Thread.RunAsync] (via guide.md:1-1) ==="),
+            "{}",
+            bundle.text
+        );
+    }
+
+    /// **The most important test in this file.** Following is additive or it is
+    /// nothing: every span the ranking would have rendered still renders, in
+    /// the same order, over the same lines.
+    ///
+    /// The definition here sits two lines below a ranked span in the *same*
+    /// file — close enough that a single shared merge pass would fold them and
+    /// silently move the ranked block's boundaries.
+    #[test]
+    fn ranked_spans_render_identically_with_following_on_and_off() {
+        let body = numbered(400, "");
+        let fixture = corpus(&[("guide.md", &body), ("impl.cs", &body)]);
+        let ranked = [hit("guide.md", 1, 20, ""), hit("impl.cs", 1, 20, "")];
+        let mut found = hit("impl.cs", 23, 60, "");
+        found.chunk_id = "definition".into();
+        found.symbol_path = Some("Widget.Build".into());
+
+        let off = assemble("line widget", &response(&ranked), &fixture.1, 40_000, 24);
+        let on = super::assemble(
+            "line widget",
+            &response(&ranked),
+            &[definition(found, "Widget.Build", &ranked[0], 0)],
+            &fixture.1,
+            40_000,
+            24,
+        );
+
+        assert_eq!(on.followed, 1, "otherwise this test asserts nothing");
+        assert_eq!(ranked_spans(&off), ranked_spans(&on));
+        assert_eq!(
+            ranked_spans(&on),
+            [
+                ("guide.md".to_string(), 1, 20),
+                ("impl.cs".to_string(), 1, 20)
+            ]
+        );
+        // Every ranked block, verbatim, still in the bundle.
+        for block in off.text.split("=== ").skip(1) {
+            assert!(on.text.contains(block.trim_end()), "lost: {block}");
+        }
+        // ...and the counts that describe the ranking describe the ranking.
+        assert_eq!(off.hits_verified, on.hits_verified);
+        assert_eq!(off.spans_after_merge, on.spans_after_merge);
+        assert_eq!(off.spans_widened, on.spans_widened);
+    }
+
+    /// The calibration guard. `zulu` and `yankee` appear only in the followed
+    /// definition; if follow-ins fed coverage this bundle would grade itself
+    /// `found` on text the retrieval never returned.
+    #[test]
+    fn coverage_and_the_verdict_ignore_everything_following_added() {
+        let fixture = corpus(&[
+            ("guide.md", "alpha bravo charlie delta\n"),
+            ("impl.cs", "zulu yankee xray whiskey\n"),
+        ]);
+        let doc = hit("guide.md", 1, 1, "alpha bravo charlie delta");
+        let mut found = hit("impl.cs", 1, 1, "zulu yankee xray whiskey");
+        found.chunk_id = "definition".into();
+
+        let query = "alpha bravo zulu yankee";
+        let off = assemble(query, &response(&[doc.clone()]), &fixture.1, 40_000, 24);
+        let on = super::assemble(
+            query,
+            &response(&[doc.clone()]),
+            &[definition(found, "Zulu.Yankee", &doc, 0)],
+            &fixture.1,
+            40_000,
+            24,
+        );
+
+        assert_eq!(on.followed, 1);
+        assert!(
+            on.text.contains("zulu yankee xray whiskey"),
+            "the definition really is rendered: {}",
+            on.text
+        );
+        assert_eq!(off.verdict, on.verdict);
+        assert_eq!(off.verdict, "weak");
+        assert_eq!(off.coverage, on.coverage);
+        assert_eq!(off.terms_covered, on.terms_covered);
+        assert_eq!(off.terms_uncovered, on.terms_uncovered);
+        assert_eq!(on.terms_uncovered, ["zulu", "yankee"]);
+        assert_eq!(off.verdict_detail, on.verdict_detail);
+    }
+
+    #[test]
+    fn a_definition_the_ranking_already_rendered_is_not_shown_twice() {
+        let fixture = corpus(&[("guide.md", "see Widget\n"), ("impl.cs", &numbered(60, ""))]);
+        let doc = hit("guide.md", 1, 1, "see Widget");
+        let ranked = hit("impl.cs", 20, 40, "");
+        // A different chunk of the same definition, overlapping once widened.
+        let mut again = hit("impl.cs", 25, 30, "");
+        again.chunk_id = "definition".into();
+
+        let bundle = super::assemble(
+            "widget line",
+            &response(&[doc.clone(), ranked]),
+            &[definition(again, "Widget", &doc, 0)],
+            &fixture.1,
+            40_000,
+            24,
+        );
+        assert_eq!(bundle.followed, 0);
+        assert_eq!(bundle.spans.len(), 2);
+        assert!(bundle.spans.iter().all(|span| span.via.is_none()));
+    }
+
+    #[test]
+    fn a_stale_definition_is_dropped_under_its_own_reason_and_counted() {
+        let fixture = corpus(&[
+            ("guide.md", "see Widget\n"),
+            ("impl.cs", "one\ntwo\nthree\n"),
+        ]);
+        let doc = hit("guide.md", 1, 1, "see Widget");
+        let ranked_stale = hit("impl.cs", 1, 2, "not what is there");
+        let mut found = hit("impl.cs", 2, 3, "also not what is there");
+        found.chunk_id = "definition".into();
+
+        let bundle = super::assemble(
+            "widget",
+            &response(&[doc.clone(), ranked_stale]),
+            &[definition(found, "Widget", &doc, 0)],
+            &fixture.1,
+            40_000,
+            24,
+        );
+        assert_eq!(bundle.followed, 0);
+        assert_eq!(bundle.followed_dropped, 1);
+        let reasons: Vec<&str> = bundle
+            .dropped
+            .iter()
+            .map(|drop| drop.reason.as_str())
+            .collect();
+        assert_eq!(reasons, ["follow:stale", "stale"]);
+        // The ranked tally is untouched: one stale hit, not two.
+        assert!(
+            bundle.text.contains("DROPPED (stale, 1): impl.cs:1-2"),
+            "{}",
+            bundle.text
+        );
+        assert!(
+            bundle
+                .text
+                .contains("DROPPED (follow:stale, 1): impl.cs:2-3"),
+            "{}",
+            bundle.text
+        );
+    }
+
+    #[test]
+    fn an_oversized_definition_becomes_a_pointer_that_still_says_why_it_is_here() {
+        let fixture = corpus(&[
+            ("guide.md", "see Widget\n"),
+            ("huge.cs", &numbered(400, "")),
+        ]);
+        let doc = hit("guide.md", 1, 1, "see Widget");
+        let mut found = hit("huge.cs", 1, 300, "");
+        found.chunk_id = "definition".into();
+
+        let bundle = super::assemble(
+            "widget",
+            &response(&[doc.clone()]),
+            &[definition(found, "Widget", &doc, 0)],
+            &fixture.1,
+            40_000,
+            24,
+        );
+        assert_eq!(bundle.followed, 0);
+        // The ranked size tally counts ranked spans, and nothing was oversized
+        // among them.
+        assert_eq!(bundle.spans_oversized, 0);
+        assert_eq!(bundle.further_reading.len(), 1);
+        assert_eq!(
+            bundle.further_reading[0]
+                .via
+                .as_ref()
+                .map(|via| via.symbol.as_str()),
+            Some("Widget")
+        );
+        assert!(
+            bundle.text.contains("FURTHER READING: huge.cs:1-300"),
+            "{}",
+            bundle.text
+        );
+    }
+
+    #[test]
+    fn the_follow_allowance_is_its_own_ceiling_and_overflow_is_further_reading() {
+        let body = numbered(400, "");
+        let fixture = corpus(&[("guide.md", &body), ("one.cs", &body), ("two.cs", &body)]);
+        let doc = hit("guide.md", 1, 20, "");
+        let mut first = hit("one.cs", 1, 100, "");
+        first.chunk_id = "first".into();
+        let mut second = hit("two.cs", 1, 100, "");
+        second.chunk_id = "second".into();
+
+        // A 100-line block is ~1.2k characters; 350 tokens of allowance (35% of
+        // 1000) is 1400 characters, so exactly one definition fits.
+        let bundle = super::assemble(
+            "line",
+            &response(&[doc.clone()]),
+            &[
+                definition(first, "One", &doc, 0),
+                definition(second, "Two", &doc, 0),
+            ],
+            &fixture.1,
+            1000,
+            24,
+        );
+        assert_eq!(bundle.followed, 1);
+        assert_eq!(bundle.further_reading.len(), 1);
+        assert_eq!(bundle.further_reading[0].path, "two.cs");
+        assert!(
+            bundle.further_reading[0].via.is_some(),
+            "the pointer keeps its provenance"
+        );
+        // The ranked span rendered whole, out of its own untouched budget.
+        assert_eq!(ranked_spans(&bundle), [("guide.md".to_string(), 1, 20)]);
+    }
+
+    #[test]
+    fn a_none_verdict_spends_nothing_on_following() {
+        // The bundle has just disclaimed its own evidence; paying 35% more to
+        // chase names out of disclaimed prose is the waste this route removes.
+        let fixture = corpus(&[
+            ("guide.md", "alpha bravo\n"),
+            ("impl.cs", "charlie delta\n"),
+        ]);
+        let doc = hit("guide.md", 1, 1, "alpha bravo");
+        let mut found = hit("impl.cs", 1, 1, "charlie delta");
+        found.chunk_id = "definition".into();
+
+        let bundle = super::assemble(
+            "quantum chromodynamics lattice gauge",
+            &response(&[doc.clone()]),
+            &[definition(found, "Charlie.Delta", &doc, 0)],
+            &fixture.1,
+            4000,
+            24,
+        );
+        assert_eq!(bundle.verdict, "none");
+        assert_eq!(bundle.followed, 0);
+        assert!(!bundle.text.contains("FOLLOWED:"), "{}", bundle.text);
+        assert!(!bundle.text.contains("charlie delta"), "{}", bundle.text);
+        // Not lost, though — it is a pointer like any other demoted span.
+        assert_eq!(bundle.further_reading.len(), 1);
+    }
+
+    #[test]
+    fn each_definition_follows_its_own_referring_span_rather_than_the_tail() {
+        let body = numbered(400, "");
+        let fixture = corpus(&[
+            ("a.md", &body),
+            ("b.md", &body),
+            ("one.cs", &body),
+            ("two.cs", &body),
+        ]);
+        let ranked = [hit("a.md", 1, 20, ""), hit("b.md", 1, 20, "")];
+        let mut first = hit("one.cs", 1, 20, "");
+        first.chunk_id = "first".into();
+        let mut second = hit("two.cs", 1, 20, "");
+        second.chunk_id = "second".into();
+
+        let bundle = super::assemble(
+            "line",
+            &response(&ranked),
+            &[
+                // Deliberately handed over out of rank order.
+                definition(second, "Two", &ranked[1], 1),
+                definition(first, "One", &ranked[0], 0),
+            ],
+            &fixture.1,
+            40_000,
+            24,
+        );
+        assert_eq!(bundle.followed, 2);
+        let order: Vec<&str> = bundle.spans.iter().map(|s| s.path.as_str()).collect();
+        assert_eq!(order, ["a.md", "one.cs", "b.md", "two.cs"]);
+    }
+
+    #[test]
+    fn an_ambiguous_name_says_which_definition_this_is() {
+        let fixture = corpus(&[("guide.md", "see Update\n"), ("impl.cs", &numbered(60, ""))]);
+        let doc = hit("guide.md", 1, 1, "see Update");
+        let mut found = hit("impl.cs", 1, 20, "");
+        found.chunk_id = "definition".into();
+        found.symbol_path = Some("Board.Update".into());
+        let mut followed = definition(found, "Update", &doc, 0);
+        followed.note = Some("1 of 3 definitions".into());
+
+        let bundle = super::assemble(
+            "update line",
+            &response(&[doc.clone()]),
+            &[followed],
+            &fixture.1,
+            40_000,
+            24,
+        );
+        assert!(
+            bundle.text.contains(
+                "=== impl.cs:1-20 [Board.Update] (via guide.md:1-1, 1 of 3 definitions) ==="
+            ),
+            "{}",
+            bundle.text
+        );
+    }
+
+    #[test]
+    fn a_via_names_the_block_the_reader_can_see_not_the_hit_behind_it() {
+        // The referring hit is three lines wide; what renders above the
+        // definition is that hit *widened*, and the printed pointer must name
+        // the lines that are actually on screen.
+        let fixture = corpus(&[
+            ("guide.md", &numbered(200, "")),
+            ("impl.cs", &numbered(60, "")),
+        ]);
+        let doc = hit("guide.md", 100, 102, "");
+        let mut found = hit("impl.cs", 1, 20, "");
+        found.chunk_id = "definition".into();
+
+        let bundle = super::assemble(
+            "line",
+            &response(&[doc.clone()]),
+            &[definition(found, "Widget", &doc, 0)],
+            &fixture.1,
+            40_000,
+            24,
+        );
+        assert_eq!(ranked_spans(&bundle), [("guide.md".to_string(), 87, 115)]);
+        let via = bundle.spans[1].via.as_ref().expect("a via");
+        assert_eq!((via.line_start, via.line_end), (87, 115));
+        assert!(
+            bundle.text.contains("(via guide.md:87-115)"),
+            "{}",
+            bundle.text
+        );
+    }
+
     // -- fixtures ----------------------------------------------------------
 
     /// A temporary corpus and the [`Sources`] that addresses it. The `TempDir`

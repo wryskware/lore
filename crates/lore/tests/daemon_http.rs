@@ -1634,6 +1634,223 @@ async fn bundle_is_scoped_and_says_how_to_scope_it() {
     assert!(body["message"].as_str().unwrap().contains("nope"), "{body}");
 }
 
+// ---------------------------------------------------------------------------
+// bundle: symbol following
+// ---------------------------------------------------------------------------
+
+/// A tree of the exact shape symbol following exists for: a doc that *names* a
+/// symbol, and another file that defines it. The query below matches the doc's
+/// prose and nothing in the code, so the definition can only reach the bundle
+/// by being followed to.
+fn populate_signpost_tree(fixture: &Fixture) {
+    fixture.write(
+        "guide.md",
+        "# Renewal\n\nThe daemon renews its claim by calling `refresh_lease` before it expires.\n",
+    );
+    fixture.write(
+        "src/lease.rs",
+        "pub fn refresh_lease(epoch: u32) -> u32 {\n    epoch + 1\n}\n",
+    );
+}
+
+const SIGNPOST_QUERY: &str = "renewal claim daemon renews";
+
+#[tokio::test]
+async fn a_bundle_follows_a_doc_to_the_definition_it_names() {
+    let h = harness();
+    populate_signpost_tree(&h.fixture);
+    full_scan(&h.fixture.context(), &h.fixture.project);
+
+    let (status, body) = post(
+        &h.router,
+        "/v1/bundle",
+        json!({ "query": SIGNPOST_QUERY, "project": "demo" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // On by default: the caller said nothing about following.
+    assert_eq!(body["followed"], 1, "{body}");
+
+    let spans = body["spans"].as_array().unwrap();
+    let followed: Vec<&Value> = spans
+        .iter()
+        .filter(|span| span["via"].is_object())
+        .collect();
+    assert_eq!(followed.len(), 1, "{body}");
+    assert_eq!(followed[0]["path"], "src/lease.rs");
+    assert_eq!(followed[0]["via"]["path"], "guide.md");
+    assert_eq!(followed[0]["via"]["symbol"], "refresh_lease");
+    // The signpost is above the thing it points at.
+    assert_eq!(spans[0]["path"], "guide.md");
+    assert!(spans[0]["via"].is_null(), "a ranked span carries no via");
+
+    let text = body["text"].as_str().unwrap();
+    assert!(text.contains("FOLLOWED: 1 definition(s)"), "{text}");
+    assert!(text.contains("(via guide.md:"), "{text}");
+    assert!(text.contains("pub fn refresh_lease"), "{text}");
+}
+
+#[tokio::test]
+async fn follow_false_removes_the_definitions_and_changes_nothing_else() {
+    let h = harness();
+    populate_signpost_tree(&h.fixture);
+    full_scan(&h.fixture.context(), &h.fixture.project);
+
+    let (_, on) = post(
+        &h.router,
+        "/v1/bundle",
+        json!({ "query": SIGNPOST_QUERY, "project": "demo" }),
+    )
+    .await;
+    let (_, off) = post(
+        &h.router,
+        "/v1/bundle",
+        json!({ "query": SIGNPOST_QUERY, "project": "demo", "follow": false }),
+    )
+    .await;
+    assert_eq!(on["followed"], 1, "{on}");
+
+    // The counters are absent rather than zero, so a bundle with nothing
+    // followed is byte-identical to one from a daemon that predates the field.
+    assert!(off.get("followed").is_none(), "{off}");
+    assert!(off.get("followed_dropped").is_none(), "{off}");
+    let text = off["text"].as_str().unwrap();
+    assert!(!text.contains("FOLLOWED:"), "{text}");
+    assert!(!text.contains("(via "), "{text}");
+    assert!(!text.contains("pub fn refresh_lease"), "{text}");
+
+    // Strict additivity, end to end: every ranked span is the same span, in
+    // the same order, and the verdict is computed from those alone.
+    let ranked = |body: &Value| -> Vec<Value> {
+        body["spans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|span| span["via"].is_null())
+            .cloned()
+            .collect()
+    };
+    assert_eq!(ranked(&on), ranked(&off));
+    for field in [
+        "verdict",
+        "verdict_detail",
+        "coverage",
+        "terms",
+        "terms_covered",
+        "terms_uncovered",
+        "hits_verified",
+        "spans_after_merge",
+        "further_reading",
+    ] {
+        assert_eq!(on[field], off[field], "{field} moved");
+    }
+}
+
+#[tokio::test]
+async fn a_prose_only_corpus_is_byte_identical_with_following_on() {
+    // The vault case: a project of design Markdown with no code to follow to.
+    // Nothing resolves, so nothing changes — not the text, not one field.
+    let h = harness();
+    h.fixture.write(
+        "design/1.1_Overview.md",
+        "---\ndesign_status: decided\n---\n\n# Overview\n\nThe daemon owns index state, and \
+         `SearchFilter` scopes every query.\n",
+    );
+    h.fixture.write(
+        "design/2.1_Ranking.md",
+        "# Ranking\n\nTwo arms are fused with RRF, then an authority multiplier applies.\n",
+    );
+    full_scan(&h.fixture.context(), &h.fixture.project);
+
+    let (_, on) = post(
+        &h.router,
+        "/v1/bundle",
+        json!({ "query": "how does ranking fuse the two arms", "project": "demo" }),
+    )
+    .await;
+    let (_, off) = post(
+        &h.router,
+        "/v1/bundle",
+        json!({
+            "query": "how does ranking fuse the two arms",
+            "project": "demo",
+            "follow": false
+        }),
+    )
+    .await;
+    assert!(!on["spans"].as_array().unwrap().is_empty(), "{on}");
+    assert_eq!(on, off);
+}
+
+#[tokio::test]
+async fn search_is_untouched_by_following() {
+    // "preserve the existing search api", asserted rather than argued: over a
+    // corpus that *does* produce follow-ins through `bundle`, a search result
+    // carries exactly the fields it carried before, and not one of them is
+    // about following.
+    let h = harness();
+    populate_signpost_tree(&h.fixture);
+    full_scan(&h.fixture.context(), &h.fixture.project);
+
+    let (_, bundle) = post(
+        &h.router,
+        "/v1/bundle",
+        json!({ "query": SIGNPOST_QUERY, "project": "demo" }),
+    )
+    .await;
+    assert_eq!(bundle["followed"], 1, "the corpus really does follow");
+
+    let (status, body) = post(
+        &h.router,
+        "/v1/search",
+        json!({ "query": SIGNPOST_QUERY, "project": "demo" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["results", "lexical_only"]
+    );
+
+    /// Every field a `search` result carried before symbol following existed.
+    /// `effective_authority` and `authority_note` are the two that come and go
+    /// on their own terms (D-0012); everything else is always on the wire.
+    const BEFORE: [&str; 16] = [
+        "chunk_id",
+        "project",
+        "project_key",
+        "path",
+        "line_start",
+        "line_end",
+        "language",
+        "symbol_path",
+        "heading_path",
+        "design_status",
+        "effective_authority",
+        "authority_note",
+        "decision_refs",
+        "score",
+        "excerpt",
+        "excerpt_truncated",
+    ];
+    let results = body["results"].as_array().unwrap();
+    assert!(!results.is_empty(), "{body}");
+    for result in results {
+        for key in result.as_object().unwrap().keys() {
+            assert!(
+                BEFORE.contains(&key.as_str()),
+                "search grew `{key}`: {result}"
+            );
+        }
+        for key in BEFORE
+            .iter()
+            .filter(|key| !matches!(**key, "effective_authority" | "authority_note"))
+        {
+            assert!(result.get(key).is_some(), "search lost `{key}`: {result}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_bundle_budget_of_one_span_demotes_the_rest_to_further_reading() {
     let h = harness();

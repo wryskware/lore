@@ -998,6 +998,217 @@ fn lexical_search_survives_hostile_queries() {
 }
 
 // ---------------------------------------------------------------------------
+// symbol anchor candidates (the lookup behind bundle-side symbol following)
+// ---------------------------------------------------------------------------
+
+/// A code chunk with an explicit `symbol_kind`, so the filler/group
+/// distinction the caller filters on is visible in the row.
+fn anchored(path: &str, symbol: &str, symbol_kind: &str, text: &str) -> Chunk {
+    let mut chunk = code_chunk(path, symbol, text, "csharp");
+    chunk.kind = ChunkKind::Code {
+        symbol_kind: symbol_kind.into(),
+        symbol_path: symbol.into(),
+        window: None,
+    };
+    chunk.id = Chunk::derive_id(&chunk.path, &chunk.kind, text);
+    chunk
+}
+
+/// One window of a split definition, anchored `Symbol#w<n>`.
+fn anchored_window(path: &str, symbol: &str, index: u32, text: &str) -> Chunk {
+    let mut chunk = code_chunk(path, symbol, text, "csharp");
+    chunk.kind = ChunkKind::Code {
+        symbol_kind: "method".into(),
+        symbol_path: format!("{symbol}#w{index}"),
+        window: Some(lore::types::WindowFamily { family: 0, index }),
+    };
+    chunk.id = Chunk::derive_id(&chunk.path, &chunk.kind, text);
+    chunk
+}
+
+/// One file per chunk, so `replace_file_chunks`' path check is satisfied.
+fn seed(store: &mut Store, project: i64, chunks: &[Chunk]) {
+    for chunk in chunks {
+        store
+            .replace_file_chunks(
+                project,
+                chunk.path.as_path(),
+                "h",
+                std::slice::from_ref(chunk),
+            )
+            .unwrap();
+    }
+}
+
+fn seeded_anchor_store(dir: &TempDir) -> (Store, i64, i64) {
+    let mut store = open(dir);
+    let a = store.register_project(p("C:/repos/a"), "a").unwrap();
+    let b = store.register_project(p("C:/repos/b"), "b").unwrap();
+    seed(
+        &mut store,
+        a,
+        &[
+            anchored(
+                "src/Board.cs",
+                "Lexomancy.Board.Update",
+                "method",
+                "void Update() {}",
+            ),
+            anchored("src/Timer.cs", "Timer.Update", "method", "void Update() {}"),
+            anchored("src/Parser.cs", "Parser.Parse", "method", "void Parse() {}"),
+            // A filler span the chunker gave a symbol path anyway, and one it
+            // could name nothing at all.
+            anchored("src/Filler.cs", "Filler.Update", "statements", "int x = 1;"),
+            anchored("src/Anon.cs", "#s0", "statements", "int y = 2;"),
+            anchored("src/Tiny.cs", "Tiny.Update", "group", "void Update() {}"),
+            anchored_window("src/Huge.cs", "Huge.Update", 1, "void Update() { /* 1 */ }"),
+            // The name appears only in the *body*: the anchor column is what
+            // is matched, so this row must never come back.
+            anchored(
+                "src/Body.cs",
+                "Body.Other",
+                "method",
+                "// calls Update here",
+            ),
+        ],
+    );
+    seed(
+        &mut store,
+        b,
+        &[anchored(
+            "src/Elsewhere.cs",
+            "Elsewhere.Update",
+            "method",
+            "void Update() {}",
+        )],
+    );
+    (store, a, b)
+}
+
+fn anchor_paths(candidates: &[lore::store::AnchorCandidate]) -> BTreeSet<String> {
+    candidates
+        .iter()
+        .map(|candidate| candidate.path.to_string())
+        .collect()
+}
+
+#[test]
+fn symbol_anchor_candidates_find_a_name_anywhere_in_a_dotted_symbol_path() {
+    let dir = TempDir::new().unwrap();
+    let (store, a, _) = seeded_anchor_store(&dir);
+    let found = store
+        .symbol_anchor_candidates(&SearchFilter::project(a), &["Update".to_string()], 400)
+        .unwrap();
+    assert_eq!(
+        anchor_paths(&found),
+        [
+            // The tail of a three-segment path…
+            "src/Board.cs",
+            // …of a two-segment one…
+            "src/Timer.cs",
+            // …a merged run of tiny members, which keeps its first member's
+            // symbol path and so really is that symbol's definition…
+            "src/Tiny.cs",
+            // …a `#w1` window, because `#` is a tokenizer separator…
+            "src/Huge.cs",
+            // …and a filler span that happens to carry the name, because the
+            // store does not judge: rejecting `statements` is
+            // `daemon::follow`'s job, on these narrow rows.
+            "src/Filler.cs",
+        ]
+        .map(str::to_string)
+        .into(),
+        "src/Body.cs mentions Update only in its body, and src/Anon.cs names \
+         nothing at all — neither is anchored on it"
+    );
+    // Every row carries what the caller narrows on, and none carries text.
+    let board = found
+        .iter()
+        .find(|candidate| candidate.path == "src/Board.cs")
+        .unwrap();
+    assert!(matches!(
+        &board.kind,
+        ChunkKind::Code { symbol_path, .. } if symbol_path == "Lexomancy.Board.Update"
+    ));
+    assert_eq!(board.line_start, 1);
+}
+
+#[test]
+fn the_anchor_match_folds_case_and_leaves_the_spelling_to_the_caller() {
+    // FTS5's unicode61 tokenizer folds case, so a lowercase `parse` finds
+    // `Parser.Parse`. That is deliberate — the store's job is to find the row
+    // cheaply — and `daemon::follow` compares the tail case-sensitively
+    // afterwards, because the author's spelling decides whether it is really
+    // a reference.
+    let dir = TempDir::new().unwrap();
+    let (store, a, _) = seeded_anchor_store(&dir);
+    let found = store
+        .symbol_anchor_candidates(&SearchFilter::project(a), &["parse".to_string()], 400)
+        .unwrap();
+    assert_eq!(anchor_paths(&found), ["src/Parser.cs".to_string()].into());
+}
+
+#[test]
+fn symbol_anchor_candidates_are_scoped_batched_and_bounded() {
+    let dir = TempDir::new().unwrap();
+    let (store, a, b) = seeded_anchor_store(&dir);
+
+    // Scoped to one project: `b` has an `Update` too and is not reachable.
+    let mine = store
+        .symbol_anchor_candidates(&SearchFilter::project(a), &["Update".to_string()], 400)
+        .unwrap();
+    assert!(!anchor_paths(&mine).contains("src/Elsewhere.cs"));
+
+    // One statement answers a batch of names.
+    let batch = store
+        .symbol_anchor_candidates(
+            &SearchFilter::project(a),
+            &["Parse".to_string(), "Update".to_string()],
+            400,
+        )
+        .unwrap();
+    assert_eq!(batch.len(), mine.len() + 1);
+
+    // The limit is a hard cap on the scan, and it truncates the same way
+    // twice — the rows are ordered, not left to the FTS posting order.
+    let capped = store
+        .symbol_anchor_candidates(&SearchFilter::project(a), &["Update".to_string()], 2)
+        .unwrap();
+    assert_eq!(capped.len(), 2);
+    let again = store
+        .symbol_anchor_candidates(&SearchFilter::project(a), &["Update".to_string()], 2)
+        .unwrap();
+    assert_eq!(anchor_paths(&capped), anchor_paths(&again));
+
+    // An unknown name, an empty batch and a zero limit are all "nothing",
+    // never an error: a follow pass that resolves nothing is a normal bundle.
+    for (names, limit) in [
+        (vec!["Nowhere".to_string()], 400usize),
+        (vec![], 400),
+        (vec!["Update".to_string()], 0),
+        // Anything outside `[A-Za-z0-9_]` is dropped rather than quoted into
+        // the expression, which is what makes the quoting unreachable-safe.
+        (vec!["\" OR anchor : \"Update".to_string()], 400),
+    ] {
+        assert!(
+            store
+                .symbol_anchor_candidates(&SearchFilter::project(a), &names, limit)
+                .unwrap()
+                .is_empty(),
+            "{names:?} / {limit}"
+        );
+    }
+    // ...and `b` still answers for itself.
+    assert_eq!(
+        store
+            .symbol_anchor_candidates(&SearchFilter::project(b), &["Update".to_string()], 400)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+// ---------------------------------------------------------------------------
 // vector search
 // ---------------------------------------------------------------------------
 
