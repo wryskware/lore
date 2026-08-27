@@ -39,13 +39,29 @@ optional `limit` (ranked chunks considered, default 24).
 Output (single text block for the agent, plus structured fields):
 
 ```
-VERDICT: found (N verified spans from M files) | weak | none
+VERDICT: found (N verified span(s) from M file(s)) | weak | none
 NO MATCH FOR: <query terms with no coverage — always printed when nonempty>
+DROPPED (<reason>, <count>): <up to 8 paths>        [one line per reason, when any]
 === path:start-end [breadcrumb] ===
 <line-numbered source, read from disk at render time>
 ...
-FURTHER READING: <verified paths that exceeded the budget>
+FURTHER READING: <verified paths that exceeded the budget, capped at 20>
 ```
+
+Contract fine print (as implemented; verified against the prototype by an
+independent differential test pass):
+
+- `budget_tokens` bounds the **rendered spans only** — header, DROPPED and
+  FURTHER READING sit outside it, and the first span always renders, so
+  the full block can exceed the nominal budget.
+- A `none` verdict is trimmed to ~1200 tokens regardless of the requested
+  budget (the closest-matches courtesy render, not a full bundle).
+- FURTHER READING truncates at 20 paths with no marker in the text; the
+  structured `further_reading` field keeps them all.
+- A hit whose stored excerpt was truncated by the indexer is verified on
+  path + range only — the staleness comparison is skipped for it. This is
+  a real, deliberate hole in the "rendered text came from disk" claim's
+  *comparison* step (the render itself is still from disk).
 
 ## Design (daemon-side, per Wrysk)
 
@@ -100,15 +116,25 @@ not canon): real queries 0.72–1.00, half-answerable ~0.50, junk ≤0.44.
   evidence exists.
 - `search`/`expand` unchanged, kept indefinitely for comparison.
 
-## Open questions (settle during implementation)
+## Open questions — settled by the implementation (2026-08-27, b75c233)
 
-- Final tool name (`bundle` vs `context` vs adopting the package wording).
-- Whether `expand` round-trips are kept for span widening or replaced by
-  direct from-disk widening (bench data: dropping them cuts assembly
-  ~1.5 s → ~0.9 s; the expansion text is discarded either way).
-- Config surface: thresholds/stopwords as constants vs `.lore.toml` keys.
-- Structured (JSON) output alongside the text block for non-agent callers.
-- Whether the CLI gains a matching `lore bundle` subcommand now or later.
+- Tool name: **`bundle`** (`context` collides with the product's own
+  vocabulary).
+- Span widening: **direct from-disk** — verification already holds the
+  file, and the widen arithmetic was proven equivalent to `expand`'s by
+  differential test against the prototype's round-trip. Assembly runs
+  ~0.15–0.94 s live.
+- Thresholds/stopwords: **constants**, documented in the module — a
+  `.lore.toml` knob would publish calibration from one corpus; revisit
+  after a second corpus is measured.
+- **JSON + text**: the endpoint returns structured JSON with `text` as one
+  field; the MCP tool renders `text` verbatim.
+- CLI `lore bundle` subcommand: **deferred** (not trivial, not asked for).
+
+Still open: whether the rendering budget should be raised or made
+rank-aware — the retrieval-recall eval showed the 4000-token budget
+demoting gold evidence to FURTHER READING (`bundle_all` outscores
+`bundle_rendered` on span recall).
 
 ## Provenance
 
