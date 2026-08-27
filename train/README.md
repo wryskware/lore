@@ -1,0 +1,422 @@
+# train/ — scouter trajectory generation
+
+A harness that turns repository questions into multi-turn tool-calling SFT
+trajectories, in the TRL conversational format, for fine-tuning a small local
+**scouter** model.
+
+The behaviour being taught, in one line:
+
+> call lore `bundle` first, then keep exploring with `search`, `grep`, `read`
+> and `bash` until you can answer, and finish with an answer that cites
+> repository-relative `path:start-end` spans.
+
+A teacher agent — `gpt-5.6-luna` at max reasoning effort, driven through
+`opencode run` — answers each question inside a commit-pinned snapshot of the
+repository the question is about, with lore's MCP server wired in so `bundle`
+and `search` are real tool calls. Its session is recorded, reshaped, path-
+normalised, graded against the question's reference answer, and validated.
+
+**Status: design + runnable skeleton.** `--dry-run` is proven end to end. No
+real trajectory has been generated. See "What is real and what is stubbed".
+
+---
+
+## Pipeline
+
+```
+generate.py   question  ->  teacher session  ->  work/raw/<batch>/<qid>/agent.ndjson
+convert.py    raw       ->  work/data/<batch>.converted.jsonl      (+ validator)
+grade.py      converted ->  work/data/<batch>.train.jsonl          (+ validator)
+```
+
+Each stage is independently re-runnable and writes its rejects beside its
+output with a reason per row. `generate.py --dry-run` fabricates genuine
+opencode-shaped event streams for a two-question fixture, so `convert.py` and
+`grade.py` then run their **real** code paths — no teacher call, no lore daemon,
+no network.
+
+```bash
+python3 generate.py --dry-run
+python3 convert.py  --batch pilot-01
+python3 grade.py    --batch pilot-01
+```
+
+Everything the harness produces lives under `work/` and is gitignored. A batch
+is reproducible from `work/manifests/<batch>.json` plus the pinned commits.
+
+---
+
+## Contamination boundary
+
+This is the constraint that shapes every other choice here, so it is stated
+first and it is absolute.
+
+**Never in training data:**
+
+- `microsoft/agent-framework` and the RepoContextBench task set. RCB is a
+  held-out evaluation. A scouter trained on its corpus would make every RCB
+  number meaningless, and the numbers are the only reason RCB exists.
+- Whatever corpus is ultimately chosen as retrieval-eval corpus two.
+
+**In training data, conditionally:** the 26 repositories and 260 questions of
+`TIGER-Lab/SWE-QA-Pro-Bench`.
+
+The condition is real and is not yet discharged.
+`design/7_Research/2026-08-27_second-corpus-survey.md` flags the coupling
+directly: SWE-QA-Pro is the *second-ranked* candidate for the retrieval eval,
+and if it is chosen for eval then neither it nor its sibling SFT trajectories
+can be training data. The survey's parent leans toward **SWE Atlas** for eval
+precisely because that keeps SWE-QA-Pro free for training — but that is a
+leaning in a research report, not an accepted decision, and Wrysk has not ruled.
+
+**So: if SWE-QA-Pro-Bench is later picked as the eval corpus, every batch
+generated from it must be discarded.** That is the risk this directory carries.
+It is cheap to carry — the manifest records the question source per batch, so
+identifying and deleting the affected rows is mechanical — and the alternative
+is blocking the whole LoRA track behind an unrelated decision.
+
+### Separation from `bench/rcb/`
+
+`train/` imports nothing from `bench/rcb/`, shares no files with it, and reads
+none of its outputs. The two trees have overlapping mechanisms — both drive
+`opencode run --format json`, both parse its NDJSON event stream — and this
+harness reimplements the ~30 lines of parsing it needs rather than importing
+them. That duplication is deliberate: a shared import is a path by which an
+eval harness and a training harness can quietly come to depend on each other,
+and there is no amount of convenience that is worth blurring the line between
+the corpus a model learns from and the corpus it is judged on.
+
+The one file that *is* shared is the output validator (see Decision 5), which
+is outside both trees and belongs to neither.
+
+---
+
+## Decisions
+
+### Decision 1 — question source: SWE-QA-Pro-Bench
+
+`TIGER-Lab/SWE-QA-Pro-Bench` (MIT), `data/test.jsonl`: 260 human-validated
+questions, exactly 10 over each of 26 commit-pinned Python repositories.
+
+Why this and not something we author:
+
+- **It grades itself.** Every question ships a human-validated reference answer
+  whose prose cites files and line ranges. Verified against the real file:
+  250 of 260 references carry at least one parseable file path and 219 carry at
+  least one line range, median 3 distinct files per answer. That is an
+  automatic quality signal for filtering trajectories, with no judge model and
+  no human in the loop — which is the difference between a corpus we can
+  actually scale and one we cannot.
+- **It is pinned.** `commit_id` per row, so a trajectory is reproducible
+  against the exact tree the teacher read.
+- **It is licensed.** MIT, confirmed on the Hub.
+- **Its repos are long-tail.** 26 real Python projects, not the five everybody
+  fine-tunes on.
+
+The reference answers are used **only as an answer key**. They are never shown
+to the teacher, never emitted into a row, and never quoted in `meta` beyond the
+derived scores. Grading on them is fine; training on them would be teaching the
+student to reproduce the key rather than to find the evidence.
+
+Known weakness: Python only. Language diversity has to come from a second
+question source later, and lore's flagship consumer is C#/Unity (D-0003). This
+corpus teaches *how to scout*, not *how to read C#*.
+
+### Decision 2 — snapshot and index pinning: a per-batch manifest
+
+Each repository is checked out at its pinned commit under a configurable root,
+registered with lore, and indexed. `work/manifests/<batch>.json` records, per
+repo:
+
+| field | why |
+|---|---|
+| `repo`, `commit` | what the teacher could read |
+| `snapshot` | directory name only, **never an absolute path** |
+| `lore_project`, `project_key` | which index answered |
+| `index_generation` | the daemon's monotonic index generation |
+| `files`, `chunks`, `embedded_chunks`, `daemon_version` | index coverage at generation time |
+
+The pin is deliberately two-sided. The commit fixes what `read`, `grep` and
+`bash` could return; the project key plus the index generation fixes what
+`bundle` and `search` could return. A trajectory whose generation no longer
+matches the live daemon is not *wrong*, but it is no longer reproducible, and
+the manifest is what lets anyone tell the difference. The subset that identifies
+the pin (`repo`, `commit`, `lore_project`, `lore_project_key`,
+`index_generation`) also rides in every row's `meta`, so a row separated from
+its batch is still traceable.
+
+Registration and indexing stay the operator's job — `lore add` and `lore index`
+are not called from here. A generation script that can mutate index state is a
+generation script that can invalidate its own pins mid-batch, and D-0003's
+single-authoritative-owner constraint says that state has exactly one owner.
+`generate.py` reads `/v1/resolve` and `/v1/status`, and refuses to spend teacher
+calls when a project is unregistered, unindexed, or degraded to lexical-only.
+
+Deliberately simple: one manifest per batch, no database. A batch is the unit of
+everything — one teacher configuration, one prompt, one set of pins.
+
+### Decision 3 — trajectory recording: parse opencode's own event stream
+
+Rejected: a tool-call interception layer (shim binaries on `PATH`, an MCP proxy).
+
+Chosen: parse `opencode run --format json` NDJSON, which is written straight to
+a file per cell.
+
+The event stream already carries everything the emission format needs, verified
+against real RCB session logs:
+
+- a `text` part per assistant prose block, and a `tool_use` part per call;
+- each `tool_use` carries `callID`, `state.input` (the *exact* arguments the
+  model produced) and `state.output` (the *exact* result it saw);
+- every part is tagged with the `messageID` it belongs to.
+
+Grouping parts by `messageID` in wire order reconstructs assistant turns
+exactly, and gets parallel tool calls for free — several `tool_use` parts
+sharing one `messageID` is one assistant message with several calls, which is
+precisely how the chat template renders them.
+
+Why this beats interception: interception only sees the tools you wrapped, so a
+tool you forgot is a silent hole in the trajectory; it changes the teacher's
+environment, so the recorded run is not quite the run you would get without it;
+and it is live, so a crashed cell loses everything. The event stream sees every
+tool including opencode's built-ins, changes nothing, and leaves a parseable
+partial trajectory on disk when a cell dies. RCB has driven several hundred
+cells through this stream without a parse failure.
+
+The one thing it does not give us is the teacher's hidden reasoning, which is
+summarised into the `text` parts. That is the right loss: reasoning traces from
+one model are not conditioning we want a different, much smaller model to
+imitate.
+
+**The teacher's prompt is discarded.** `convert.py` replaces the whole framing
+with the frozen `SCOUT_SYSTEM_PROMPT` and the bare question, so the teacher can
+be steered as hard as it needs to be without any of that scaffolding becoming
+conditioning the student will never see at inference.
+
+### Decision 4 — grading: citation overlap, with structure gated first
+
+Two classes of filter, in order.
+
+**Structural gates** (`convert.py`) — a trajectory that fails one is not a bad
+trajectory, it is not a trajectory:
+
+| reason | meaning |
+|---|---|
+| `no_events` | the cell produced nothing parseable |
+| `no_tool_calls` | the teacher answered from memory |
+| `bundle_not_first:<tool>` | the defining behaviour was not demonstrated |
+| `ends_on_tool_call` | the session died mid-exploration |
+| `empty_answer` | last turn has no prose |
+| `forbidden_tool:<name>` | a tool outside the five-tool surface was used |
+| `too_many_tool_calls:<n>` | thrashing, and over budget |
+| `abs_path_leak:<frag>` | an absolute path survived into supervised tokens |
+| `question_echoed_verbatim` | the `bundle` query is the question pasted back |
+
+**Quality gates** (`grade.py`) — citation overlap with the reference answer:
+
+| reason | default |
+|---|---|
+| `no_citations` | answer cites no file at all |
+| `unresolvable_citation:<path>` | a cited path does not exist at the pinned commit |
+| `few_tool_calls:<n>` | fewer than `min_tool_calls` = 2 |
+| `low_file_recall:<x>` | below `min_file_recall` = 0.5 |
+| `low_span_overlap:<x>` | below `min_span_hit_rate` = 0.34 |
+| `ungradeable_reference` | the reference has no parseable citation (10 of 260) |
+
+`file_recall` is the primary signal: of the files the reference cites, what
+fraction does the answer also cite. It is robust, because a right answer has to
+land on the right files, and file paths survive both refactoring noise and
+citation-style differences. Path comparison is a **component-wise suffix match**
+— the references are genuinely inconsistent about how much of a path they write
+(`src/qibo/models/circuit.py` in one answer, `qibo/models/circuit.py` in another
+for the same file), so string equality would reject correct citations.
+
+`span_hit_rate` is secondary and carries the lower bar: of the reference's cited
+line ranges, what fraction is covered by an overlapping range in the answer,
+within `line_tolerance` = 20 lines. Line numbers drift with how much surrounding
+context an author chose to include, so this is the sharper signal and the
+noisier one. Requiring 0.34 means "at least a third of the reference's evidence
+was actually located", not "the answers agree".
+
+Thresholds are opening bids, to be recalibrated on the pilot's measured
+distribution — that is one of the things the pilot is for. Rejects are written
+out in full rather than deleted, so a threshold change is a re-run of `grade.py`
+and not a re-run of the teacher.
+
+`question_echoed_verbatim` earns a note, because it was found by the validator
+rather than by design. A `bundle` query that is the question pasted back
+demonstrates no query formulation — the single behaviour this corpus most exists
+to teach — *and* it puts the user's own words inside a supervised tool call,
+which the shared validator flags as the user turn leaking into the loss. Both
+readings agree, so the trajectory is rejected and the teacher prompt explicitly
+asks for an expansion instead. The gate uses the validator's own 80-character
+prefix threshold so the two can never disagree about the same row.
+
+### Decision 5 — path normalisation, designed in rather than bolted on
+
+The SWE-QA-Pro trajectory conversion found that **92.8% of its supervised tool
+calls** carried the generating harness's own repo root
+(`repos_tmp/worker_646683/…`). A model trained on that learns to prefix every
+path with a directory that will not exist at inference. It is the single most
+expensive defect in that corpus and it was invisible until someone looked at the
+rendered text.
+
+So this harness normalises on the way in and then **asserts**:
+
+1. Every snapshot root — not just this row's, because a `bash` command in one
+   cell can name a sibling checkout — is rewritten out of every argument, every
+   assistant message and every tool result.
+2. Supervised strings are then re-scanned for anything absolute-looking, and a
+   trajectory that still has one is **rejected, not repaired**. Repairing
+   guesses; rejecting costs one trajectory.
+3. Absolute fragments surviving in *masked* tool results are counted into
+   `meta.masked_abs_fragments` rather than rejected. They are conditioning, not
+   targets, and rejecting on them would throw away trajectories over text the
+   model is never trained to produce — but a batch where that count climbs is
+   telling you the normaliser has a blind spot.
+
+The detector is deliberately broad — any rooted `/a/b/` path, any drive letter,
+any `~/` — and is checked against both positive and negative controls
+(`https://` must not read as drive `s:`; `and/or` and `src/qibo/` must not read
+as rooted). False positives cost one trajectory each. A false negative is
+permanent and lives in the weights.
+
+### Decision 6 — the validator is referenced, never vendored
+
+`grade.py` and `convert.py` hand their output to `~/lora-prep/validate_dataset.py`
+(path configured under `[validate]`) — the same 33-check validator that proved
+the masking on the SWE-QA-Pro conversion, whose own teeth are proven by a
+negative-control script that corrupts data seven ways and confirms each is
+caught. One copy means the two corpora cannot drift apart on what "valid" means.
+
+It enforces the emission spec's hard rules directly: `arguments` is a JSON
+string (never a dict — Arrow's `Dataset.from_list` unifies struct schemas and
+null-fills, and the model learns to emit the nulls); `tools` byte-identical
+across rows; `content` always a plain string; at least one supervised token per
+row; and the full mask audit — tool calls and `<|im_end|>` supervised, system
+prompt, tool schemas, user question, `<tool_response>` payloads and the
+assistant header all masked.
+
+Two rules it cannot check, which this harness owns instead:
+
+- **Load with `load_dataset("json", data_files=…)`, never `Dataset.from_list`.**
+  Even with string `arguments`, `from_list` corrupts the `tools` column — on the
+  dry-run fixture it injects +157 junk tokens per row into the masked system
+  block, where nothing raises and nothing shows in the loss. The validator
+  prints this as an advisory on every run; it is not a defect in the file.
+- **Never set `use_liger_kernel`** (trl#3781 silently disables masking).
+
+### Decision 7 — drop, don't truncate; but do cap tool results
+
+Two different things that are easy to confuse.
+
+*Trajectories* are dropped whole when they exceed `max_length`. A truncated
+trajectory teaches the scout to stop mid-exploration, and truncation that eats
+the prefix silently drops **every** supervised token while raising nothing —
+measured: a 933-token example encoded at `max_length=200` yields
+`supervised=0, truncated=True` and no error.
+
+*Tool results* are capped, at `max_tool_chars` (4000, with `bundle` allowed
+12000). They are masked, so trimming them costs no training signal. It is not
+free — it changes the context each supervised turn was actually produced from —
+so the elision is explicit (`... [N characters elided] ...`), keeps both ends,
+and is a configured knob rather than a constant. This is the lever that decides
+whether trajectories fit an 8k budget: the SWE-QA-Pro corpus sits at a 19k
+median almost entirely because of untrimmed tool output, and at the 4096 length
+actually proven on this box exactly **one** of its 926 rows fits.
+
+### Decision 8 — the teacher's tools are narrowed at the source
+
+`generate.py` writes a per-cell `opencode.json` that denies everything the
+student will never own: `edit`/`write`/`patch` (the snapshot must stay
+byte-identical, or the pin is a lie), `webfetch`/`websearch`, `glob`/`list`,
+`todowrite`, `external_directory`, and the `task` subagent. What is left maps
+onto the five-tool surface: lore's `bundle` and `search` over MCP, plus
+opencode's native `grep`, `read` and `bash`.
+
+A call the teacher never makes is a trajectory that never has to be thrown away.
+`convert.py` still rejects on an unmapped tool, because a config that silently
+stops applying should fail loudly rather than quietly emit off-surface calls.
+
+Argument names are renamed to the student's surface at conversion:
+`lore_bundle`/`lore_search` → `bundle`/`search`, `read.filePath/offset/limit` →
+`read.path/start/end` (opencode counts lines from 0; citations are 1-based),
+`grep.include` → `grep.glob`. Every dropped key is counted into
+`meta.dropped_arg_keys`, so a renaming that starts losing information is visible
+in the data rather than only in this paragraph.
+
+---
+
+## What is real and what is stubbed
+
+**Real, exercised by `--dry-run`:** the event-stream parser, message
+reconstruction including parallel tool calls, tool-name and argument mapping,
+path normalisation and the leak gate (with positive and negative controls), tool
+result elision, all structural gates, the citation parser (checked against all
+260 real reference answers: 250 with files, 219 with spans), file-recall and
+span-overlap scoring, manifest read/write, both validator invocations, and the
+row shape — which passes all 33 validator check classes.
+
+**Real but never yet executed:** the `opencode` invocation, snapshot checkout,
+and the lore daemon preflight. Written against verified interfaces —
+`opencode run --help` confirms `--variant max` and `--dir`; the daemon exposes
+`POST /v1/bundle`, `GET /v1/resolve` and `GET /v1/status` with `generation`;
+`lore-mcp` exposes exactly `bundle`, `expand`, `search`, `status` and honours
+`LORE_PROJECT` — but the first real cell is the first time they run.
+
+**Stubbed:**
+
+- The dry-run fixture repository is fabricated. `citations_checked` is `false`
+  for those rows because there is no tree to resolve paths against.
+- `[lore] bundle_limit` / `bundle_budget_tokens` are read but not yet plumbed
+  into the MCP call; the daemon's own defaults apply.
+- No cost or token accounting is collected from `step_finish` events yet. It is
+  in the stream and should be added once a pilot shows what a cell costs.
+- No deduplication pass. With one trajectory per question and 260 distinct
+  questions there is nothing to dedupe yet; sampling several trajectories per
+  question would change that.
+
+**Not built, deliberately:** the training script. This directory produces a
+dataset. Training it is a separate concern with a separate failure surface.
+
+---
+
+## The pilot
+
+One repository, five questions. Its job is to produce the numbers this design
+is currently guessing at: keep rate, token length distribution, tool calls per
+trajectory, and whether the grading thresholds are anywhere near right.
+
+```bash
+cd train
+cp config.example.toml config.toml       # then set [lore].mcp_bin
+
+# 1. Clone the snapshot. This exits telling you the exact `lore add` to run.
+python3 generate.py --batch pilot-01 --repos qiboteam/qibo \
+    --limit-per-repo 5 --prepare-only
+
+# 2. Register and index it (the operator owns index state, not this harness).
+lore add  work/snapshots/qiboteam__qibo
+lore index
+
+# 3. Capture the pin, then generate.
+python3 generate.py --batch pilot-01 --repos qiboteam/qibo --limit-per-repo 5
+
+# 4. Convert, grade, validate.
+python3 convert.py --batch pilot-01
+python3 grade.py   --batch pilot-01
+```
+
+Run it from WSL, with the lore daemon up and its embedding server ready —
+`generate.py` refuses to start otherwise, because a batch generated while lore
+is degraded to lexical-only is not the corpus it claims to be.
+
+Expect roughly 3–5 minutes and 30–60k teacher tokens per cell at max effort,
+so 15–25 minutes and 150–300k tokens for five cells at concurrency 1, plus a
+one-time clone and index of qibo. The teacher runs through the existing
+opencode/ChatGPT setup, so the cost is subscription quota and wall time rather
+than metered API spend.
+
+Check before scaling: the keep rate, the reject-reason histogram (a taxonomy
+where one reason dominates is a harness bug, not a quality signal), and the
+token-length distribution against `max_length`.

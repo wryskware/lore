@@ -1,0 +1,74 @@
+# train/config.example.toml -- copy to train/config.toml and edit.
+#
+# config.toml is gitignored. Nothing in this file may name a host, a user, a LAN
+# name, or a machine-specific absolute path: this repository is public. Point at
+# things with `~`, with paths relative to train/, or with environment variables.
+
+[batch]
+# One batch = one manifest + one raw/ directory + one dataset file. Bump it
+# whenever the teacher, the prompt, or the pinned index changes.
+name = "pilot-01"
+
+[teacher]
+model     = "openai/gpt-5.6-luna"
+variant   = "max"          # opencode's provider-agnostic reasoning-effort knob
+opencode_bin = "opencode"
+port      = 4177           # each concurrent cell gets port + worker index
+timeout_s = 1800
+concurrency = 1            # raise once a pilot has shown cells are independent
+allow_task_subagent = false  # the student has no subagent; the teacher gets none
+
+[lore]
+# Path to the lore MCP binary. `cargo build --release -p lore-mcp` puts it in
+# target/release/; the relative form below keeps this file portable.
+mcp_bin = "../target/release/lore-mcp"
+# Empty = $LORE_STATE_DIR, else ~/.local/share/lore. The daemon's port is read
+# from <state_dir>/daemon.json.
+state_dir = ""
+daemon_url = ""            # empty = derive from state_dir
+project_prefix = ""        # e.g. "train-" if you keep training projects apart
+bundle_limit = 0           # 0 = leave the daemon's own default
+bundle_budget_tokens = 0
+
+[paths]
+# Relative paths resolve against train/. Both are gitignored.
+workspace = "./work"
+snapshots = "./work/snapshots"
+
+[questions]
+# SWE-QA-Pro-Bench (MIT): 260 questions, 10 each over 26 commit-pinned Python
+# repos, reference answers with file/line citations. Leave `file` empty to pull
+# data/test.jsonl from the Hub, or point it at a local copy.
+file       = ""
+hf_dataset = "TIGER-Lab/SWE-QA-Pro-Bench"
+hf_file    = "data/test.jsonl"
+repos      = []            # empty = all 26; e.g. ["qiboteam/qibo"]
+limit_per_repo = 0         # 0 = all 10
+clone_url_template = "https://github.com/{repo}.git"
+
+[emit]
+# Tool results are masked, so capping them costs no supervised tokens -- but it
+# does change the context each supervised turn was produced from. Raise these if
+# trajectories start losing the evidence their answers rest on.
+max_tool_chars   = 4000
+max_bundle_chars = 12000
+# Drop-don't-truncate: rows over max_length are rejected whole, never cut, so no
+# half-trajectory ever teaches the scout to stop mid-exploration.
+max_length     = 8192
+max_tool_calls = 30
+drop_tools = ["todowrite"]  # dropped from the trajectory, not a rejection
+allow_question_echo = false  # reject a bundle query that is the question pasted back
+
+[grade]
+min_file_recall   = 0.5    # of the reference's cited files, how many the answer cites
+min_span_hit_rate = 0.34   # of the reference's cited line ranges, how many overlap
+line_tolerance    = 20     # lines of slack when matching a range
+min_tool_calls    = 2      # bundle plus at least one act of verification
+keep_ungradeable  = false  # references with no parseable citation (10 of 260)
+
+[validate]
+# The output gate. This is the same validator the SWE-QA-Pro conversion was
+# checked with; it is referenced, never vendored, so "valid" cannot drift.
+python = "~/lora-prep/codescout/bin/python"
+script = "~/lora-prep/validate_dataset.py"
+sample = 25

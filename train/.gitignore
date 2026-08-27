@@ -1,0 +1,7 @@
+# The operator's own config -- may name local paths; never committed.
+config.toml
+
+# Everything the harness produces: snapshots, raw teacher sessions, datasets,
+# manifests. Reproducible from the manifest plus the pinned commits.
+work/
+__pycache__/
