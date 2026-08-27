@@ -29,6 +29,7 @@
 
 mod query;
 mod schema;
+mod subword;
 /// Crate-visible so the embed worker can screen vectors with the *same*
 /// predicate the write path uses (see [`vector::is_usable`]).
 pub(crate) mod vector;
@@ -38,6 +39,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use camino::{Utf8Path, Utf8PathBuf};
+use rusqlite::functions::FunctionFlags;
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 use serde::{Deserialize, Serialize};
@@ -75,13 +77,22 @@ const CHUNK_COL_COUNT: usize = 13;
 /// to fix them, few enough that a status call stays a status call.
 pub const MAX_VIOLATION_PATHS: usize = 5;
 
-/// BM25 field weights: `text`, `path`, `anchor`.
+/// BM25 field weights: `text`, `path`, `anchor`, `subwords`.
 ///
 /// A hit on a symbol name or heading (`anchor`) is worth more than a hit in
 /// the body, and a hit in the path is worth least — but bodies *are* indexed
 /// and *do* score, deliberately: names-only BM25 is the CodeGraph mistake
 /// called out in 3.1. Weights are tuning, not canon.
-const BM25_WEIGHTS: &str = "1.0, 0.5, 2.0";
+///
+/// `subwords` sits at parity with the body rather than above it. It is a
+/// recall column: it exists so a query word can reach *inside* an identifier
+/// (see [`subword`]), and matching part of a name is weaker evidence than
+/// matching the name. Ranking it above the body would let a chunk that merely
+/// contains a variable called `dispatchFanout` outrank one that discusses
+/// dispatch fanout in prose. It carries only expansions, so a chunk with no
+/// compound identifiers scores exactly what it scored before the column
+/// existed, whatever this number is.
+const BM25_WEIGHTS: &str = "1.0, 0.5, 2.0, 1.0";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -399,6 +410,10 @@ enum Opened {
     /// The file carried something else and was discarded (see
     /// [`discard_store`]).
     Rebuilt,
+    /// The file carried this build's schema but an older lexical index layout,
+    /// so the FTS5 table alone was re-derived from `chunks` (see
+    /// [`schema::ensure_fts_current`]). Chunks and embeddings survived.
+    FtsRebuilt,
 }
 
 /// Delete a store this build cannot read, so the caller can create a current
@@ -449,6 +464,59 @@ fn discard_store(path: &Path, user_version: i64) -> Result<()> {
     Ok(())
 }
 
+/// Register `lore_subwords(text, anchor)`, the SQL side of
+/// [`subword::expand`].
+///
+/// Both columns go through one call rather than two so they share a
+/// deduplication set: a symbol named in the anchor is almost always written in
+/// the body too, and emitting its parts twice would cost the chunk BM25 length
+/// for nothing.
+///
+/// `DETERMINISTIC` is true of the function and lets SQLite hoist it; the
+/// arguments are read with `as_str().unwrap_or("")` so a NULL or a non-text
+/// value degrades to "no subwords" rather than failing an index write — both
+/// columns are `NOT NULL TEXT`, so that branch is unreachable today and exists
+/// only so a future nullable column cannot break indexing.
+fn register_subword_function(conn: &Connection) -> Result<()> {
+    conn.create_scalar_function(
+        "lore_subwords",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let inputs: Vec<&str> = (0..ctx.len())
+                .map(|i| ctx.get_raw(i).as_str().unwrap_or(""))
+                .collect();
+            Ok(subword::expand(&inputs))
+        },
+    )?;
+    Ok(())
+}
+
+/// Re-derive the lexical index if its layout is older than this build's, and
+/// say so loudly enough that a slow first open is explained rather than
+/// mysterious. Reports whether it ran.
+///
+/// Loud but not alarming, unlike [`discard_store`]: nothing is lost here. The
+/// index is rebuilt from chunks that stay exactly where they were, and the
+/// embeddings — the expensive half — are not read, let alone rewritten.
+fn fts_rebuild(conn: &Connection, path: &Path) -> Result<bool> {
+    let started = std::time::Instant::now();
+    if !schema::ensure_fts_current(conn)? {
+        return Ok(false);
+    }
+    let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
+    tracing::info!(
+        store = %path.display(),
+        fts_version = schema::FTS_VERSION,
+        chunks,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "the lexical index predated this build's layout and was re-derived from the chunks \
+         already in the store. Nothing was re-indexed and nothing was re-embedded; search was \
+         unavailable only for the duration of this rebuild"
+    );
+    Ok(true)
+}
+
 /// The SQLite-backed SearchStore.
 pub struct Store {
     conn: Connection,
@@ -479,7 +547,17 @@ impl Store {
         let mut conn = Self::connect(path)?;
 
         let opened = match schema::inspect(&conn)? {
-            schema::Found::Current => Opened::Existing,
+            // The only in-place upgrade there is. It is scoped to the derived
+            // lexical index — no base table is written, so no chunk id moves
+            // and no vector is invalidated — which is exactly why it can be a
+            // rebuild rather than the discard below.
+            schema::Found::Current => {
+                if fts_rebuild(&conn, path)? {
+                    Opened::FtsRebuilt
+                } else {
+                    Opened::Existing
+                }
+            }
             schema::Found::Empty => {
                 schema::create(&conn)?;
                 Opened::Created
@@ -507,6 +585,13 @@ impl Store {
     /// A connection with the pragmas that are properties of the *file*, set
     /// before anything looks at what is in it. Foreign keys are turned on by
     /// the caller, after the schema exists.
+    ///
+    /// **This is the only place a connection to a Lore database is opened**, and
+    /// that is load-bearing for `lore_subwords`: the FTS5 content view calls it,
+    /// so a connection without it cannot rebuild or integrity-check the index.
+    /// Registering here rather than at each call site makes "every Lore
+    /// connection has the function" true by construction instead of by
+    /// discipline.
     fn connect(path: &Path) -> Result<Connection> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
@@ -514,6 +599,7 @@ impl Store {
         // journal_mode returns a row, so it cannot go through execute_batch.
         let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
         conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
+        register_subword_function(&conn)?;
         Ok(conn)
     }
 
@@ -2273,6 +2359,106 @@ mod tests {
 
         // The rebuild is one-shot: the next open finds a current store and
         // leaves it alone.
+        drop(store);
+        assert_eq!(Store::open_reporting(&db).unwrap().1, Opened::Existing);
+    }
+
+    /// The lexical index is the one thing that upgrades in place, and the whole
+    /// justification is what it does *not* touch.
+    ///
+    /// The setup reproduces a database written before the subword column
+    /// existed as faithfully as a test can: the `fts_version` column is dropped
+    /// outright, so this exercises the `ALTER TABLE` that introduces the counter
+    /// as well as the rebuild it gates. What is asserted is the contract a
+    /// [`schema::VERSION`] bump could not have honoured — the chunk rowids and
+    /// every embedding blob come through byte-identical, so nothing is re-chunked
+    /// and, far more expensively, nothing is re-embedded — plus the point of the
+    /// exercise: a query that could not work before the rebuild works after it.
+    #[test]
+    fn an_old_lexical_index_is_re_derived_without_touching_chunks_or_embeddings() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("lore.db");
+
+        let (before_rows, before_embeddings) = {
+            let mut store = Store::open(&db).unwrap();
+            let proj = store
+                .register_project(Utf8Path::new("C:/repos/x"), "x")
+                .unwrap();
+            let path = Utf8Path::new("src/messaging.rs");
+            let chunk = vault_chunk(
+                "src/messaging.rs",
+                "Messaging",
+                "fn _dispatch_fanout() -> ConcurrentOrchestration { }",
+                declares(DesignStatus::Exploration, &[]),
+            );
+            store
+                .replace_file_chunks(proj, path, "h1", &[chunk.clone()])
+                .unwrap();
+            store
+                .upsert_embeddings(&[NewEmbedding {
+                    project: proj,
+                    chunk_id: chunk.id.clone(),
+                    vector: vec![0.25, 0.5, 0.75, 1.0],
+                }])
+                .unwrap();
+
+            // Wind the store back to the pre-subword layout: the old three
+            // column index, the old triggers, and no version counter at all.
+            store
+                .conn
+                .execute_batch(
+                    "DROP TRIGGER chunks_ai;
+                     DROP TRIGGER chunks_ad;
+                     DROP TRIGGER chunks_au;
+                     DROP TABLE chunks_fts;
+                     DROP VIEW chunks_fts_content;
+                     ALTER TABLE meta DROP COLUMN fts_version;
+                     CREATE VIRTUAL TABLE chunks_fts USING fts5(
+                         text, path, anchor, content='chunks', content_rowid='id',
+                         tokenize=\"unicode61 remove_diacritics 2 tokenchars '_'\");
+                     INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild');",
+                )
+                .unwrap();
+            assert!(
+                store
+                    .lexical_search("dispatch", &SearchFilter::default(), 10)
+                    .unwrap()
+                    .is_empty(),
+                "precondition: the old index cannot reach inside an identifier"
+            );
+            (chunk_rows(&store), embedding_rows(&store))
+        };
+
+        let (store, opened) = Store::open_reporting(&db).unwrap();
+        assert_eq!(opened, Opened::FtsRebuilt);
+        assert_eq!(chunk_rows(&store), before_rows, "chunk rowids moved");
+        assert_eq!(
+            embedding_rows(&store),
+            before_embeddings,
+            "vectors were disturbed by an index rebuild"
+        );
+        assert_eq!(
+            store
+                .lexical_search("dispatch fanout", &SearchFilter::default(), 10)
+                .unwrap()
+                .len(),
+            1,
+            "the rebuilt index must carry the subwords"
+        );
+        assert_eq!(
+            store
+                .lexical_search("_dispatch_fanout", &SearchFilter::default(), 10)
+                .unwrap()
+                .len(),
+            1,
+            "and must not have lost the whole identifier"
+        );
+        store
+            .conn
+            .execute_batch("INSERT INTO chunks_fts(chunks_fts) VALUES('integrity-check')")
+            .unwrap();
+
+        // One-shot: the counter now matches, so reopening writes nothing.
         drop(store);
         assert_eq!(Store::open_reporting(&db).unwrap().1, Opened::Existing);
     }

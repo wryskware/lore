@@ -2,6 +2,7 @@
 
 use rusqlite::types::Value;
 
+use super::subword;
 use super::{SearchFilter, StatusFilter, status_str};
 
 /// Hard cap on terms in one FTS query — pasted-blob queries should not turn
@@ -32,7 +33,9 @@ const MAX_TERMS: usize = 64;
 ///
 /// Terms are returned rather than pre-joined because juxtaposition is AND in
 /// FTS5, and the caller needs to be able to relax that — see
-/// [`or_fts_query`].
+/// [`or_fts_query`]. Each returned element is a self-contained FTS5
+/// sub-expression, not necessarily a bare term, precisely so that both joins
+/// stay correct after [`expand_term`] parenthesizes one.
 pub(crate) fn sanitize_fts_terms(input: &str) -> Vec<String> {
     fn flush(current: &mut String, prefix: bool, terms: &mut Vec<String>) {
         if current.is_empty() {
@@ -40,11 +43,7 @@ pub(crate) fn sanitize_fts_terms(input: &str) -> Vec<String> {
         }
         let term = std::mem::take(current);
         if !matches!(term.as_str(), "AND" | "OR" | "NOT" | "NEAR") && terms.len() < MAX_TERMS {
-            terms.push(if prefix {
-                format!("\"{term}\"*")
-            } else {
-                format!("\"{term}\"")
-            });
+            terms.push(expand_term(&term, prefix));
         }
     }
 
@@ -62,6 +61,41 @@ pub(crate) fn sanitize_fts_terms(input: &str) -> Vec<String> {
     flush(&mut current, false, &mut terms);
 
     terms
+}
+
+/// One sanitized term as the FTS5 sub-expression that reaches both the
+/// verbatim columns and the subword column.
+///
+/// Symmetry with the index side is the whole contract: the subword column was
+/// filled by [`subword::expand_into`], and the query side splits the term with
+/// the *same* [`subword::split_parts`], so a term matches its own expansion by
+/// construction rather than by two rules that happen to agree today.
+///
+/// A term that is already a plain word is left exactly as it was — no
+/// parentheses, no alternation, no extra work — which is why prose queries
+/// produce byte-identical MATCH expressions to before this existed. A compound
+/// term becomes `("theTerm" OR "the Term")`:
+///
+/// - the first branch still finds the identifier verbatim, so exact-identifier
+///   search is untouched (that is what `tokenchars '_'` bought and this must
+///   not spend);
+/// - the second is a *phrase*, not an AND of the parts, so `parseJSONResponse`
+///   matches an identifier whose subwords are adjacent rather than any chunk
+///   that happens to mention parsing, JSON and responses in three unrelated
+///   places.
+///
+/// A trailing `*` distributes onto both branches. FTS5 applies a prefix
+/// operator to the last token of a phrase, so `"parse json resp"*` is the
+/// prefix search the user asked for, one level down.
+fn expand_term(term: &str, prefix: bool) -> String {
+    let star = if prefix { "*" } else { "" };
+    let parts = subword::split_parts(term);
+    // `parts.is_empty()` is reachable: the term `_` is all separator.
+    if parts.is_empty() || (parts.len() == 1 && parts[0] == term) {
+        return format!("\"{term}\"{star}");
+    }
+    let phrase = parts.join(" ");
+    format!("(\"{term}\"{star} OR \"{phrase}\"{star})")
 }
 
 /// The same terms joined with `OR` instead of by juxtaposition.
@@ -197,13 +231,53 @@ mod tests {
         sanitize_fts_terms(input).join(" ")
     }
 
+    /// A compound term keeps its verbatim branch — that is the exact-identifier
+    /// search `tokenchars '_'` exists to protect — and gains the subword phrase
+    /// that reaches the `subwords` column.
     #[test]
     fn sanitize_keeps_identifier_terms() {
-        assert_eq!(sanitize_fts_query("content_hash"), "\"content_hash\"");
+        assert_eq!(
+            sanitize_fts_query("content_hash"),
+            "(\"content_hash\" OR \"content hash\")"
+        );
         assert_eq!(
             sanitize_fts_query("Board.Update"),
-            "\"Board\" \"Update\"".to_string()
+            "\"Board\" \"Update\"".to_string(),
+            "`.` already separates, and neither half is compound"
         );
+    }
+
+    /// Words that were never compound must produce the expression they always
+    /// did: prose queries pay nothing for the identifier machinery.
+    #[test]
+    fn plain_words_are_left_exactly_as_they_were() {
+        assert_eq!(
+            sanitize_fts_query("how does the daemon own the index"),
+            "\"how\" \"does\" \"the\" \"daemon\" \"own\" \"the\" \"index\""
+        );
+        assert_eq!(sanitize_fts_query("café"), "\"café\"");
+    }
+
+    /// The index side split `_dispatch_fanout` into adjacent subwords, so the
+    /// query side must ask for a *phrase*, not three unrelated words.
+    #[test]
+    fn compound_terms_expand_to_a_phrase_over_the_subword_column() {
+        assert_eq!(
+            sanitize_fts_query("parseJSONResponse"),
+            "(\"parseJSONResponse\" OR \"parse JSON Response\")"
+        );
+        assert_eq!(
+            sanitize_fts_query("_dispatch_fanout"),
+            "(\"_dispatch_fanout\" OR \"dispatch fanout\")"
+        );
+        // One part that differs from the term is still an expansion.
+        assert_eq!(
+            sanitize_fts_query("_private"),
+            "(\"_private\" OR \"private\")"
+        );
+        // A term that is all separator has no parts at all and must not
+        // produce `OR ""`.
+        assert_eq!(sanitize_fts_query("_"), "\"_\"");
     }
 
     #[test]
@@ -211,6 +285,12 @@ mod tests {
         assert_eq!(sanitize_fts_query("cont*"), "\"cont\"*");
         // A bare star is not a term and must not become one.
         assert_eq!(sanitize_fts_query("*"), "");
+        // FTS5 applies `*` to the last token of a phrase, so the prefix search
+        // survives one level down into the expansion.
+        assert_eq!(
+            sanitize_fts_query("dispatch_fan*"),
+            "(\"dispatch_fan\"* OR \"dispatch fan\"*)"
+        );
     }
 
     #[test]
@@ -250,12 +330,15 @@ mod tests {
         }
     }
 
+    /// The cap counts *terms*, which is no longer the same as counting
+    /// space-separated words — one term can expand into a parenthesized
+    /// alternation — so assert on the vector the cap actually governs.
     #[test]
     fn sanitize_caps_term_count() {
         let long = (0..200)
-            .map(|i| format!("t{i}"))
+            .map(|i| format!("word{i}"))
             .collect::<Vec<_>>()
             .join(" ");
-        assert_eq!(sanitize_fts_query(&long).split(' ').count(), MAX_TERMS);
+        assert_eq!(sanitize_fts_terms(&long).len(), MAX_TERMS);
     }
 }

@@ -711,11 +711,12 @@ fn lexical_search_keeps_snake_case_identifiers_whole() {
         store.lexical_search("content_ha*", &f, 10).unwrap().len(),
         1
     );
-    // The documented cost of `tokenchars '_'`: a bare component of a
-    // snake_case identifier is NOT a token, so it does not match on its own.
-    // `content` here only fails to match because the sole occurrence is
-    // inside `content_hash`.
-    assert!(store.lexical_search("content", &f, 10).unwrap().is_empty());
+    // `tokenchars '_'` used to cost exactly this: a bare component of a
+    // snake_case identifier was not a token, so `content` — whose only
+    // occurrence in the corpus is inside `content_hash` — matched nothing.
+    // The `subwords` column pays that cost back without giving up either
+    // assertion above.
+    assert_eq!(store.lexical_search("content", &f, 10).unwrap().len(), 1);
     assert_eq!(store.lexical_search("content*", &f, 10).unwrap().len(), 1);
     // A dotted symbol path, by contrast, IS split — `.` stays a separator —
     // so its components are reachable via the indexed anchor.
