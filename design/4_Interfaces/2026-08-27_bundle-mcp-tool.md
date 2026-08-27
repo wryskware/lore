@@ -1,0 +1,119 @@
+# Context bundles on the MCP surface (`bundle` tool)
+
+*2026-08-27. Proposal — implementation authorized by Wrysk (2026-08-27:
+"worth rolling into standard lore … add it as part of the mcp surface and
+preserve the existing search api"). Not canon; no ledger entry yet — an
+accepted-decision entry is pending Wrysk's explicit sign-off once the
+implementation settles the open questions below.*
+
+## What and why
+
+A new MCP tool (working name `bundle`; final name open) that answers a
+natural-language retrieval query with a **finished evidence bundle**: a
+verdict line, then verified code/doc spans rendered with line numbers from
+the files on disk, under a caller-set token budget, with overflow paths
+listed as further reading and an honest statement of what found no match.
+
+Evidence (RCB, 2026-08-26, all glm-judged, gpt-5.6-luna @ high, 20 cells
+each; bench/rcb/RESULTS.md is the ledger):
+
+| arm | wall | tokens | quality/pass |
+|---|---|---|---|
+| lore search via MCP (today) | 46.2 s | 138k | 0.75 / 0.95 |
+| lore bundles (bench prototype) | 50.4 s, median 32.5 | 110k, median 32k | 0.71 / 0.80 |
+
+The median bundle cell is faster and ~4× cheaper than the current MCP
+integration; the mean carries a tail of cells where the agent ignored the
+trust discipline (agent-behavior, not assembler — 0 assembler errors, all
+spans verified). Quality sits slightly below iterative search. Decision:
+ship the bundle **alongside** `search`/`expand`, unchanged — hosts compare
+and switch deliberately; the bundle is also the designated starting point
+for the later trained scouter (bundle first, explore from there).
+
+## Contract
+
+Input: `query` (agent-written; there is deliberately no translator layer),
+`project` (resolved as today), optional `budget_tokens` (default 4000),
+optional `limit` (ranked chunks considered, default 24).
+
+Output (single text block for the agent, plus structured fields):
+
+```
+VERDICT: found (N verified spans from M files) | weak | none
+NO MATCH FOR: <query terms with no coverage — always printed when nonempty>
+=== path:start-end [breadcrumb] ===
+<line-numbered source, read from disk at render time>
+...
+FURTHER READING: <verified paths that exceeded the budget>
+```
+
+## Design (daemon-side, per Wrysk)
+
+Assembly lives in the **daemon**, not lore-mcp: one implementation that
+the MCP tool, the CLI, and any future surface all call (new endpoint,
+e.g. `POST /v1/bundle`). lore-mcp gains a thin tool wrapper. D-0003 is
+untouched: the daemon remains the single authoritative owner of index
+state and of source rendering.
+
+Pipeline (port of the validated bench prototype
+`bench/rcb/sandbox/lore_pkg.py`, whose calibration ran 20 judged cells):
+
+1. search (existing fused retrieval) → top `limit` chunks;
+2. verify each hit: realpath containment, line range vs actual file
+   length; **render text from the file on disk, never from the index** —
+   compare against the index excerpt and demote mismatches as `stale`;
+3. widen short chunks (<16 lines) via expansion, merge touching same-file
+   spans;
+4. budget: spans that fit render in rank order; overflow demotes whole
+   spans to FURTHER READING (never truncate mid-span);
+5. verdict from **term coverage, not retrieval score**.
+
+Two implementation traps the prototype hit, preserved as requirements:
+the code chunker stores dedented text (compare dedented, render raw), and
+files may carry a BOM (strip before compare).
+
+## Why term coverage, not score
+
+lore's fusion is RRF: score = Σ 1/(60+rank) — a pure function of rank.
+Measured on the bench corpus: a nonsense query's top hit (0.0294)
+outscored the #2 hit of a well-answered query. Any score threshold
+therefore manufactures confident `found` on empty results. The prototype's
+verdict instead measures how many meaningful query terms are covered by
+the returned spans (`found` ≥ 0.65, `weak` ≥ 0.45, else `none`), with a
+stopword list for retrieval-brief meta-vocabulary ("identify", "locate",
+"usage", …). Uncovered terms always print — this is the honest-gap signal
+that lets a consuming agent know what to go find itself, and it is what
+fixed the benchmark's unanswerable-task failure (a confident `found` on a
+question the corpus cannot answer).
+
+Calibration from the bench round (thresholds are constants to revisit,
+not canon): real queries 0.72–1.00, half-answerable ~0.50, junk ≤0.44.
+
+## Non-goals (decided)
+
+- No bundle caching (seconds of assembly never earns invalidation
+  complexity — Wrysk, 2026-08-26).
+- No translator/query-rewriting layer, ever; the calling agent writes the
+  query.
+- No steering/compliance tuning shipped with the tool: how hosts instruct
+  agents to consume bundles is productization, deferred until multi-model
+  evidence exists.
+- `search`/`expand` unchanged, kept indefinitely for comparison.
+
+## Open questions (settle during implementation)
+
+- Final tool name (`bundle` vs `context` vs adopting the package wording).
+- Whether `expand` round-trips are kept for span widening or replaced by
+  direct from-disk widening (bench data: dropping them cuts assembly
+  ~1.5 s → ~0.9 s; the expansion text is discarded either way).
+- Config surface: thresholds/stopwords as constants vs `.lore.toml` keys.
+- Structured (JSON) output alongside the text block for non-agent callers.
+- Whether the CLI gains a matching `lore bundle` subcommand now or later.
+
+## Provenance
+
+Bench prototype and rounds: `bench/rcb/sandbox/lore_pkg.py`,
+`bench/rcb/rounds/luna-lore-pkg-1.jsonl`, probes and trajectories under
+`bench/rcb/rounds/traj/`. Comparative context and judge conventions:
+`bench/rcb/RESULTS.md`. Plan/decision trail:
+`design/99_Scratch/2026-08-26_context-package-path-forward.md`.
