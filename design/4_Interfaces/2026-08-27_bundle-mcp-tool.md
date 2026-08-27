@@ -1,10 +1,17 @@
+---
+design_status: decided
+last_reviewed: 2026-08-27
+decision_refs:
+  - D-0025
+  - D-0003
+---
+
 # Context bundles on the MCP surface (`bundle` tool)
 
-*2026-08-27. Proposal — implementation authorized by Wrysk (2026-08-27:
-"worth rolling into standard lore … add it as part of the mcp surface and
-preserve the existing search api"). Not canon; no ledger entry yet — an
-accepted-decision entry is pending Wrysk's explicit sign-off once the
-implementation settles the open questions below.*
+*2026-08-27. Decided — D-0025 (Wrysk sign-off 2026-08-27). Implementation
+shipped, measured, and live on both daemons; symbol following ships
+behind `follow`, default off (see the ledger entry and the
+symbol-following section below for why).*
 
 ## What and why
 
