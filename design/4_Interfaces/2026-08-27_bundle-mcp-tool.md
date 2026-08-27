@@ -51,9 +51,11 @@ FURTHER READING: <verified paths that exceeded the budget, capped at 20>
 Contract fine print (as implemented; verified against the prototype by an
 independent differential test pass):
 
-- `budget_tokens` bounds the **rendered spans only** — header, DROPPED and
-  FURTHER READING sit outside it, and the first span always renders, so
-  the full block can exceed the nominal budget.
+- `budget_tokens` bounds the **rendered ranked spans only** — header,
+  DROPPED, FOLLOWED and FURTHER READING sit outside it, and the first span
+  always renders, so the full block can exceed the nominal budget. Symbol
+  following (below) adds a second allowance of up to 35% *on top of* it,
+  which the `FOLLOWED:` header line names in tokens.
 - A `none` verdict is trimmed to ~1200 tokens regardless of the requested
   budget (the closest-matches courtesy render, not a full bundle).
 - FURTHER READING truncates at 20 paths with no marker in the text; the
@@ -87,6 +89,52 @@ Pipeline (port of the validated bench prototype
 Two implementation traps the prototype hit, preserved as requirements:
 the code chunker stores dedented text (compare dedented, render raw), and
 files may carry a BOM (strip before compare).
+
+## Symbol following (implemented 2026-08-27; not yet evaluated)
+
+*Status: shipped behind `follow`, default on. The eval that decides
+whether it stays on has not run — see
+`design/99_Scratch/2026-08-27_symbol-following-design.md` §7 for the
+success bar stated before the run.*
+
+Natural-language queries match natural language, and both ranking arms
+reward that. On the RCB corpus, span recall for **primary implementing
+source** sat at 0.15–0.21 while sample/doc evidence sat at 0.47–0.58,
+with coverage perfect — the implementation was always indexed, ranked
+below the prose that *names* it.
+
+So the bundle path (only — `search` is untouched) follows that pointer.
+After search and before the store lock is released, the top 5
+prose-adjacent hits (doc chunks, and code under `samples/`-shaped paths;
+`tests/` and `benchmarks/` deliberately excluded in v1) are scanned for
+identifier-shaped references, and each is resolved against the existing
+`chunks_fts.anchor` index by exact symbol-path tail match. No schema
+change, no new table, no re-index, one batched FTS statement.
+
+Contract additions, all serde-skipped when absent, so a bundle with
+nothing followed is byte-identical to one from before this existed:
+
+- request: `follow` (bool, default true);
+- `spans[]` / `further_reading[]`: `via { path, line_start, line_end,
+  symbol }`, present **only** on a followed span;
+- response: `followed`, `followed_dropped`;
+- text: a `FOLLOWED: N definition(s) … costing T tokens on top of the
+  B-token budget.` header line, and ` (via <path>:<lines>)` on each
+  followed span header.
+
+Three properties are the fence, and each is asserted:
+
+- **Strictly additive.** Ranked spans widen, merge and budget exactly as
+  they do with following off; a definition is never merged into one, and
+  one overlapping a ranked span is dropped rather than shown twice.
+- **Paid for separately**, at up to 35% on top of `budget_tokens`, and
+  disclosed. A `none` verdict spends nothing on it.
+- **Never evidence.** Coverage, and therefore the verdict, is computed
+  from ranked spans alone — the 0.65/0.45 cuts were calibrated on twenty
+  judged cells with no follow-ins in them.
+
+Exact-name only, forever: resolving "the concurrent orchestrator" to a
+symbol is the query-translation layer this contract's non-goals rule out.
 
 ## Why term coverage, not score
 
