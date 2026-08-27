@@ -766,6 +766,7 @@ pub fn fingerprint_of(
         document_prefix: settings.document_prefix.clone(),
         normalization: NORMALIZATION.to_string(),
         max_embed_bytes: settings.max_embed_bytes as u32,
+        embed_text_recipe: super::text::EMBED_TEXT_RECIPE.to_string(),
     }
 }
 

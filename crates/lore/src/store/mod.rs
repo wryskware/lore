@@ -29,7 +29,11 @@
 
 mod query;
 mod schema;
-mod subword;
+/// Crate-visible so the embedding header can gloss a fused identifier with the
+/// *same* splitter the lexical column uses (see [`crate::embed::text`]). One
+/// splitter, two consumers: a second implementation would drift, and the two
+/// arms would then disagree about what `search_page_final` is made of.
+pub(crate) mod subword;
 /// Crate-visible so the embed worker can screen vectors with the *same*
 /// predicate the write path uses (see [`vector::is_usable`]).
 pub(crate) mod vector;
@@ -376,10 +380,32 @@ pub struct EmbeddingFingerprint {
     /// forcing a pointless full re-embed.
     #[serde(default = "default_max_embed_bytes")]
     pub max_embed_bytes: u32,
+    /// Which recipe built the text that was actually sent — see
+    /// [`crate::embed::text::EMBED_TEXT_RECIPE`]. The prefixes above say what
+    /// was pasted *around* a chunk; this says how the chunk's own header was
+    /// constructed, which is just as much part of the embedding space.
+    ///
+    /// Unlike [`Self::max_embed_bytes`], the default here is deliberately
+    /// **not** today's value. A record written before this field existed came
+    /// from the `v1` recipe by definition, so it must deserialize as `v1` and
+    /// therefore *mismatch* a current build's `v2`. That is the whole
+    /// mechanism: opening such a store makes
+    /// [`crate::embed::EmbedWorker::reconcile_fingerprint`] take the
+    /// destructive branch exactly once — every vector is discarded, the `v2`
+    /// identity is written in its place, and the next start matches and does
+    /// nothing. Defaulting to the current recipe instead would silently keep
+    /// vectors built from headers this build no longer produces.
+    #[serde(default = "default_embed_text_recipe")]
+    pub embed_text_recipe: String,
 }
 
 fn default_max_embed_bytes() -> u32 {
     8 * 1024
+}
+
+/// The recipe in force before the tag was recorded — never the current one.
+fn default_embed_text_recipe() -> String {
+    "v1".to_string()
 }
 
 /// Per-project index counts plus the store-wide generation.
@@ -1977,6 +2003,36 @@ mod tests {
                       "document_prefix":"d: ","normalization":"l2"}"#;
         let fp: EmbeddingFingerprint = serde_json::from_str(old).unwrap();
         assert_eq!(fp.max_embed_bytes, 8 * 1024);
+    }
+
+    /// The opposite default, for the opposite reason. A fingerprint stored
+    /// before the recipe tag existed describes text built by `v1`, so it must
+    /// read as `v1` and therefore *differ* from what this build produces —
+    /// which is what buys exactly one reconcile wipe on an upgraded store.
+    #[test]
+    fn fingerprint_without_a_recipe_reads_as_the_superseded_one() {
+        let old = r#"{"model_id":"m","dimensions":768,"query_prefix":"q: ",
+                      "document_prefix":"d: ","normalization":"l2"}"#;
+        let fp: EmbeddingFingerprint = serde_json::from_str(old).unwrap();
+        assert_eq!(fp.embed_text_recipe, "v1");
+        assert_ne!(
+            fp.embed_text_recipe,
+            crate::embed::text::EMBED_TEXT_RECIPE,
+            "a legacy store must not read as already carrying this build's recipe"
+        );
+
+        // And a record this build wrote reads back unchanged, so the wipe
+        // happens once rather than every start.
+        let current = serde_json::to_string(&EmbeddingFingerprint {
+            embed_text_recipe: crate::embed::text::EMBED_TEXT_RECIPE.to_string(),
+            ..fp.clone()
+        })
+        .unwrap();
+        let round: EmbeddingFingerprint = serde_json::from_str(&current).unwrap();
+        assert_eq!(
+            round.embed_text_recipe,
+            crate::embed::text::EMBED_TEXT_RECIPE
+        );
     }
 
     #[test]

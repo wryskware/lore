@@ -845,6 +845,77 @@ async fn a_changed_fingerprint_discards_every_stored_vector() {
     rig.stub.shutdown().await;
 }
 
+/// How the embedding *text* is built is part of the embedding space, so the
+/// header recipe is carried in the fingerprint like the prefixes are. A store
+/// written under the previous recipe must therefore be wiped and re-embedded
+/// exactly once: on the first start, not on every start after it.
+#[tokio::test]
+async fn a_new_header_recipe_clears_and_re_embeds_every_chunk_once() {
+    let rig = Rig::new("demo").await;
+    populate_standard_tree(&rig.fixture);
+    full_scan(&rig.fixture.context(), &rig.fixture.project);
+
+    let mut worker = rig.worker();
+    worker.reconcile_fingerprint().await.unwrap();
+    assert!(worker.probe().await);
+    worker.drain().await;
+    let (chunks, embedded) = rig.counts();
+    assert_eq!(embedded, chunks);
+
+    // The real derivation records this build's recipe — not the value serde
+    // supplies for a record that predates the field.
+    let current = rig.stored_fingerprint().expect("an identity was recorded");
+    assert_eq!(
+        current,
+        fingerprint_of(rig.embedder.client().unwrap().settings(), Some(DIMS))
+    );
+    assert_ne!(
+        current.embed_text_recipe, "v1",
+        "the derivation must move when the recipe does"
+    );
+
+    // Rewind the stored identity to the previous recipe: byte-for-byte what a
+    // store embedded before this change carries, since an absent field
+    // deserializes to exactly this.
+    let legacy = EmbeddingFingerprint {
+        embed_text_recipe: "v1".into(),
+        ..current.clone()
+    };
+    rig.fixture
+        .store
+        .blocking(|store| store.set_embedding_fingerprint(&legacy))
+        .unwrap();
+
+    // Start: every vector goes, and the new identity is recorded in its place.
+    assert!(worker.probe().await);
+    assert_eq!(
+        rig.counts(),
+        (chunks, 0),
+        "vectors built under the old header recipe do not survive"
+    );
+    assert_eq!(rig.stored_fingerprint().as_ref(), Some(&current));
+
+    // Same start: the whole corpus comes back under the new recipe.
+    worker.drain().await;
+    assert_eq!(rig.counts(), (chunks, chunks), "everything is re-embedded");
+
+    // The next start is inert — one wipe, not one per start.
+    assert!(worker.probe().await);
+    assert_eq!(
+        rig.counts(),
+        (chunks, chunks),
+        "the second start keeps them"
+    );
+    let settled = rig.stub.state.attempts();
+    assert_eq!(worker.drain().await, Drained::Idle);
+    assert_eq!(
+        rig.stub.state.attempts(),
+        settled,
+        "nothing is left to re-send"
+    );
+    rig.stub.shutdown().await;
+}
+
 /// Issue #9: with no `dimensions` in the config, model identity used to rest
 /// on the model id alone — so a GGUF swapped in behind the same name mixed two
 /// vector spaces in one index, silently. The probed width is folded into the

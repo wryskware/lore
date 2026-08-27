@@ -31,8 +31,54 @@
 //! header. Ranking makes the opposite choice and reads no anchor strings at
 //! all — window membership reaches it as [`crate::types::WindowFamily`]
 //! metadata, because there a wrong guess deletes a result.
+//!
+//! # Fused identifiers are glossed
+//!
+//! A code header also carries a short parenthetical spelling the symbol out in
+//! words: `function item search_page_final (search page final)`. The reason is
+//! the same one the lexical side has (see [`crate::store::subword`]) — a
+//! sentencepiece tokenizer shreds `search_page_final` into pieces that share
+//! very little with how the query "search the final page" is tokenized — and it
+//! is the *same splitter*, so the two arms cannot come to disagree about what a
+//! name is made of.
+//!
+//! Two limits keep the gloss from diluting the header it decorates:
+//!
+//! - it appears **only** when splitting actually says something, so
+//!   `Board.Update` (already two plain words to any tokenizer) gets nothing,
+//!   and only genuinely fused names like `UpdateAll` or `parseJSONResponse` pay
+//!   for one; and
+//! - it is one parenthetical of deduplicated words, never a second copy of the
+//!   header. A header is a handful of tokens next to a whole chunk body; every
+//!   token spent restating what is already there moves the embedding away from
+//!   the code it is supposed to represent.
+//!
+//! Prose anchors — Markdown heading paths — are untouched. A heading is already
+//! words, and splitting it could only fabricate ones its author did not write.
+//!
+//! # Changing any of this forces a re-embed
+//!
+//! The recipe above is identity, not presentation: two chunks embedded under
+//! different header rules are not comparable. [`EMBED_TEXT_RECIPE`] is folded
+//! into the persisted [`crate::store::EmbeddingFingerprint`] for exactly that
+//! reason, so editing the construction here and bumping the tag costs one full
+//! re-embed at the next worker start and nothing subtler.
 
+use crate::store::subword;
 use crate::types::{Chunk, ChunkKind};
+
+/// Version tag for the *construction rules* in this module, carried in the
+/// persisted embedding fingerprint.
+///
+/// Bump it whenever [`document_text`] or [`query_text`] would produce different
+/// bytes for the same chunk. The fingerprint comparison then reports a changed
+/// embedding space and the worker re-embeds everything, which is the honest
+/// outcome: vectors built from two different header recipes rank against each
+/// other badly and nothing downstream can tell.
+///
+/// - `v1` — language, path and anchor phrase, symbol paths left as written.
+/// - `v2` — adds the subword gloss described above.
+pub const EMBED_TEXT_RECIPE: &str = "v2";
 
 /// Per-chunk byte ceiling **for embedding only**; the stored chunk and its
 /// FTS postings are untouched.
@@ -81,7 +127,7 @@ fn anchor_phrase(kind: &ChunkKind) -> Option<String> {
             let symbol = strip_discriminators(symbol_path, &ALL_MARKERS);
             // "group" means the chunker merged several tiny siblings; naming
             // only the first one would misdescribe the chunk's extent.
-            let phrase = if symbol_kind == "group" {
+            let mut phrase = if symbol_kind == "group" {
                 match symbol.is_empty() {
                     true => "group".to_string(),
                     false => format!("group starting at {symbol}"),
@@ -95,6 +141,11 @@ fn anchor_phrase(kind: &ChunkKind) -> Option<String> {
                     false => format!("{kind} {symbol}"),
                 }
             };
+            if let Some(gloss) = split_gloss(&symbol)
+                && !phrase.is_empty()
+            {
+                phrase = format!("{phrase} ({gloss})");
+            }
             (!phrase.is_empty()).then_some(phrase)
         }
         ChunkKind::Section { heading_path, .. } => {
@@ -107,6 +158,37 @@ fn anchor_phrase(kind: &ChunkKind) -> Option<String> {
         }
         ChunkKind::Window { .. } => None,
     }
+}
+
+/// The parenthetical word gloss for a symbol path, or `None` when splitting it
+/// would only restate its own spelling.
+///
+/// The runs walked here are the ones [`crate::store::subword`] walks — maximal
+/// spans of alphanumerics and `_` — so `.`, `::`, `<>` and the `#` in a Rust
+/// trait-impl path all separate names without appearing in the gloss.
+///
+/// `None` is the common case and is the point. The gloss is emitted only when
+/// at least one run is a real expansion; `Board.Update` and `store::subword`
+/// are already word-per-token to any tokenizer, and glossing them would spend
+/// header tokens to say nothing.
+///
+/// Words are lowercased (the gloss is a reading of the name, not a second
+/// spelling of it) and deduplicated in first-seen order, so `Card.CardView`
+/// glosses as `card view` rather than `card card view`.
+fn split_gloss(symbol: &str) -> Option<String> {
+    let mut expanded = false;
+    let mut words: Vec<String> = Vec::new();
+    for run in subword::runs(symbol) {
+        let parts = subword::split_parts(run);
+        expanded |= subword::is_expansion(run, &parts);
+        for part in parts {
+            let word = part.to_lowercase();
+            if !words.contains(&word) {
+                words.push(word);
+            }
+        }
+    }
+    (expanded && !words.is_empty()).then(|| words.join(" "))
 }
 
 /// Remove trailing discriminator suffixes from a dotted symbol path.
@@ -197,6 +279,102 @@ mod tests {
         );
     }
 
+    /// The gloss exists so a fused identifier reaches a natural-language
+    /// query. It is appended once, in parentheses, after the symbol itself.
+    #[test]
+    fn a_fused_identifier_gains_one_parenthetical_gloss() {
+        let snake = chunk(
+            "crates/lore/src/search.rs",
+            Some("rust"),
+            code("function_item", "search_page_final"),
+            "fn search_page_final() {}",
+        );
+        assert_eq!(
+            header(&snake),
+            "rust crates/lore/src/search.rs function item search_page_final (search page final)"
+        );
+
+        // camelCase and an acronym run split by the same rules the lexical
+        // column uses: `HTTP` stays whole, `Response` starts a word.
+        let camel = chunk(
+            "Assets/Net.cs",
+            Some("csharp"),
+            code("method_declaration", "Client.parseHTTPResponse"),
+            "",
+        );
+        assert_eq!(
+            header(&camel),
+            "csharp Assets/Net.cs method declaration Client.parseHTTPResponse \
+             (client parse http response)"
+        );
+    }
+
+    /// The expensive half of the rule: a name that is *already* words costs no
+    /// header tokens at all. `Board.Update` and `store::subword` are one word
+    /// per token to any tokenizer, so restating them would be pure dilution.
+    #[test]
+    fn a_name_that_is_already_plain_words_gets_no_gloss() {
+        for (kind, symbol) in [
+            ("method_declaration", "Board.Update"),
+            ("mod_item", "store::subword"),
+            ("function_item", "main"),
+            // A trait impl: `#` separates without appearing in any gloss, and
+            // both halves are plain words, so there is nothing to say.
+            ("impl_item", "Index#Display"),
+        ] {
+            let c = chunk("f.rs", Some("rust"), code(kind, symbol), "");
+            assert_eq!(
+                header(&c),
+                format!("rust f.rs {} {symbol}", kind.replace('_', " ")),
+                "{symbol} must not be glossed"
+            );
+        }
+    }
+
+    /// Discriminators are stripped *before* the gloss is built, so a windowed
+    /// chunk glosses its symbol and not its bookkeeping.
+    #[test]
+    fn a_windowed_anchor_glosses_the_stripped_symbol() {
+        let c = chunk(
+            "src/index.rs",
+            Some("rust"),
+            code("function_item", "Indexer.fullScanAll#w2"),
+            "",
+        );
+        assert_eq!(
+            header(&c),
+            "rust src/index.rs function item Indexer.fullScanAll (indexer full scan all)"
+        );
+    }
+
+    /// Words are deduplicated in first-seen order, so a name that repeats a
+    /// scope in its own leaf does not repeat it in the gloss either. Merged
+    /// siblings keep their "group starting at" phrasing around it.
+    #[test]
+    fn the_gloss_is_deduplicated_and_survives_the_group_phrasing() {
+        let c = chunk(
+            "Ui/Card.cs",
+            Some("csharp"),
+            code("group", "Card.CardView#w0"),
+            "",
+        );
+        assert_eq!(
+            header(&c),
+            "csharp Ui/Card.cs group starting at Card.CardView (card view)"
+        );
+
+        // Digits are their own subword, as they are on the lexical side.
+        assert_eq!(
+            split_gloss("readUtf8Blob").as_deref(),
+            Some("read utf 8 blob")
+        );
+        // Nothing to split, nothing to say.
+        assert_eq!(split_gloss("Board.Update"), None);
+        assert_eq!(split_gloss(""), None);
+        // A leading underscore is an expansion even though it yields one part.
+        assert_eq!(split_gloss("_private"), Some("private".to_string()));
+    }
+
     #[test]
     fn header_uses_the_heading_path_for_sections() {
         let c = chunk(
@@ -209,6 +387,40 @@ mod tests {
             "RRF fuses the two arms.",
         );
         assert_eq!(header(&c), "markdown design/x.md Retrieval > Ranking");
+    }
+
+    /// Prose is byte-identical to what the `v1` recipe produced. A heading is
+    /// already words; splitting `authority_laundering` into a gloss would put
+    /// tokens the author never wrote into a document's embedding, and the
+    /// non-regression claim for the design vault rests on prose not moving.
+    #[test]
+    fn prose_headers_are_unchanged_by_the_gloss() {
+        let heading = chunk(
+            "design/1_Architecture/authority_laundering.md",
+            Some("markdown"),
+            ChunkKind::Section {
+                heading_path: vec!["authority_laundering".into(), "parseJSON".into()],
+                window: None,
+            },
+            "body",
+        );
+        assert_eq!(
+            header(&heading),
+            "markdown design/1_Architecture/authority_laundering.md \
+             authority_laundering > parseJSON"
+        );
+
+        let window = chunk(
+            "logs/run_final.log",
+            None,
+            ChunkKind::Window { index: 7 },
+            "boot",
+        );
+        assert_eq!(header(&window), "text logs/run_final.log");
+        assert_eq!(
+            document_text(&window, "passage: "),
+            "passage: text logs/run_final.log\nboot"
+        );
     }
 
     #[test]

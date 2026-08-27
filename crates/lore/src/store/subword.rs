@@ -117,7 +117,11 @@ fn push_case_and_digit_parts<'a>(segment: &'a str, parts: &mut Vec<&'a str>) {
 /// One part equal to the input is a plain word: indexing it again would only
 /// double-count it in BM25. One part *different* from the input is still an
 /// expansion (`_private` → `private`), and so is any split into two or more.
-fn is_expansion(run: &str, parts: &[&str]) -> bool {
+///
+/// [`crate::embed::text`] asks the same question for a different reason: an
+/// embedding header glosses a symbol only when the gloss says something the
+/// spelling does not.
+pub(crate) fn is_expansion(run: &str, parts: &[&str]) -> bool {
     parts.len() > 1 || parts.first().is_some_and(|only| *only != run)
 }
 
@@ -176,7 +180,7 @@ pub(crate) fn expand<'a>(inputs: &[&'a str]) -> String {
 
 /// The maximal runs of token characters in `text` — what FTS5 would tokenize
 /// it into, before any of the splitting above.
-fn runs(text: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn runs(text: &str) -> impl Iterator<Item = &str> {
     text.split(|c: char| !is_run_char(c))
         .filter(|run| !run.is_empty())
 }

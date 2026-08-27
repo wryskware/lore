@@ -1395,6 +1395,7 @@ fn embedding_fingerprint_set_get_clear() {
         document_prefix: "passage: ".into(),
         normalization: "l2".into(),
         max_embed_bytes: 8 * 1024,
+        embed_text_recipe: "v2".into(),
     };
     store.set_embedding_fingerprint(&fp).unwrap();
     assert_eq!(store.embedding_fingerprint().unwrap().as_ref(), Some(&fp));
