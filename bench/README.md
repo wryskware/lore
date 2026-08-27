@@ -6,6 +6,10 @@ self-contained and supersedes the round-1 plan, answer-key and Revision A
 addendum for round-2 purposes; those three stay on disk as the record of what
 round 1 was graded against. This folder is the machinery.
 
+A round's write-up follows
+`design/6_Evaluation/2026-08-18_bench-report-format.md` — required sections,
+the cell ledger, and where each number comes from.
+
 - `run.ps1` — one cell (`-Model luna|qwen -Repo lore|terrarium|lexomancy
   -Arm on|off -Task T1..T5`) or the whole matrix (`-Matrix`; `-Arms on` for
   the on-arm-only shape).
