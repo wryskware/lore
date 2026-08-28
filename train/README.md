@@ -292,7 +292,25 @@ The detector is deliberately broad — any rooted `/a/b/` path, any drive letter
 any `~/` — and is checked against both positive and negative controls
 (`https://` must not read as drive `s:`; `and/or` and `src/qibo/` must not read
 as rooted). False positives cost one trajectory each. A false negative is
-permanent and lives in the weights.
+permanent and lives in the weights. One carve-out, measured in from the glm
+pilots: `/dev/` is exempt — `2>/dev/null` is portable shell plumbing that names
+no machine, and the blanket rule was rejecting a third of otherwise-good cells.
+
+**One bounded exception to "rejected, not repaired": citations** (Wrysk,
+2026-08-28, for yield). The teacher's dominant citation defect is a bare
+filename — `client.py` for `docker/client.py` — and one unresolvable citation
+rejects the whole row, so a small per-citation slip rate killed 78 of 260
+glm-run-01 cells. `repair_citations` in convert.py rewrites a cited path that
+does not resolve **only when it names exactly one file**: unique
+trailing-component match, then unique basename, then — because file recall
+already scores a bare filename as matching a reference path by suffix, so such
+rows were dying on the existence gate alone — a unique suffix match against
+the reference's own citations, resolved back against the snapshot. Repair
+touches the final answer message only (mid-trajectory narration beside a
+recorded tool call is never rewritten), counts into `meta.citation_repairs`,
+and anything still ambiguous dies at the grade gate exactly as before. This is
+not a guess: every adopted path is a real file at the pinned commit that the
+written path unambiguously names.
 
 ### Decision 6 — the validator is referenced, never vendored
 

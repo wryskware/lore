@@ -218,8 +218,82 @@ def elide(text: str, cap: int) -> str:
 # One trajectory
 # --------------------------------------------------------------------------- #
 
+def snapshot_files(snapshot: str) -> list[str]:
+    """Repo-relative paths of every file in a snapshot, forward slashes."""
+    out = []
+    for dirpath, dirnames, filenames in os.walk(snapshot):
+        dirnames[:] = [d for d in dirnames if d != ".git"]
+        for name in filenames:
+            rel = os.path.relpath(os.path.join(dirpath, name), snapshot)
+            out.append(rel.replace(os.sep, "/"))
+    return out
+
+
+def repair_citations(text: str, files: list[str],
+                     ref_paths: set[str] | frozenset[str] = frozenset(),
+                     ) -> tuple[str, int]:
+    """Rewrite citation paths that do not resolve but name exactly one file.
+
+    The teacher's dominant citation defect is a bare filename (`client.py`
+    for `docker/client.py`) -- per-citation it is rare, but one bad citation
+    rejects the whole row, so at scale it was the single biggest yield sink
+    (78 of 260 cells in glm-run-01). When the written path misses but matches
+    exactly one real file, the intent is unambiguous and the repaired text is
+    what a correct demonstration would have said.
+
+    Tier 1 matches on whole trailing path components (`grade.same_file`
+    semantics); tier 2 falls back to a unique basename, which also catches a
+    mistyped directory. Tier 3 disambiguates through the reference answer:
+    file recall already scores a bare filename as matching a reference path
+    by suffix, so when the cited path suffix-matches exactly one reference
+    citation, the row was dying on the existence gate alone -- adopting the
+    reference's file (itself resolved against the snapshot) writes out the
+    path the grader already deemed correct. Anything still ambiguous is left
+    alone and dies at the grade gate as before.
+    """
+    import grade
+    existing = set(files)
+    by_base: dict[str, list[str]] = collections.defaultdict(list)
+    for f in files:
+        by_base[f.rsplit("/", 1)[-1]].append(f)
+
+    def resolve(path: str) -> str | None:
+        """A snapshot file the written path unambiguously names, if any."""
+        if path in existing:
+            return path
+        suffix = [f for f in files if grade.same_file(path, f)]
+        if len(suffix) == 1:
+            return suffix[0]
+        base = by_base.get(path.rsplit("/", 1)[-1], [])
+        return base[0] if len(base) == 1 else None
+
+    pieces, last, repairs = [], 0, 0
+    for match in grade.PATH_RE.finditer(text or ""):
+        cited = match.group(0).lstrip("./")
+        if cited in existing:
+            continue
+        target = resolve(cited)
+        if target is None:
+            matched_refs = [r for r in ref_paths if grade.same_file(cited, r)]
+            if len(matched_refs) == 1:
+                target = resolve(matched_refs[0])
+        if target is None:
+            continue
+        pieces.append(text[last:match.start()])
+        pieces.append(target)
+        last = match.end()
+        repairs += 1
+    if not repairs:
+        return text, 0
+    pieces.append(text[last:])
+    return "".join(pieces), repairs
+
+
 def convert_one(cfg: Config, meta: dict, events: list[dict],
-                roots: list[str]) -> tuple[dict | None, list[str]]:
+                roots: list[str],
+                files: list[str] | None = None,
+                ref_paths: frozenset[str] = frozenset(),
+                ) -> tuple[dict | None, list[str]]:
     """Return (row, reasons). `row is None` means the trajectory was dropped."""
     emit = cfg["emit"]
     drop_tools = set(emit["drop_tools"])
@@ -312,6 +386,17 @@ def convert_one(cfg: Config, meta: dict, events: list[dict],
     if reasons:
         return None, reasons
 
+    # The final message is the graded answer; repair happens there and only
+    # there. Mid-trajectory narration stays exactly as the teacher spoke it --
+    # rewriting text that sits beside a recorded tool call would falsify the
+    # interaction it narrates.
+    repairs = 0
+    if files:
+        repaired, repairs = repair_citations(messages[-1]["content"], files,
+                                             ref_paths)
+        if repairs:
+            messages[-1]["content"] = repaired
+
     masked_leaks = sum(len(common.absolute_leaks(b)) for b in masked_blobs)
     row_meta = dict(meta)
     row_meta.pop("question", None)          # it is messages[1]; do not duplicate
@@ -323,6 +408,7 @@ def convert_one(cfg: Config, meta: dict, events: list[dict],
         "dropped_tool_calls": dropped_calls,
         "dropped_arg_keys": dict(dropped_args) or None,
         "masked_abs_fragments": masked_leaks,
+        "citation_repairs": repairs,
         "system_prompt_sha12": common.sha12(common.SCOUT_SYSTEM_PROMPT),
         "graded": False,
     })
@@ -353,6 +439,30 @@ def main(argv: list[str]) -> int:
     roots = [os.path.join(snap_root, p.snapshot) for p in pins.values()]
     roots.append(snap_root)
 
+    # Reference citations, for tier-3 repair disambiguation. Same file and
+    # extractor the grader uses, so repair and grading can never disagree
+    # about what the reference cites.
+    import grade
+    qfile = manifest.get("questions_file") or os.path.join(
+        workspace, "questions", f"{batch}.jsonl")
+    ref_paths_by_qid: dict[str, frozenset[str]] = {}
+    if os.path.exists(qfile):
+        for q in common.read_jsonl(qfile):
+            ref_paths_by_qid[q["qid"]] = frozenset(
+                grade.citations(q.get("reference_answer", ""))[0])
+
+    inventories: dict[str, list[str]] = {}
+
+    def files_for(repo: str) -> list[str] | None:
+        pin = pins.get(repo)
+        if pin is None:
+            return None
+        if pin.snapshot not in inventories:
+            snap = os.path.join(snap_root, pin.snapshot)
+            inventories[pin.snapshot] = (snapshot_files(snap)
+                                         if os.path.isdir(snap) else [])
+        return inventories[pin.snapshot] or None
+
     rows, rejects = [], []
     reason_counts: collections.Counter = collections.Counter()
     for qid in sorted(os.listdir(raw_dir)):
@@ -363,7 +473,10 @@ def main(argv: list[str]) -> int:
         with open(meta_path, encoding="utf-8") as handle:
             meta = json.load(handle)
         events = parse_events(os.path.join(cell, "agent.ndjson"))
-        row, reasons = convert_one(cfg, meta, events, roots)
+        row, reasons = convert_one(cfg, meta, events, roots,
+                                   files=files_for(meta.get("repo", "")),
+                                   ref_paths=ref_paths_by_qid.get(
+                                       qid, frozenset()))
         if row is None:
             rejects.append({"qid": qid, "stage": "convert", "reasons": reasons})
             for reason in reasons:
