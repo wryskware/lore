@@ -146,6 +146,19 @@ single-authoritative-owner constraint says that state has exactly one owner.
 `generate.py` reads `/v1/resolve` and `/v1/status`, and refuses to spend teacher
 calls when a project is unregistered, unindexed, or degraded to lexical-only.
 
+"Degraded" is the whole point of that check and it took the first pilot to make
+it true. The daemon reports readiness as `embeddings.state == "ready"`, never as
+a boolean `ready` key, so the endpoint check was reading a field that does not
+exist; the fallback then accepted *any* non-zero `embedded_chunks`, which let a
+project 22% through its embedding backlog pin cleanly and answer `bundle`
+lexically for the other 78% without erroring. Readiness of the endpoint is not
+coverage of the index, and both are now required: `embeddings.state` must be
+`ready` and `embedded_chunks` must equal `chunks`.
+
+The operator-owned half has a sharp edge worth stating: bare `lore index`
+queues **every** registered project on the daemon, not the one just added. On a
+shared daemon, prefer `lore index <project>`.
+
 Deliberately simple: one manifest per batch, no database. A batch is the unit of
 everything — one teacher configuration, one prompt, one set of pins.
 
@@ -324,9 +337,12 @@ actually proven on this box exactly **one** of its 926 rows fits.
 `generate.py` writes a per-cell `opencode.json` that denies everything the
 student will never own: `edit`/`write`/`patch` (the snapshot must stay
 byte-identical, or the pin is a lie), `webfetch`/`websearch`, `glob`/`list`,
-`todowrite`, `external_directory`, and the `task` subagent. What is left maps
-onto the five-tool surface: lore's `bundle` and `search` over MCP, plus
-opencode's native `grep`, `read` and `bash`.
+`todowrite`, `external_directory`, the `task` subagent, and lore's own
+`expand`/`status` — the MCP server exposes four tools, only two of which the
+student has, and the `search` description actively tells its caller to expand a
+hit before quoting it. What is left maps onto the five-tool surface: lore's
+`bundle` and `search` over MCP, plus opencode's native `grep`, `read` and
+`bash`.
 
 A call the teacher never makes is a trajectory that never has to be thrown away.
 `convert.py` still rejects on an unmapped tool, because a config that silently
@@ -334,10 +350,22 @@ stops applying should fail loudly rather than quietly emit off-surface calls.
 
 Argument names are renamed to the student's surface at conversion:
 `lore_bundle`/`lore_search` → `bundle`/`search`, `read.filePath/offset/limit` →
-`read.path/start/end` (opencode counts lines from 0; citations are 1-based),
-`grep.include` → `grep.glob`. Every dropped key is counted into
-`meta.dropped_arg_keys`, so a renaming that starts losing information is visible
-in the data rather than only in this paragraph.
+`read.path/start/end`, `grep.path`+`grep.include` → `grep.glob`. Every dropped
+key is counted into `meta.dropped_arg_keys`, so a renaming that starts losing
+information is visible in the data rather than only in this paragraph.
+
+Two of those renames were wrong until the first pilot measured them, and both
+were wrong in the quiet direction — the output stayed plausible:
+
+- **`read.offset` is 1-based, not 0-based.** Measured at opencode 1.18.23:
+  `offset: 302` returns a body whose first line is the file's line 302, and
+  `offset: 1` returns line 1. The conversion added one, so every read span in
+  every trajectory was shifted by a line, in a corpus whose entire purpose is
+  teaching a model to cite line spans.
+- **`grep` scopes with `path` as well as `include`.** Keeping only `include`
+  collapsed two greps over different subtrees into two byte-identical
+  supervised calls with different tool results. Both now fold into the one
+  `glob` the student has.
 
 ---
 
@@ -351,12 +379,16 @@ result elision, all structural gates, the citation parser (checked against all
 span-overlap scoring, manifest read/write, both validator invocations, and the
 row shape — which passes all 33 validator check classes.
 
-**Real but never yet executed:** the `opencode` invocation, snapshot checkout,
-and the lore daemon preflight. Written against verified interfaces —
-`opencode run --help` confirms `--variant max` and `--dir`; the daemon exposes
-`POST /v1/bundle`, `GET /v1/resolve` and `GET /v1/status` with `generation`;
-`lore-mcp` exposes exactly `bundle`, `expand`, `search`, `status` and honours
-`LORE_PROJECT` — but the first real cell is the first time they run.
+**Real, and executed once for real** (batch `pilot-01`, qibo, five questions,
+2026-08-27): the `opencode` invocation and its per-cell tool gate, snapshot
+checkout, and the lore daemon preflight. All five cells completed. What the
+first contact changed is recorded above under Decisions 2 and 8 — the read
+off-by-one, the lost grep scope, `lore_expand`/`lore_status` left un-denied, and
+a preflight that read `embeddings.ready` (the daemon reports
+`embeddings.state`) and accepted a 22%-embedded project as healthy.
+
+Still unexercised at any scale: concurrency above 1, more than one repository in
+a batch, and every repo in the corpus that is not qibo.
 
 **Stubbed:**
 
@@ -465,3 +497,31 @@ than metered API spend.
 Check before scaling: the keep rate, the reject-reason histogram (a taxonomy
 where one reason dominates is a harness bug, not a quality signal), and the
 token-length distribution against `max_length`.
+
+### What the first pilot measured (2026-08-27, qibo, five questions)
+
+13m01s wall at concurrency 1 — 78s to 219s per cell, median 173s — and 28k to
+65k teacher tokens per cell, which lands inside the estimate above. Every cell
+called `bundle` exactly once and called it first; none reached for a tool
+outside the surface. Tool calls per trajectory ranged 9 to 40, median 19.
+
+The numbers the design was guessing at, and what they say:
+
+- **`max_tool_calls = 30` is the wrong bid.** It was the *only* reject reason at
+  the convert stage, and it took two of five — one of which then graded 1.00 /
+  1.00 on the answer key. A trajectory-shaped filter that mostly rejects good
+  trajectories is a threshold, not a gate. The teacher reads more files than
+  this anticipated: 69 `read` calls across five cells.
+- **The grading thresholds are, if anything, slack.** File recall came in at
+  1.00, 1.00, 1.00, 0.50 and 0.43; span hit rate at 1.00, 1.00, 0.67. Nothing
+  landed near the 0.5 / 0.34 bars from below except the one row that failed
+  outright, so the pilot neither confirms nor refutes where they sit.
+- **`max_length = 8192` is unreachable and `max_tool_chars` is why.** Rows
+  rendered at 12.4k, 13.1k, 22.9k and 31.8k tokens — every one over, none within
+  a factor of the bar, and only ~8.4% of each row supervised. Tool results are
+  the whole mass. Either the budget rises to 32k, where all four fit but the
+  largest fits by 3%, or the caps come down hard.
+- **Decision 7's "drop, don't truncate" is not implemented.** Nothing in
+  `convert.py` or `grade.py` drops a row for length; `max_length` is only
+  handed to the validator, which fails the *batch* and leaves the over-length
+  rows in the file. The gate has to exist before a real batch is trained on.
