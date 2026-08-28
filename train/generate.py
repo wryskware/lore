@@ -193,12 +193,30 @@ def pin_repo(cfg: Config, repo: str, commit: str, dry_run: bool) -> RepoPin:
     if not proj.get("chunks"):
         raise SystemExit(f"{repo}: lore project {info.get('name')!r} has no chunks "
                          f"indexed; run `lore index` before generating.")
+    # The daemon reports readiness as `embeddings.state == "ready"`, not as a
+    # boolean `ready` key; the older spelling is still accepted so a daemon that
+    # predates the change does not read as broken.
     embeddings = status.get("embeddings") or {}
-    if not (embeddings.get("ready") or proj.get("embedded_chunks")):
+    ready = embeddings.get("state") == "ready" or bool(embeddings.get("ready"))
+    if not ready:
         raise SystemExit(
-            f"{repo}: the embedding endpoint is not ready, so every bundle "
-            f"would silently degrade to lexical-only. Start it and re-check "
-            f"`lore status` before spending teacher calls.")
+            f"{repo}: the embedding endpoint is not ready "
+            f"(embeddings={embeddings!r}), so every bundle would silently "
+            f"degrade to lexical-only. Start it and re-check `lore status` "
+            f"before spending teacher calls.")
+    # Readiness of the endpoint is not coverage of the index. A project whose
+    # embedding backlog is still draining answers `bundle` from whatever subset
+    # has vectors, which is lexical-only for everything else -- and it does so
+    # without erroring, so nothing downstream would ever notice. Coverage has to
+    # be complete before a teacher call is worth spending.
+    chunks = int(proj.get("chunks") or 0)
+    embedded = int(proj.get("embedded_chunks") or 0)
+    if embedded < chunks:
+        raise SystemExit(
+            f"{repo}: lore project {info.get('name')!r} is only "
+            f"{embedded}/{chunks} embedded ({embedded / chunks * 100:.0f}%). "
+            f"Bundles would degrade to lexical-only over the remainder. Wait "
+            f"for `lore status` to reach 100% before spending teacher calls.")
     return RepoPin(
         repo=repo, commit=commit, snapshot=common.slug(repo),
         lore_project=info.get("name") or project, project_key=key,
@@ -223,18 +241,30 @@ def opencode_config(cfg: Config, out_dir: str) -> str:
     never makes is a trajectory that never has to be thrown away.
     """
     model = cfg["teacher"]["model"]
+    variant = cfg["teacher"]["variant"]
     provider_block: dict = {}
     if model.startswith("openai/"):
+        # The effort has to follow the configured variant. Hardcoding one here
+        # while passing another on the command line leaves two answers to the
+        # same question in the same cell, and which of them the teacher
+        # actually ran at is not recoverable from the recording.
         provider_block = {"openai": {"models": {
-            model.split("/", 1)[1]: {"options": {"reasoningEffort": "high"}}}}}
+            model.split("/", 1)[1]: {"options": {"reasoningEffort": variant}}}}}
     doc = {
         "$schema": "https://opencode.ai/config.json",
         "model": model,
         "share": "disabled",
         "autoupdate": False,
         "snapshot": False,
+        # `lore_expand` and `lore_status` are on the MCP server but not on the
+        # student's five-tool surface, so a teacher that calls one costs the
+        # whole trajectory to `forbidden_tool`. Decision 8: deny at the source,
+        # because a call the teacher never makes is a trajectory that never has
+        # to be thrown away. `expand` is the live risk -- lore's own `search`
+        # description tells the caller to expand a hit before quoting it.
         "tools": {"webfetch": False, "websearch": False, "glob": False,
                   "list": False, "todowrite": False,
+                  "lore_expand": False, "lore_status": False,
                   "task": bool(cfg["teacher"]["allow_task_subagent"])},
         "permission": {
             "webfetch": "deny", "websearch": "deny", "question": "deny",
@@ -300,6 +330,24 @@ def run_cell(cfg: Config, question: dict, pin: RepoPin, raw_dir: str,
     with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as handle:
         json.dump(meta, handle, indent=2)
     return meta
+
+
+def completed(raw_dir: str, qid: str) -> bool:
+    """Whether `qid` already has a finished cell on disk.
+
+    "Finished" means the run exited cleanly and left events behind: a timed-out
+    or crashed cell is worth re-running, an empty `agent.ndjson` is worth
+    re-running, and a good one is not.
+    """
+    cell = os.path.join(raw_dir, qid)
+    try:
+        with open(os.path.join(cell, "meta.json"), encoding="utf-8") as handle:
+            meta = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return False
+    ndjson = os.path.join(cell, "agent.ndjson")
+    return (meta.get("status") == "OK" and os.path.exists(ndjson)
+            and os.path.getsize(ndjson) > 0)
 
 
 def cell_meta(cfg: Config, question: dict, pin: RepoPin, **extra) -> dict:
@@ -465,6 +513,8 @@ def main(argv: list[str]) -> int:
                     help="fabricate opencode-shaped trajectories; call nothing")
     ap.add_argument("--prepare-only", action="store_true",
                     help="check out snapshots and write the manifest, then stop")
+    ap.add_argument("--resume", action="store_true",
+                    help="skip cells that already completed; re-run the rest")
     args = ap.parse_args(argv)
 
     cfg = common.load_config(args.config)
@@ -510,6 +560,19 @@ def main(argv: list[str]) -> int:
         print(f"\nprepared only; manifest at "
               f"{common.manifest_path(workspace, batch)}")
         return 0
+
+    if args.resume:
+        # A cell is a teacher call, and a teacher call is the expensive thing
+        # here. Re-running a batch to add the cells that failed -- or to finish
+        # one that was inspected after its first cell -- must not re-spend the
+        # ones that already succeeded.
+        pending = [q for q in questions if not completed(raw_dir, q["qid"])]
+        print(f"resume: {len(questions) - len(pending)} cells already complete, "
+              f"{len(pending)} to run")
+        questions = pending
+        if not questions:
+            print("nothing to do")
+            return 0
 
     base_port = int(cfg["teacher"]["port"])
     workers = max(1, int(cfg["teacher"]["concurrency"]))

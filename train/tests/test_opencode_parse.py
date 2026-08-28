@@ -124,14 +124,21 @@ def test_a_tool_use_with_no_output_never_injects_a_literal_null(cfg):
 # --------------------------------------------------------------------------- #
 
 def test_read_offset_and_limit_map_to_one_based_start_and_end(cfg):
-    """opencode counts lines from 0; citations are 1-based."""
+    """opencode's `read.offset` is 1-based, so it *is* the citation's start.
+
+    Measured against the real event stream at opencode 1.18.23 during the first
+    pilot: `{"filePath": ..., "offset": 302, "limit": 430}` returned a body
+    whose first line is the file's line 302, and `offset: 1` returned line 1.
+    The README originally claimed 0-based and the code added one, which shifted
+    every read span in every trajectory by a line.
+    """
     row, _ = convert.convert_one(
         cfg, meta_for(QUESTION), fixture_events("interleaved.ndjson"), [])
     read = [c for m in row["messages"] if m["role"] == "assistant"
             for c in (m.get("tool_calls") or [])
             if c["function"]["name"] == "read"][0]
     assert json.loads(read["function"]["arguments"]) == {
-        "path": "src/registry.py", "start": 21, "end": 26}
+        "path": "src/registry.py", "start": 20, "end": 25}
 
 
 def test_grep_include_is_renamed_to_glob(cfg):
@@ -140,6 +147,29 @@ def test_grep_include_is_renamed_to_glob(cfg):
     grep = row["messages"][4]["tool_calls"][0]
     assert json.loads(grep["function"]["arguments"]) == {
         "pattern": "ChunkerRegistry\\(", "glob": "*.py"}
+
+
+def test_grep_path_and_include_both_survive_into_the_glob(cfg):
+    """The teacher scopes greps with `path` *and* filters with `include`.
+
+    Found in the first pilot: two greps sharing a pattern but scoped to
+    different subtrees rendered as two byte-identical supervised calls with
+    different tool results, because only `include` was kept.
+    """
+    assert convert.map_grep({"pattern": "QAOA", "path": "/snap/src/qibo/tests",
+                             "include": "*.py"}) == {
+        "pattern": "QAOA", "glob": "/snap/src/qibo/tests/**/*.py"}
+    assert convert.map_grep({"pattern": "QAOA", "path": "/snap"}) == {
+        "pattern": "QAOA", "glob": "/snap/**"}
+    assert convert.map_grep({"pattern": "QAOA", "include": "*.py"}) == {
+        "pattern": "QAOA", "glob": "*.py"}
+    assert convert.map_grep({"pattern": "QAOA", "path": "."}) == {
+        "pattern": "QAOA"}
+    # `path` is not always a directory: pinning it to a single file and then
+    # appending `/**/*.py` yields a glob that matches nothing.
+    assert convert.map_grep({"pattern": "QAOA", "include": "*.py",
+                             "path": "src/qibo/models/circuit.py"}) == {
+        "pattern": "QAOA", "glob": "src/qibo/models/circuit.py"}
 
 
 def test_dropped_argument_keys_are_counted(cfg):

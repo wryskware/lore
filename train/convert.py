@@ -47,27 +47,57 @@ FORBIDDEN = "forbidden_tool"
 
 
 def map_read(args: dict) -> dict:
+    """`read.filePath/offset/limit` -> the student's `read.path/start/end`.
+
+    opencode's `read.offset` is **1-based**, not 0-based: measured against the
+    real stream at opencode 1.18.23, `offset=302` returns a body whose first
+    line is the file's line 302, and `offset=1` returns line 1. Adding one on
+    the way in shifted every span in the trajectory by a line, which is a
+    systematic off-by-one the student would have learnt from every read it ever
+    saw -- and one nothing downstream could have caught, because both the wrong
+    and the right span are plausible integers.
+    """
     out = {"path": args.get("filePath") or args.get("path") or ""}
     offset = args.get("offset")
     limit = args.get("limit")
-    if offset:                      # opencode counts lines from 0; we cite from 1
-        out["start"] = int(offset) + 1
+    if offset:
+        out["start"] = int(offset)
     if limit:
         out["end"] = out.get("start", 1) + int(limit) - 1
     return out
 
 
 def map_grep(args: dict) -> dict:
+    """`grep.pattern/path/include` -> the student's `grep.pattern/glob`.
+
+    Both of opencode's scoping arguments have to survive into the one the
+    student has. Keeping only `include` loses the directory the teacher
+    actually searched, and the cost is not merely lost information: two greps
+    with the same pattern scoped to different subtrees collapse into two
+    *identical* supervised calls with different results, which teaches the
+    student that the same call returns different things.
+    """
     out = {"pattern": args.get("pattern") or ""}
-    glob = args.get("include")
-    if not glob:
-        # `rstrip` only: a leading slash is left on deliberately. It lets the
-        # normaliser rewrite the snapshot root out, and when the root does not
-        # match, the absolute-path gate catches it instead of a silently
-        # relative-looking `mnt/c/.../**` sailing through.
-        scope = (args.get("path") or "").rstrip("/")
-        if scope and scope != ".":
-            glob = f"{scope}/**"
+    # `rstrip` only: a leading slash is left on deliberately. It lets the
+    # normaliser rewrite the snapshot root out, and when the root does not
+    # match, the absolute-path gate catches it instead of a silently
+    # relative-looking `mnt/c/.../**` sailing through.
+    scope = (args.get("path") or "").rstrip("/")
+    if scope == ".":
+        scope = ""
+    include = args.get("include") or ""
+    # `path` is usually a directory, but the teacher does sometimes hand it a
+    # single file. Joining a filename to `/**/*.py` produces a glob that matches
+    # nothing and reads, in the trajectory, as a directory that does not exist.
+    scope_is_file = bool(os.path.splitext(os.path.basename(scope))[1])
+    if scope and scope_is_file:
+        glob = scope
+    elif scope and include:
+        glob = f"{scope}/**/{include}"
+    elif scope:
+        glob = f"{scope}/**"
+    else:
+        glob = include
     if glob:
         out["glob"] = glob
     return out

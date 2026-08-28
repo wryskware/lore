@@ -108,6 +108,70 @@ def test_the_daemon_port_is_read_from_the_state_dir(cfg, tmp_path):
     assert common.daemon_base(cfg) == "http://127.0.0.1:4321/v1"
 
 
+# --------------------------------------------------------------------------- #
+# the index-degradation preflight
+#
+# Written after the first real pilot, where both of these passed a project that
+# was 22% embedded straight through to the teacher.  Decision 2: "`generate.py`
+# reads `/v1/resolve` and `/v1/status`, and refuses to spend teacher calls when
+# a project is unregistered, unindexed, or degraded to lexical-only."
+# --------------------------------------------------------------------------- #
+
+def _preflight(cfg, monkeypatch, tmp_path, status: dict):
+    """Drive `pin_repo` against a fixtured daemon and an existing checkout."""
+    import generate
+
+    snapshot = tmp_path / "work" / "snapshots" / "example__repo"
+    snapshot.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(generate, "ensure_snapshot",
+                        lambda *a, **k: str(snapshot))
+    monkeypatch.setattr(common, "daemon_base", lambda _cfg: "http://stub/v1")
+
+    def fake_get(_base, route, timeout=15.0):
+        if route.startswith("/resolve"):
+            return {"id": 1, "name": "example__repo", "key": "example-repo",
+                    "root": str(snapshot), "kind": "repo"}
+        return status
+
+    monkeypatch.setattr(common, "daemon_get", fake_get)
+    return generate.pin_repo(cfg, "example/repo", "0" * 40, dry_run=False)
+
+
+def _status(embedded: int, chunks: int = 2058, state: str = "ready") -> dict:
+    return {"api_version": 1, "daemon_version": "0.1.0", "generation": 38,
+            "embeddings": {"state": state, "endpoint": "http://stub:8000/v1",
+                           "model": "stub-embed"},
+            "projects": [{"key": "example-repo", "name": "example__repo",
+                          "files": 387, "chunks": chunks,
+                          "embedded_chunks": embedded}]}
+
+
+def test_a_partly_embedded_project_is_refused(cfg, monkeypatch, tmp_path):
+    """A draining embedding backlog answers `bundle` from whatever subset has
+    vectors and is lexical-only for the rest, without erroring -- so nothing
+    downstream would ever notice.  Coverage has to be complete."""
+    with pytest.raises(SystemExit) as exc:
+        _preflight(cfg, monkeypatch, tmp_path, _status(embedded=448))
+    assert "448/2058" in str(exc.value)
+
+
+def test_a_fully_embedded_project_is_pinned(cfg, monkeypatch, tmp_path):
+    pin = _preflight(cfg, monkeypatch, tmp_path, _status(embedded=2058))
+    assert (pin.chunks, pin.embedded_chunks) == (2058, 2058)
+    assert pin.project_key == "example-repo"
+    assert pin.index_generation == 38
+
+
+def test_embedding_readiness_is_read_from_state_not_a_boolean(cfg, monkeypatch,
+                                                              tmp_path):
+    """The daemon reports `embeddings.state`, never `embeddings.ready`; reading
+    the wrong key made the whole check dead code."""
+    with pytest.raises(SystemExit) as exc:
+        _preflight(cfg, monkeypatch, tmp_path,
+                   _status(embedded=2058, state="degraded"))
+    assert "embedding endpoint is not ready" in str(exc.value)
+
+
 def test_the_harness_never_calls_lore_add_or_lore_index():
     """Decision 2: "Registration and indexing stay the operator's job -- `lore
     add` and `lore index` are not called from here." D-0003's
