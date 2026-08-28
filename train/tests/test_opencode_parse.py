@@ -104,16 +104,35 @@ def test_a_missing_log_file_is_no_events(cfg, tmp_path):
     assert convert.parse_events(str(tmp_path / "nope.ndjson")) == []
 
 
+def test_an_errored_lore_call_in_the_fixture_now_rejects(cfg):
+    """This fixture (a lore_bundle whose state is `error`, no output) is the
+    exact shape every cell of glm-run-01/-02 recorded when daemon discovery
+    broke. It used to convert quietly with an empty tool result; that silence
+    is how a fully corrupted corpus passed every gate. It rejects now."""
+    row, reasons = convert.convert_one(
+        cfg, meta_for(QUESTION), fixture_events("missing_output.ndjson"), [])
+    assert row is None
+    assert reasons == ["lore_tool_error:lore_bundle"]
+
+
 def test_a_tool_use_with_no_output_never_injects_a_literal_null(cfg):
-    """A `tool_use` whose `state` carries no `output` (a failed or interrupted
-    call) must not render the four characters `null` as the tool result.
+    """A non-lore `tool_use` whose `state` carries no `output` (a failed or
+    interrupted call) must not render the four characters `null` as the tool
+    result.
 
     `json.dumps(None)` is the string "null", and a masked tool result reading
     `null` is junk conditioning that no validator check catches: the row is a
     perfectly well-formed string everywhere.
     """
-    row, reasons = convert.convert_one(
-        cfg, meta_for(QUESTION), fixture_events("missing_output.ndjson"), [])
+    events = fixture_events("missing_output.ndjson")
+    for event in events:
+        part = event.get("part") or {}
+        if part.get("tool") == "lore_bundle":
+            # Interrupted, not errored: the lore_tool_error gate keys on the
+            # `error` status alone, and an interrupted call still must not
+            # render as the string "null".
+            (part.get("state") or {})["status"] = "completed"
+    row, reasons = convert.convert_one(cfg, meta_for(QUESTION), events, [])
     assert reasons == []
     results = [m["content"] for m in row["messages"] if m["role"] == "tool"]
     assert results == [""], f"tool result rendered as {results!r}"

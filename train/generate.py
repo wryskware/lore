@@ -377,6 +377,38 @@ def teacher_tokens(ndjson: str) -> dict:
     return totals
 
 
+def cell_env(cfg: Config, pin: RepoPin, out_dir: str, config_path: str) -> dict:
+    """The environment one teacher cell runs under.
+
+    opencode keeps one global sqlite store per user; concurrent cells collide
+    on its lock at session start ("database is locked", exit 1 in <1s). Each
+    cell gets a private XDG data dir seeded with the shared credentials, and
+    run_cell deletes it once the trajectory is safely in agent.ndjson.
+
+    LORE_STATE_DIR must then be pinned to the REAL state dir: lore-mcp
+    discovers the daemon through the state dir's daemon.json, and its default
+    follows XDG -- so the isolation dir silently redirected discovery and
+    every bundle/search call in glm-run-01/-02 errored with "daemon is not
+    running" while answers still graded well. The corpus taught the student
+    that bundle fails. Explicit is the only safe setting here.
+    """
+    env = dict(os.environ)
+    env["OPENCODE_CONFIG"] = config_path
+    # The MCP server scopes itself to one project. Pinning it by name here
+    # removes the only ambiguity in the whole cell: which index answered.
+    env["LORE_PROJECT"] = pin.project_key or pin.lore_project
+    xdg = os.path.join(out_dir, "xdg")
+    os.makedirs(os.path.join(xdg, "opencode"), exist_ok=True)
+    auth = os.path.expanduser("~/.local/share/opencode/auth.json")
+    if os.path.exists(auth):
+        shutil.copy(auth, os.path.join(xdg, "opencode", "auth.json"))
+    env["XDG_DATA_HOME"] = xdg
+    env["LORE_STATE_DIR"] = (cfg.get_path("lore", "state_dir")
+                             or os.environ.get("LORE_STATE_DIR")
+                             or os.path.expanduser("~/.local/share/lore"))
+    return env
+
+
 def run_cell(cfg: Config, question: dict, pin: RepoPin, raw_dir: str,
              port: int) -> dict:
     """One teacher session. Everything it produced lands under `raw_dir/<qid>`."""
@@ -390,21 +422,8 @@ def run_cell(cfg: Config, question: dict, pin: RepoPin, raw_dir: str,
         handle.write(prompt)
     config_path = opencode_config(cfg, out_dir)
 
-    env = dict(os.environ)
-    env["OPENCODE_CONFIG"] = config_path
-    # The MCP server scopes itself to one project. Pinning it by name here
-    # removes the only ambiguity in the whole cell: which index answered.
-    env["LORE_PROJECT"] = pin.project_key or pin.lore_project
-    # opencode keeps one global sqlite store per user; concurrent cells collide
-    # on its lock at session start ("database is locked", exit 1 in <1s). Each
-    # cell gets a private XDG data dir seeded with the shared credentials; it
-    # is deleted below once the trajectory is safely in agent.ndjson.
-    xdg = os.path.join(out_dir, "xdg")
-    os.makedirs(os.path.join(xdg, "opencode"), exist_ok=True)
-    auth = os.path.expanduser("~/.local/share/opencode/auth.json")
-    if os.path.exists(auth):
-        shutil.copy(auth, os.path.join(xdg, "opencode", "auth.json"))
-    env["XDG_DATA_HOME"] = xdg
+    env = cell_env(cfg, pin, out_dir, config_path)
+    xdg = env["XDG_DATA_HOME"]
 
     argv = [cfg["teacher"]["opencode_bin"], "run", "--pure", "--format", "json",
             "--variant", cfg["teacher"]["variant"], "--port", str(port),

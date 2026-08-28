@@ -321,6 +321,14 @@ def convert_one(cfg: Config, meta: dict, events: list[dict],
             if call["tool"] in drop_tools:
                 dropped_calls += 1
                 continue
+            # A lore tool that ERRORED is broken infrastructure, not a
+            # demonstration: glm-run-01/-02 recorded 100% of bundle/search
+            # calls failing ("daemon is not running" behind an env bug) and
+            # every gate passed, because an empty tool result is well-formed.
+            # An errored bash call is legitimate conditioning; an errored
+            # lore call means the corpus is teaching that bundle fails.
+            if call["tool"].startswith("lore_") and call.get("status") == "error":
+                return None, [f"lore_tool_error:{call['tool']}"]
             try:
                 name, args, dropped = map_call(call["tool"], call["input"])
             except KeyError:
