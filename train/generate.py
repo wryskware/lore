@@ -75,11 +75,16 @@ aim for a handful of well-chosen calls, not dozens.
 part of what you asked about, go and find that part yourself rather than \
 answering around it.
 4. Finish with a direct answer to the question. Cite every claim as a \
-`path:start-end` line span. Every path you write MUST be relative to the \
-repository root -- never an absolute path, never a path with a leading slash, \
-never `~`. Do not invent spans; cite only what you actually saw.
+`path:start-end` line span. Every path you write MUST be the full path from \
+the repository root, exactly as the bundle and `search` print it (e.g. \
+`src/pkg/module.py:12-40`) -- never an absolute path, never a path with a \
+leading slash, never `~`, and never a bare filename: `module.py:12-40` \
+does not resolve and does not count as a citation. Do not invent spans; \
+cite only what you actually saw.
 
-Say briefly what you are doing before each tool call. Do not modify anything: \
+Say briefly what you are doing before each tool call. Stay inside the \
+repository: never read or reference files outside it (installed packages, \
+system directories, your home directory). Do not modify anything: \
 this repository is a pinned snapshot and must stay byte-identical."""
 
 
@@ -252,6 +257,12 @@ def opencode_config(cfg: Config, out_dir: str) -> str:
         # actually ran at is not recoverable from the recording.
         provider_block = {"openai": {"models": {
             model.split("/", 1)[1]: {"options": {"reasoningEffort": variant}}}}}
+    elif model.startswith("openrouter/"):
+        # OpenRouter's unified reasoning knob; the provider maps it onto
+        # whatever the underlying model calls its effort levels.
+        provider_block = {"openrouter": {"models": {
+            model.split("/", 1)[1]: {"options": {
+                "reasoning": {"effort": variant}}}}}}
     doc = {
         "$schema": "https://opencode.ai/config.json",
         "model": model,
@@ -384,6 +395,16 @@ def run_cell(cfg: Config, question: dict, pin: RepoPin, raw_dir: str,
     # The MCP server scopes itself to one project. Pinning it by name here
     # removes the only ambiguity in the whole cell: which index answered.
     env["LORE_PROJECT"] = pin.project_key or pin.lore_project
+    # opencode keeps one global sqlite store per user; concurrent cells collide
+    # on its lock at session start ("database is locked", exit 1 in <1s). Each
+    # cell gets a private XDG data dir seeded with the shared credentials; it
+    # is deleted below once the trajectory is safely in agent.ndjson.
+    xdg = os.path.join(out_dir, "xdg")
+    os.makedirs(os.path.join(xdg, "opencode"), exist_ok=True)
+    auth = os.path.expanduser("~/.local/share/opencode/auth.json")
+    if os.path.exists(auth):
+        shutil.copy(auth, os.path.join(xdg, "opencode", "auth.json"))
+    env["XDG_DATA_HOME"] = xdg
 
     argv = [cfg["teacher"]["opencode_bin"], "run", "--pure", "--format", "json",
             "--variant", cfg["teacher"]["variant"], "--port", str(port),
@@ -403,6 +424,9 @@ def run_cell(cfg: Config, question: dict, pin: RepoPin, raw_dir: str,
         except subprocess.TimeoutExpired:
             code, status = -1, "TIMEOUT"
     wall_s = round(time.monotonic() - started, 1)
+    # The private XDG dir holds a copy of auth.json; never leave that lying
+    # around in the workspace once the cell is done with it.
+    shutil.rmtree(xdg, ignore_errors=True)
 
     meta = cell_meta(cfg, question, pin, status=status, exit_code=code,
                      wall_s=wall_s, tokens=teacher_tokens(ndjson))

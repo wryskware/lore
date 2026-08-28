@@ -10,10 +10,14 @@ The behaviour being taught, in one line:
 > and `bash` until you can answer, and finish with an answer that cites
 > repository-relative `path:start-end` spans.
 
-A teacher agent — `gpt-5.6-luna` at max reasoning effort, driven through
-`opencode run` — answers each question inside a commit-pinned snapshot of the
-repository the question is about, with lore's MCP server wired in so `bundle`
-and `search` are real tool calls. Its session is recorded, reshaped, path-
+A teacher agent — `z-ai/glm-5.3-flash` at max reasoning effort via OpenRouter,
+driven through `opencode run` — answers each question inside a commit-pinned
+snapshot of the repository the question is about, with lore's MCP server wired
+in so `bundle` and `search` are real tool calls. (The pilots that proved the
+harness used `gpt-5.6-luna`; the production teacher is glm because its open
+weights carry no terms against training on outputs, where OpenAI's do — a
+dataset distilled from luna would be tainted the same way the unlicensed
+CodeScout rollouts were, which this project already declined to train on.) Its session is recorded, reshaped, path-
 normalised, graded against the question's reference answer, and validated.
 
 **Status: piloted, not scaled.** `--dry-run` is proven end to end, and two real
