@@ -62,7 +62,7 @@ def test_cell_env_isolates_xdg_but_pins_the_real_state_dir(tmp_path):
     os.makedirs(out_dir)
     env = generate.cell_env(cfg, pin, out_dir, str(tmp_path / "oc.json"))
     assert env["XDG_DATA_HOME"] == os.path.join(out_dir, "xdg")
-    state = env["LORE_STATE_DIR"]
+    state = env["LORE_DATA_DIR"]
     assert state and not state.startswith(env["XDG_DATA_HOME"]), \
         "daemon discovery must not follow the per-cell isolation dir"
 
@@ -76,4 +76,4 @@ def test_cell_env_respects_an_explicit_configured_state_dir(tmp_path):
     out_dir = str(tmp_path / "cell")
     os.makedirs(out_dir)
     env = generate.cell_env(cfg, pin, out_dir, "oc.json")
-    assert env["LORE_STATE_DIR"] == os.path.join(TRAIN, "mystate")
+    assert env["LORE_DATA_DIR"] == os.path.join(TRAIN, "mystate")

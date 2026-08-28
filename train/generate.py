@@ -403,9 +403,12 @@ def cell_env(cfg: Config, pin: RepoPin, out_dir: str, config_path: str) -> dict:
     if os.path.exists(auth):
         shutil.copy(auth, os.path.join(xdg, "opencode", "auth.json"))
     env["XDG_DATA_HOME"] = xdg
-    env["LORE_STATE_DIR"] = (cfg.get_path("lore", "state_dir")
-                             or os.environ.get("LORE_STATE_DIR")
-                             or os.path.expanduser("~/.local/share/lore"))
+    # LORE_DATA_DIR is the binary's actual override (lore-core discovery);
+    # without it, `dirs::data_local_dir()` follows XDG_DATA_HOME -- the exact
+    # redirection this function exists to prevent.
+    env["LORE_DATA_DIR"] = (cfg.get_path("lore", "state_dir")
+                            or os.environ.get("LORE_DATA_DIR")
+                            or os.path.expanduser("~/.local/share/lore"))
     return env
 
 
