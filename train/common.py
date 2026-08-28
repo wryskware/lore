@@ -129,8 +129,12 @@ DEFAULTS: dict = {
     "emit": {
         "max_tool_chars": 4000,
         "max_bundle_chars": 12000,
-        "max_length": 8192,
-        "max_tool_calls": 30,
+        # 32k: the 2026-08-27 context smoke proved a 4B bf16 LoRA trains a
+        # 32,768 budget in ~12 GiB (padding_free off); 8192 kept 0 of the
+        # pilot's 4 rows. 60 calls: the pilot's ONLY reject reason at 30 was
+        # too_many_tool_calls, and the cell it rejected at 31 graded 1.00/1.00.
+        "max_length": 32768,
+        "max_tool_calls": 60,
         "drop_tools": ["todowrite"],
         "allow_question_echo": False,
     },
@@ -144,6 +148,9 @@ DEFAULTS: dict = {
     "validate": {
         "python": "python3",
         "script": "~/lora-prep/validate_dataset.py",
+        # Per-row token counter for the over_length drop gate; empty = gate
+        # off, validator remains the backstop.
+        "counter": "",
         "sample": 25,
     },
 }
@@ -359,6 +366,42 @@ def daemon_get(base: str, route: str, timeout: float = 15.0) -> dict:
 # --------------------------------------------------------------------------- #
 # Validator
 # --------------------------------------------------------------------------- #
+
+def token_lengths(cfg: Config, rows: list[dict]) -> list[int] | None:
+    """Exact rendered token length per row, or None when no counter is wired.
+
+    The counter runs under the validator's own python with the validator's own
+    template, so the number it reports is the number the validator will later
+    check against --max-length. It is an *optimization* for the drop gate, not
+    the gate itself: with no counter the rows still hit the validator, which
+    fails the batch loudly rather than shipping an over-length row.
+    """
+    counter = cfg.get_path("validate", "counter")
+    python = os.path.expanduser(cfg["validate"]["python"])
+    if not counter or not os.path.exists(counter) or not os.path.exists(python):
+        return None
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False,
+                                     encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
+        tmp = handle.name
+    try:
+        proc = subprocess.run([python, "-u", counter, tmp],
+                              capture_output=True, text=True, timeout=600)
+        if proc.returncode != 0:
+            print(f"!! token counter failed ({proc.returncode}): "
+                  f"{proc.stderr.strip()[:300]}", file=sys.stderr)
+            return None
+        lengths = json.loads(proc.stdout)
+        if not isinstance(lengths, list) or len(lengths) != len(rows):
+            print("!! token counter returned a malformed length list",
+                  file=sys.stderr)
+            return None
+        return [int(n) for n in lengths]
+    finally:
+        os.unlink(tmp)
+
 
 def run_validator(cfg: Config, jsonl: str, extra_args: list[str] | None = None) -> int:
     """Hand a finished JSONL to `validate_dataset.py`; return its exit code.

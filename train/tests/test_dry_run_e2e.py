@@ -165,3 +165,49 @@ def test_no_part_of_the_manifest_names_an_absolute_path(dry_config, tmp_path):
     text = open(common.manifest_path(str(tmp_path / "work"), BATCH),
                 encoding="utf-8").read()
     assert common.absolute_leaks(text) == [], text
+
+
+def test_an_over_length_row_is_dropped_whole_with_its_measured_size(
+        dry_config, tmp_path, monkeypatch):
+    """Decision 7's drop gate: counting comes from the validator's environment
+    (stubbed here), the row leaves the output entirely, and the reject names
+    the measured size -- never a truncation."""
+    stage("generate.py", dry_config, "--dry-run")
+
+    import convert as convert_mod
+    # First row enormous, the rest tiny; the gate must key on position.
+    monkeypatch.setattr(common, "token_lengths",
+                        lambda cfg, rows: [10_000_000] + [100] * (len(rows) - 1))
+    monkeypatch.chdir(TRAIN)
+    code = convert_mod.main(["--config", dry_config, "--no-validate"])
+    assert code == 0
+
+    workspace = str(tmp_path / "work")
+    converted = common.read_jsonl(
+        os.path.join(workspace, "data", f"{BATCH}.converted.jsonl"))
+    rejects = common.read_jsonl(
+        os.path.join(workspace, "data", f"{BATCH}.convert-rejects.jsonl"))
+    over = [r for r in rejects
+            if any(x.startswith("over_length:") for x in r["reasons"])]
+    assert len(over) == 1
+    assert over[0]["reasons"] == ["over_length:10000000"]
+    # Survivors carry the measured size; no row was cut down to fit.
+    assert converted, "the small rows must survive"
+    assert all(row["meta"]["render_tokens"] == 100 for row in converted)
+    assert all(row["meta"]["qid"] != over[0]["qid"] for row in converted)
+
+
+def test_no_counter_means_no_silent_drop_and_no_crash(dry_config, tmp_path,
+                                                      monkeypatch):
+    """With no counter wired, the gate steps aside (the validator is the
+    backstop) -- every converted row survives and none carries a length."""
+    stage("generate.py", dry_config, "--dry-run")
+    import convert as convert_mod
+    monkeypatch.setattr(common, "token_lengths", lambda cfg, rows: None)
+    monkeypatch.chdir(TRAIN)
+    assert convert_mod.main(["--config", dry_config, "--no-validate"]) == 0
+    converted = common.read_jsonl(
+        os.path.join(str(tmp_path / "work"), "data",
+                     f"{BATCH}.converted.jsonl"))
+    assert converted
+    assert all("render_tokens" not in row["meta"] for row in converted)

@@ -372,6 +372,37 @@ def main(argv: list[str]) -> int:
         else:
             rows.append(row)
 
+    # The over_length drop gate -- Decision 7's "drop, don't truncate", made
+    # real. Counting happens in the validator's own environment so this number
+    # and the validator's --max-length check can never disagree; when no
+    # counter is configured the gate is skipped and the validator remains the
+    # (loud, batch-failing) backstop.
+    lengths = common.token_lengths(cfg, rows)
+    # The counter and the validator agreed to within one token on the pilot
+    # rows (22,945 vs 22,946) -- a render-boundary difference, not a bug. The
+    # margin keeps a row that grazes the budget from passing here and then
+    # failing the batch there, which is the exact outcome this gate exists to
+    # prevent.
+    LENGTH_SAFETY_MARGIN = 64
+    max_len = cfg["emit"]["max_length"] - LENGTH_SAFETY_MARGIN
+    if lengths is None:
+        print("!! no token counter available; over-length rows are NOT "
+              "dropped here and will fail the validator instead",
+              file=sys.stderr)
+    else:
+        kept = []
+        for row, n in zip(rows, lengths):
+            if n > max_len:
+                qid = row["meta"]["qid"]
+                rejects.append({"qid": qid, "stage": "convert",
+                                "reasons": [f"over_length:{n}"]})
+                reason_counts["over_length"] += 1
+                print(f"  DROP {qid:<24} over_length:{n} (budget {max_len})")
+            else:
+                row["meta"]["render_tokens"] = n
+                kept.append(row)
+        rows = kept
+
     out = os.path.join(workspace, "data", f"{batch}.converted.jsonl")
     common.write_jsonl(out, rows)
     rej = os.path.join(workspace, "data", f"{batch}.convert-rejects.jsonl")

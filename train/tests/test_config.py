@@ -44,7 +44,10 @@ def test_the_documented_thresholds_are_the_shipped_defaults():
     emit = common.DEFAULTS["emit"]
     assert emit["max_tool_chars"] == 4000
     assert emit["max_bundle_chars"] == 12000
-    assert emit["max_tool_calls"] == 30
+    # Recalibrated by the 2026-08-27 pilot: 60 calls (the only reject at 30
+    # was a 31-call cell grading 1.00/1.00) and the proven 32k training budget.
+    assert emit["max_tool_calls"] == 60
+    assert emit["max_length"] == 32768
     assert emit["allow_question_echo"] is False
 
 

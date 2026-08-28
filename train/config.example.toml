@@ -53,9 +53,13 @@ clone_url_template = "https://github.com/{repo}.git"
 max_tool_chars   = 4000
 max_bundle_chars = 12000
 # Drop-don't-truncate: rows over max_length are rejected whole, never cut, so no
-# half-trajectory ever teaches the scout to stop mid-exploration.
-max_length     = 8192
-max_tool_calls = 30
+# half-trajectory ever teaches the scout to stop mid-exploration. 32768 is the
+# proven training budget on the reference GPU (2026-08-27 smoke: ~12 GiB peak,
+# padding_free off); the drop itself needs [validate].counter configured --
+# without it, over-length rows only fail at the validator, loudly but undropped.
+max_length     = 32768
+# The pilot's only reject at 30 was a 31-call cell that graded 1.00/1.00.
+max_tool_calls = 60
 drop_tools = ["todowrite"]  # dropped from the trajectory, not a rejection
 allow_question_echo = false  # reject a bundle query that is the question pasted back
 
@@ -71,4 +75,7 @@ keep_ungradeable  = false  # references with no parseable citation (10 of 260)
 # checked with; it is referenced, never vendored, so "valid" cannot drift.
 python = "~/lora-prep/codescout/bin/python"
 script = "~/lora-prep/validate_dataset.py"
+# Exact per-row token counter (same env, same template as the validator).
+# Powers the over_length drop gate in convert.py; empty = gate disabled.
+counter = "~/lora-prep/count_tokens.py"
 sample = 25
