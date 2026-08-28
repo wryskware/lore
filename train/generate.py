@@ -622,6 +622,11 @@ def main(argv: list[str]) -> int:
                     help="check out snapshots and write the manifest, then stop")
     ap.add_argument("--resume", action="store_true",
                     help="skip cells that already completed; re-run the rest")
+    ap.add_argument("--qids", default="",
+                    help="re-roll only these cells: a comma-separated list of "
+                         "qids, or @file with one qid per line. qids are "
+                         "position-derived from the questions file, so they "
+                         "match across batches of the same source.")
     args = ap.parse_args(argv)
 
     cfg = common.load_config(args.config)
@@ -637,6 +642,17 @@ def main(argv: list[str]) -> int:
     limit = (args.limit_per_repo if args.limit_per_repo is not None
              else cfg["questions"]["limit_per_repo"])
     questions = load_questions(cfg, repos, limit)
+    if args.qids:
+        if args.qids.startswith("@"):
+            with open(args.qids[1:], encoding="utf-8") as handle:
+                wanted_qids = {line.strip() for line in handle if line.strip()}
+        else:
+            wanted_qids = {q for q in args.qids.split(",") if q}
+        questions = [q for q in questions if q["qid"] in wanted_qids]
+        missing = wanted_qids - {q["qid"] for q in questions}
+        if missing:
+            raise SystemExit(f"--qids named cells not in the selection: "
+                             f"{sorted(missing)[:5]} (+{max(0, len(missing)-5)} more)")
     if not questions:
         raise SystemExit("no questions selected")
 
