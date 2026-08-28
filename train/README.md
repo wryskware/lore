@@ -396,8 +396,14 @@ a batch, and every repo in the corpus that is not qibo.
   for those rows because there is no tree to resolve paths against.
 - `[lore] bundle_limit` / `bundle_budget_tokens` are read but not yet plumbed
   into the MCP call; the daemon's own defaults apply.
-- No cost or token accounting is collected from `step_finish` events yet. It is
-  in the stream and should be added once a pilot shows what a cell costs.
+- No *cost* accounting. Token usage is collected — every cell's `meta.json`
+  carries `tokens` summed over its `step_finish` events (`input`, `output`,
+  `reasoning`, `cache_read`, and the `steps` that divide them), and the
+  end-of-batch summary totals them — but opencode reports `cost: 0` for a
+  subscription-quota model, so there is no money figure to record. Note that
+  `input` is summed over steps, which is what the provider bills: a
+  tool-calling session re-sends its transcript every step, so the number is
+  several times the size of the final context.
 - No deduplication pass. With one trajectory per question and 260 distinct
   questions there is nothing to dedupe yet; sampling several trajectories per
   question would change that.
@@ -433,6 +439,7 @@ stays green and the disagreement stays visible.
 | `test_manifest.py` | Decision 2 — what the pin records, what rides in `meta`, and each stage's refusal to run without its inputs |
 | `test_output_gate.py` | Decision 6 — how the referenced validator is invoked (against a stub) and the read-only daemon preflight |
 | `test_config.py` | the shipped example config and the documented default thresholds |
+| `test_token_accounting.py` | per-cell teacher token capture from `step_finish` (shapes copied from a real captured session), and the port lease's invariant that no two cells in flight share a port |
 | `test_dry_run_e2e.py` | `--dry-run` through all three stages in a subprocess, in a tmpdir |
 
 `tests/emission_spec.py` replicates the checks of `~/lora-prep/validate_dataset.py`

@@ -29,8 +29,10 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import json
 import os
+import queue
 import shutil
 import subprocess
 import sys
@@ -287,6 +289,76 @@ def opencode_config(cfg: Config, out_dir: str) -> str:
     return path
 
 
+def port_pool(base: int, workers: int) -> "queue.Queue[int]":
+    """One port per concurrent cell, leased for the whole of that cell.
+
+    `opencode run --port N` binds a server, so two cells sharing a port collide.
+    Deriving the port from the question's index does not prevent that: a slow
+    cell still holds its port when a fast neighbour laps it and is handed the
+    same number. A pool of exactly `workers` ports, each held from the start of
+    a cell to its end, cannot issue one twice at once.
+    """
+    pool: "queue.Queue[int]" = queue.Queue()
+    for slot in range(workers):
+        pool.put(base + slot)
+    return pool
+
+
+@contextlib.contextmanager
+def leased(pool: "queue.Queue[int]"):
+    port = pool.get()
+    try:
+        yield port
+    finally:
+        pool.put(port)
+
+
+TOKEN_FIELDS = ("input", "output", "reasoning", "cache_read")
+
+
+def teacher_tokens(ndjson: str) -> dict:
+    """What the teacher spent on one cell, summed over its model steps.
+
+    opencode emits a `step_finish` event per model step carrying that step's
+    `tokens` block -- `input`, `output`, `reasoning`, and a nested `cache`
+    with `read`/`write`. Summing over steps is the honest cost of the cell:
+    a multi-step tool-calling session re-sends its whole transcript every
+    step, so `input` counts the same conditioning many times over, which is
+    exactly what the provider bills for. `cache_read` is the part of that
+    input which was served from cache, and `steps` is the divisor that makes
+    the rest interpretable.
+
+    A partial or torn log is not an error here: a cell that crashed still has
+    the steps it managed, and a missing count is reported as zero rather than
+    failing the cell it is only annotating.
+    """
+    totals = {field: 0 for field in TOKEN_FIELDS}
+    totals["steps"] = 0
+    try:
+        handle = open(ndjson, encoding="utf-8")
+    except OSError:
+        return totals
+    with handle:
+        for line in handle:
+            line = line.strip()
+            if not line or "step_finish" not in line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue          # a torn final line costs its own step, not the cell
+            if event.get("type") != "step_finish":
+                continue
+            tokens = (event.get("part") or {}).get("tokens") or {}
+            cache = tokens.get("cache") or {}
+            totals["steps"] += 1
+            totals["input"] += int(tokens.get("input") or 0)
+            totals["output"] += int(tokens.get("output") or 0)
+            totals["reasoning"] += int(tokens.get("reasoning") or 0)
+            totals["cache_read"] += int(cache.get("read") or 0)
+    return totals
+
+
 def run_cell(cfg: Config, question: dict, pin: RepoPin, raw_dir: str,
              port: int) -> dict:
     """One teacher session. Everything it produced lands under `raw_dir/<qid>`."""
@@ -326,7 +398,7 @@ def run_cell(cfg: Config, question: dict, pin: RepoPin, raw_dir: str,
     wall_s = round(time.monotonic() - started, 1)
 
     meta = cell_meta(cfg, question, pin, status=status, exit_code=code,
-                     wall_s=wall_s)
+                     wall_s=wall_s, tokens=teacher_tokens(ndjson))
     with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as handle:
         json.dump(meta, handle, indent=2)
     return meta
@@ -482,7 +554,9 @@ def run_dry(cfg: Config, batch: str) -> int:
             for event in dry_events(question, snapshot):
                 handle.write(json.dumps(event) + "\n")
         meta = cell_meta(cfg, question, pin, status="OK", exit_code=0,
-                         wall_s=0.0, dry_run=True)
+                         wall_s=0.0, dry_run=True,
+                         tokens=teacher_tokens(
+                             os.path.join(out_dir, "agent.ndjson")))
         with open(os.path.join(out_dir, "meta.json"), "w",
                   encoding="utf-8") as handle:
             json.dump(meta, handle, indent=2)
@@ -509,6 +583,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--batch", default=None, help="batch name (default from config)")
     ap.add_argument("--repos", default="", help="comma-separated owner/name filter")
     ap.add_argument("--limit-per-repo", type=int, default=None)
+    ap.add_argument("--concurrency", type=int, default=None,
+                    help="cells in flight at once (default from config)")
     ap.add_argument("--dry-run", action="store_true",
                     help="fabricate opencode-shaped trajectories; call nothing")
     ap.add_argument("--prepare-only", action="store_true",
@@ -518,6 +594,8 @@ def main(argv: list[str]) -> int:
     args = ap.parse_args(argv)
 
     cfg = common.load_config(args.config)
+    if args.concurrency is not None:
+        cfg["teacher"]["concurrency"] = max(1, args.concurrency)
     batch = args.batch or cfg["batch"]["name"]
     print(f"config: {cfg.source}   batch: {batch}")
 
@@ -574,16 +652,18 @@ def main(argv: list[str]) -> int:
             print("nothing to do")
             return 0
 
-    base_port = int(cfg["teacher"]["port"])
     workers = max(1, int(cfg["teacher"]["concurrency"]))
+    ports = port_pool(int(cfg["teacher"]["port"]), workers)
+
+    def cell(question: dict) -> dict:
+        with leased(ports) as port:
+            return run_cell(cfg, question, pins[question["repo"]], raw_dir, port)
+
+    started = time.monotonic()
     print(f"\n{'qid':<24}{'wall_s':>8}  status")
-    done = 0
+    done, metas = 0, []
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(run_cell, cfg, question, pins[question["repo"]], raw_dir,
-                        base_port + index % workers): question
-            for index, question in enumerate(questions)
-        }
+        futures = {pool.submit(cell, question): question for question in questions}
         for future in concurrent.futures.as_completed(futures):
             question = futures[future]
             try:
@@ -591,10 +671,24 @@ def main(argv: list[str]) -> int:
             except Exception as exc:  # one dead cell must not take the batch
                 meta = {"qid": question["qid"], "wall_s": 0,
                         "status": f"HARNESS_ERROR: {type(exc).__name__}: {exc}"}
+            metas.append(meta)
             done += 1
             print(f"{meta.get('qid', '?'):<24}{meta.get('wall_s', 0):>8}  "
                   f"{meta.get('status')}   [{done}/{len(questions)}]", flush=True)
+    wall_s = round(time.monotonic() - started, 1)
 
+    ok = [m for m in metas if m.get("status") == "OK"]
+    totals = {field: sum(int((m.get("tokens") or {}).get(field) or 0)
+                         for m in metas) for field in TOKEN_FIELDS}
+    steps = sum(int((m.get("tokens") or {}).get("steps") or 0) for m in metas)
+    billed = totals["input"] + totals["output"]
+    print(f"\n{len(ok)}/{len(questions)} cells OK in {wall_s}s wall "
+          f"at concurrency {workers}")
+    print(f"teacher tokens: in={totals['input']} out={totals['output']} "
+          f"reasoning={totals['reasoning']} cache_read={totals['cache_read']} "
+          f"over {steps} steps")
+    if ok:
+        print(f"  {billed} in+out total, {billed // len(ok)} per completed cell")
     print(f"\nraw trajectories in {raw_dir}")
     print(f"next:  python3 convert.py --batch {batch}")
     return 0
