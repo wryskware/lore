@@ -16,8 +16,10 @@ repository the question is about, with lore's MCP server wired in so `bundle`
 and `search` are real tool calls. Its session is recorded, reshaped, path-
 normalised, graded against the question's reference answer, and validated.
 
-**Status: design + runnable skeleton.** `--dry-run` is proven end to end. No
-real trajectory has been generated. See "What is real and what is stubbed".
+**Status: piloted, not scaled.** `--dry-run` is proven end to end, and two real
+pilots have run — eleven cells over two repositories, serially and at
+concurrency 2 — producing trajectories that pass the validator. Nothing has
+been trained on them. See "What is real and what is stubbed".
 
 ---
 
@@ -387,8 +389,14 @@ off-by-one, the lost grep scope, `lore_expand`/`lore_status` left un-denied, and
 a preflight that read `embeddings.ready` (the daemon reports
 `embeddings.state`) and accepted a 22%-embedded project as healthy.
 
-Still unexercised at any scale: concurrency above 1, more than one repository in
-a batch, and every repo in the corpus that is not qibo.
+**Real, and executed again at width** (batch `pilot-02`, qibo + pybryt, six
+questions, concurrency 2, 2026-08-27): a second repository registered from
+scratch and indexed, two cells in flight throughout, and the `over_length`
+drop gate rejecting a real row. All six cells completed. See "What the second
+pilot measured".
+
+Still unexercised at any scale: concurrency above 2, batches beyond six cells,
+and the 24 repos in the corpus that are neither qibo nor pybryt.
 
 **Stubbed:**
 
