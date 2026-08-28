@@ -536,3 +536,80 @@ The numbers the design was guessing at, and what they say:
   `convert.py` or `grade.py` drops a row for length; `max_length` is only
   handed to the validator, which fails the *batch* and leaves the over-length
   rows in the file. The gate has to exist before a real batch is trained on.
+
+### What the second pilot measured (2026-08-27, qibo + pybryt, six questions)
+
+Pilot-02's job was the axes pilot-01 could not reach: two repositories in one
+batch, a repository registered from scratch, concurrency 2, and the
+`over_length` drop gate in the wild. `microsoft/pybryt` was chosen as the
+second repo for size (1.8 MB, 134 tracked files) — the axis under test is
+whether a *new* repo works, not whether a big one does.
+
+**9m02s wall for six cells at concurrency 2, all six OK.** Summed per-cell
+wall was 1052.7s, so the batch ran at 1.94× — 97% of the ideal speedup for two
+workers. That is the headline: on this box, at this width, the cells are
+independent and the wall scales.
+
+- **No interference of any kind was detectable.** Every cell's `agent.ndjson`
+  carries exactly one `sessionID` and no `sessionID` appears in two cells;
+  every `agent.stderr` is zero bytes; the daemon's `generation` held at 40
+  across the whole batch, so nothing re-queued an index under concurrent
+  query load. Teacher spend per cell went *down* against pilot-01's serial
+  run (187k vs 219k mean), which is the opposite of what contention looks
+  like.
+- **Per-cell wall is dominated by teacher nondeterminism, not by the neighbour.**
+  The same three qibo questions ran 108.9 / 218.9 / 173.1s serially in
+  pilot-01 and 95.3 / 176.1 / 292.6s here. Two got faster. The one that got
+  slower did 42% more work — 11 model steps against pilot-01's 9, 44 tool
+  calls, 410k tokens — and it is the same cell the length gate then dropped.
+  Reading that 292.6s as contention would be reading the wrong variable.
+
+The gate and the caps, now that both have met real data:
+
+- **The `over_length` gate fired, once, and cleanly.** Rows rendered at 10,816
+  / 15,372 / 15,516 / 19,332 / 26,841 / **42,932** tokens; the last was dropped
+  as `over_length:42932` against the effective budget of 32,704, and the five
+  survivors each carry their `render_tokens` in `meta`. The validator then
+  passed the file at 32,768 — which is the whole point of the gate, because
+  before it existed that one row failed the *batch*.
+- **The 64-token margin was never load-bearing here, and the counter and the
+  validator agreed exactly.** The nearest survivor to the bar sits 5,863
+  tokens under it, and the validator's reported quantiles (10,816 / 15,516 /
+  26,841) reproduce the counter's numbers to the token — pilot-01's
+  one-token disagreement did not recur. The margin remains cheap insurance
+  rather than something the data has yet leaned on.
+- **`max_tool_calls = 60` is now correctly slack, and that is what let the
+  length gate speak.** Survivors used 8 to 22 calls, median 15. The dropped
+  cell used 44 — over pilot-01's old bid of 30, under 60, so it was rejected
+  for the thing actually wrong with it (length) rather than for a proxy.
+
+Keep rates, per stage: **6/6 generated, 5/6 converted (the one `over_length`),
+4/5 graded — 4/6 end to end, 67%.** `over_length` is now the single largest
+sink, and it is a `max_tool_chars` question rather than a threshold question.
+
+- **The new repo cost nothing in friction and little in quality.** `lore add`
+  plus a scoped `lore index microsoft__pybryt` had it at 124 files / 479
+  chunks / 100% embedded in under two minutes, with no `.loreignore` tuning
+  needed. Keeper grades: qibo 1.00/1.00 and 1.00/1.00, pybryt 1.00/0.80 and
+  1.00/0.75. File recall is identical at 1.00 across both repos; pybryt's
+  span hit rates are slightly lower, which is two rows and not yet a trend.
+  The one grade reject (`low_file_recall:0.33`) was pybryt's.
+- **`lore index <project>` does scope, so pilot-01's warning has an answer.**
+  Bare `lore index` queues everything; `lore index microsoft__pybryt` reported
+  `queued 1 project(s)` and left the shared daemon's other projects alone.
+
+Two things worth fixing that this pilot surfaced and did not:
+
+- **`lore add` writes `.lore.toml` into the snapshot.** Both checkouts now
+  carry an untracked file that is not in the pinned commit, so "the snapshot
+  must stay byte-identical" (Decision 8) is already false before the teacher
+  starts, and a `grep` or `bash` cell could see harness scaffolding. It is
+  outside `train/`'s control — registration is the operator's job by
+  Decision 2 — but the pin's claim should either be narrowed to tracked
+  content or the file should live outside the tree.
+- **`--dry-run` still cannot exercise concurrency.** The port lease is unit
+  tested, but no dry path runs two fabricated cells at once, so the
+  interaction of the pool with `--resume` is still only argued.
+
+At these numbers, 260 cells at concurrency 2 projects to roughly **6.5 hours
+and 49M teacher tokens**, yielding about 174 keepers at the measured 67%.
