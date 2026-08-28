@@ -83,6 +83,16 @@ def test_absolute_paths_are_leaks(text):
     assert common.absolute_leaks(text), f"{text!r} slipped past the gate"
 
 
+def test_dev_is_shell_plumbing_not_a_leak():
+    """`2>/dev/null` is portable POSIX, identical on every box; treating it as
+    a leak cost a third of the 2026-08-28 glm pilot cells for no privacy gain.
+    The exemption is `/dev/` alone -- everything else stays a leak."""
+    assert common.absolute_leaks("grep -r foo src/ 2>/dev/null") == []
+    assert common.absolute_leaks("cat /dev/stdin") == []
+    assert common.absolute_leaks("ls /usr/local/bin/ 2>/dev/null") == \
+        ["/usr/local/bin/"]
+
+
 def test_harness_snapshot_root_forms_are_all_caught():
     """The three shapes the README names: a rooted path, a drive, and `~/`."""
     for text in ("/snap/example__repo/src/x.py",

@@ -270,8 +270,15 @@ def normalize_paths(text: str, roots: list[str]) -> tuple[str, int]:
 
 
 def absolute_leaks(text: str) -> list[str]:
-    """Absolute-looking path fragments still present. Empty is the pass case."""
-    return [m.group(0) for m in ABS_PATH_RE.finditer(text or "")]
+    """Absolute-looking path fragments still present. Empty is the pass case.
+
+    `/dev/` is exempt: `2>/dev/null` is portable shell plumbing, identical on
+    every POSIX box, so a fragment under it names no machine and teaches the
+    student nothing untrue. (The 2026-08-28 glm pilots had the blanket rule
+    rejecting a third of otherwise-good cells for `/dev/null` redirects.)
+    """
+    return [m.group(0) for m in ABS_PATH_RE.finditer(text or "")
+            if not m.group(0).startswith("/dev/")]
 
 
 # --------------------------------------------------------------------------- #
