@@ -321,12 +321,19 @@ def teacher_tokens(ndjson: str) -> dict:
 
     opencode emits a `step_finish` event per model step carrying that step's
     `tokens` block -- `input`, `output`, `reasoning`, and a nested `cache`
-    with `read`/`write`. Summing over steps is the honest cost of the cell:
-    a multi-step tool-calling session re-sends its whole transcript every
-    step, so `input` counts the same conditioning many times over, which is
-    exactly what the provider bills for. `cache_read` is the part of that
-    input which was served from cache, and `steps` is the divisor that makes
-    the rest interpretable.
+    with `read`/`write`.
+
+    The fields partition rather than nest, which is the one thing worth
+    knowing before reading the numbers: measured across all 40 steps of
+    pilot-01, `total == input + output + reasoning + cache.read +
+    cache.write` exactly, with no mismatches. So `input` is the *uncached*
+    prompt only, `cache_read` is the rest of the prompt, and `reasoning` is
+    charged separately from `output` rather than inside it. The whole prompt
+    a step ran on is `input + cache_read`.
+
+    Summing over steps is the honest cost of the cell: a tool-calling session
+    re-sends its whole transcript every step, so the prompt is counted once
+    per step, which is exactly what the provider meters.
 
     A partial or torn log is not an error here: a cell that crashed still has
     the steps it managed, and a missing count is reported as zero rather than
@@ -681,14 +688,17 @@ def main(argv: list[str]) -> int:
     totals = {field: sum(int((m.get("tokens") or {}).get(field) or 0)
                          for m in metas) for field in TOKEN_FIELDS}
     steps = sum(int((m.get("tokens") or {}).get("steps") or 0) for m in metas)
-    billed = totals["input"] + totals["output"]
+    # The fields partition the total, so this sum double-counts nothing.
+    spent = sum(totals[field] for field in TOKEN_FIELDS)
     print(f"\n{len(ok)}/{len(questions)} cells OK in {wall_s}s wall "
           f"at concurrency {workers}")
-    print(f"teacher tokens: in={totals['input']} out={totals['output']} "
-          f"reasoning={totals['reasoning']} cache_read={totals['cache_read']} "
-          f"over {steps} steps")
+    print(f"teacher tokens: input={totals['input']} "
+          f"cache_read={totals['cache_read']} output={totals['output']} "
+          f"reasoning={totals['reasoning']} over {steps} steps")
     if ok:
-        print(f"  {billed} in+out total, {billed // len(ok)} per completed cell")
+        print(f"  {spent} total, {spent // len(ok)} per completed cell "
+              f"({(totals['input'] + totals['cache_read']) // max(steps, 1)} "
+              f"prompt tokens per step)")
     print(f"\nraw trajectories in {raw_dir}")
     print(f"next:  python3 convert.py --batch {batch}")
     return 0

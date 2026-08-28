@@ -70,6 +70,27 @@ def test_tokens_sum_across_every_step(tmp_path):
     }
 
 
+def test_the_token_fields_partition_the_step_total(tmp_path):
+    """Measured over all 40 steps of pilot-01, with no mismatches.
+
+    It matters because it is the counter-intuitive reading: `input` is the
+    *uncached* prompt only, not the whole of it, and `reasoning` is charged
+    beside `output` rather than inside it. Summing the four captured fields
+    therefore double-counts nothing, which is what the batch summary relies on.
+    """
+    event = step_finish("msg_1", input_t=7621, output_t=199, reasoning=160,
+                        cache_read=5632, cache_write=0)
+    tokens = event["part"]["tokens"]
+    tokens["total"] = 13612                      # as the real session reported
+    cache = tokens["cache"]
+    assert (tokens["input"] + tokens["output"] + tokens["reasoning"]
+            + cache["read"] + cache["write"]) == tokens["total"]
+
+    log = write_log(tmp_path / "agent.ndjson", [event])
+    totals = generate.teacher_tokens(log)
+    assert sum(totals[f] for f in generate.TOKEN_FIELDS) == tokens["total"]
+
+
 def test_a_log_with_no_step_finish_costs_zero(tmp_path):
     log = write_log(tmp_path / "agent.ndjson", [
         {"type": "text", "part": {"messageID": "msg_1", "type": "text",

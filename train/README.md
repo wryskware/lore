@@ -400,10 +400,14 @@ a batch, and every repo in the corpus that is not qibo.
   carries `tokens` summed over its `step_finish` events (`input`, `output`,
   `reasoning`, `cache_read`, and the `steps` that divide them), and the
   end-of-batch summary totals them — but opencode reports `cost: 0` for a
-  subscription-quota model, so there is no money figure to record. Note that
-  `input` is summed over steps, which is what the provider bills: a
-  tool-calling session re-sends its transcript every step, so the number is
-  several times the size of the final context.
+  subscription-quota model, so there is no money figure to record. Two things
+  to know before reading those numbers. The fields **partition** the step's
+  total rather than nesting — verified across all 40 steps of pilot-01,
+  `total == input + output + reasoning + cache.read + cache.write` with no
+  mismatches — so `input` is the *uncached* prompt only, the whole prompt is
+  `input + cache_read`, and `reasoning` is charged beside `output`, not
+  inside it. And every field is summed over steps, because a tool-calling
+  session re-sends its transcript each step and that is what is metered.
 - No deduplication pass. With one trajectory per question and 260 distinct
   questions there is nothing to dedupe yet; sampling several trajectories per
   question would change that.
