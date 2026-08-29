@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import http.client
 import json
 import os
 import threading
@@ -159,7 +160,8 @@ def make_chat(endpoint: str, model: str, usage: Usage, *,
                 last = exc
                 if exc.code not in (408, 429, 500, 502, 503, 524, 529):
                     raise
-            except (urllib.error.URLError, TimeoutError) as exc:
+            except (urllib.error.URLError, TimeoutError, ConnectionError,
+                    http.client.HTTPException) as exc:
                 last = exc
             time.sleep(2 * (attempt + 1))
         raise RuntimeError(f"chat failed after retries: {last}")
@@ -176,7 +178,7 @@ def tool_loop(chat_fn, system: str, question: str, tools: list,
     messages = [{"role": "system", "content": system},
                 {"role": "user", "content": question}]
     n_calls, tool_counts, first_tool = 0, {}, None
-    answer, error, forced = "", None, False
+    answer, error, forced, nudges = "", None, False, 0
 
     def approx_chars() -> int:
         return sum(len(m.get("content") or "")
@@ -203,6 +205,16 @@ def tool_loop(chat_fn, system: str, question: str, tools: list,
         messages.append(entry)
         if not calls:
             answer = msg.get("content") or ""
+            # A reasoning-heavy turn can spend the whole completion budget
+            # thinking and return neither text nor calls; that is a stall,
+            # not an answer.
+            if not answer.strip() and nudges < 2:
+                nudges += 1
+                messages.append({
+                    "role": "user",
+                    "content": "You returned no answer. Answer now with what "
+                               "you have, citing path:start-end spans."})
+                continue
             break
         for call in calls:
             name = call["function"]["name"]
@@ -338,7 +350,7 @@ def run_cell(task: dict, args, api_key: str, reasoning: dict | None) -> dict:
         run = tool_loop(
             host_chat, HOST_PROMPT.format(guidance=GUIDANCE[args.arm]),
             task["question"], ARM_TOOLS[args.arm], dispatch, caps,
-            max_calls=HOST_MAX_TOOL_CALLS, char_guard=HOST_CHAR_GUARD)
+            max_calls=args.max_calls, char_guard=HOST_CHAR_GUARD)
     except Exception as exc:  # noqa: BLE001
         run = {"answer": "", "error": str(exc)[:400], "n_calls": 0,
                "tool_counts": {}, "first_tool": None}
@@ -426,6 +438,10 @@ def main() -> int:
     ap.add_argument("--data-dir", default=os.path.expanduser(
         "~/.local/share/lore"))
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--max-calls", type=int, default=HOST_MAX_TOOL_CALLS,
+                    help="host tool-call budget; the default lets the host "
+                         "grind, a small value models a busy host consuming "
+                         "the scout mid-task")
     ap.add_argument("--concurrency", type=int, default=12)
     args = ap.parse_args()
 
