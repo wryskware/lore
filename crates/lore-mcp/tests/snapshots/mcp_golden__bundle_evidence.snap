@@ -1,6 +1,5 @@
 ---
 source: crates/lore-mcp/tests/mcp_golden.rs
-assertion_line: 419
 expression: rendered
 ---
 VERDICT: weak (1 verified span(s), but only 1 of 2 query terms appear in them -- treat as partial, and find the rest yourself)

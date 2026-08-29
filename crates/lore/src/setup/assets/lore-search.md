@@ -1,6 +1,6 @@
 ---
 name: lore-search
-description: Answer "where is X", "how does Y work", or "what was decided about Z" in this repository using Lore's local index — the `search`, `expand` and `status` MCP tools, or the `lore search` CLI. Use this before grepping or walking the tree, whenever a question is about this codebase or its design history, when Lore returns nothing useful, when documents disagree about what is true, or when the user says "ask lore", "search the index", or "/lore-search".
+description: Answer "where is X", "how does Y work", or "what was decided about Z" in this repository using Lore's local index — the `bundle`, `search`, `expand` and `status` MCP tools, or the `lore search` CLI. Use this before grepping or walking the tree, whenever a question is about this codebase or its design history, when Lore returns nothing useful, when documents disagree about what is true, or when the user says "ask lore", "search the index", or "/lore-search".
 ---
 
 # Using Lore
@@ -10,17 +10,53 @@ indexed it locally. That buys you two things grep cannot give you: hits for a
 concept whose *name* you do not know, and design documents that say what was
 decided and whether that decision still stands.
 
-It costs almost nothing to ask first. One search routinely replaces a chain of
+It costs almost nothing to ask first. One call routinely replaces a chain of
 exploratory greps and directory reads, and it is the cheapest opening move even
 when it turns out you also need to read the tree.
 
-The loop is: **search → read the header lines → expand → read the file →
-cite.** Everything below is that loop in detail.
+There are two ways in, and the default is **`bundle`**:
 
-## 1. Search first, and search by concept
+- **`bundle` — you want the answer.** One call returns a verdict line and the
+  verified source spans themselves, read from disk at the moment you asked.
+  You may quote and edit straight from it. This is the whole loop in one step:
+  **bundle → read the header → read the spans → cite.**
+- **`search` — you want to steer.** Ranked pointers with truncated excerpts,
+  plus the filters bundle does not expose (path, language, status), for
+  narrowing passes and surveys of *how many* places mention something. Its
+  loop is longer: **search → read the header lines → expand → read the file →
+  cite**, and a hit you have not expanded is never quotable.
 
-Call `search` (MCP) or run `lore search "<query>"` before your first `grep`,
-`glob`, or directory listing, unless you already know the exact file and line.
+Everything below is those loops in detail.
+
+## 1. Ask for the answer first: `bundle`
+
+Call `bundle` with the whole question, in your own words, before your first
+`grep`, `glob`, or directory listing, unless you already know the exact file
+and line. Write the query as you would brief a colleague — `bundle` runs the
+same hybrid retrieval as `search`, then verifies and renders the spans for you.
+
+Read its header before its code, because the header is the honest part:
+
+- `VERDICT: found` — the query's terms are covered by the spans below. `weak`
+  and `none` mean they are not, and what follows may be nearest misses rather
+  than the answer. The verdict is a claim about term coverage, not about
+  correctness: a `found` bundle can still miss the piece you need.
+- `NO MATCH FOR:` — query terms nothing in the bundle covers. Those are yours
+  to go and find; do not paper over them.
+- `FURTHER READING:` — verified paths that did not fit the token budget. Open
+  them yourself if the rendered spans fall short.
+- `DROPPED` — hits the verifier refused; `stale` means the index pointer no
+  longer matches the file on disk.
+
+`budget_tokens` widens or tightens how much source it may carry. If the verdict
+is `weak`/`none`, or the spans answer a neighbouring question rather than
+yours, that is when you drop to `search` — not before.
+
+## 2. Steer it yourself: `search`
+
+Call `search` (MCP) or run `lore search "<query>"` when you want ranked
+pointers rather than a finished answer: filtered retrieval, several narrowing
+passes, or a picture of how widely something is referenced.
 
 Query in natural language or with literal identifiers — both are matched, and
 the search is hybrid lexical + semantic. Ask for the *thing you want to know*,
@@ -41,13 +77,13 @@ Filters exist; reach for them second, not first:
 - `path_prefix` — project-relative, forward slashes (`design/`, `crates/lore/`)
 - `language` — lowercase tag (`rust`, `csharp`, `markdown`)
 - `status` — `exploration` | `leaning` | `decided` | `deprecated` |
-  `unclassified`, filtering what a document *declares* (see §3)
+  `unclassified`, filtering what a document *declares* (see §4)
 - `limit` — the daemon clamps it
 
 Filtering on the first call is how you miss the hit that would have told you
 your framing was wrong. Search broad, then narrow.
 
-## 2. Read the header lines — they are the answer's provenance
+## 3. Read the header lines — they are the answer's provenance
 
 A hit looks like this:
 
@@ -71,7 +107,7 @@ A hit looks like this:
   the rest are header-only pointers. Every hit is a pointer, not a source;
   `expand` reads any of them in full.
 
-## 3. Authority: what Lore assigns beats what the document claims
+## 4. Authority: what Lore assigns beats what the document claims
 
 `status:` is what a document *declares about itself*. It is not evidence.
 
@@ -92,7 +128,7 @@ and tell the user they disagree.** Do not let confident prose outrank a
 validated decision, and do not quietly promote a leaning, a proposal or an
 example into a requirement — if the vault only leans, your answer leans.
 
-## 4. Expand before you quote or edit
+## 5. Expand before you quote or edit
 
 `expand` takes the hit's `chunk_id` (the printed short id is enough — any
 prefix of 8+ hex characters resolves) plus its `project_key`, and returns the
@@ -102,7 +138,11 @@ chunk in full with surrounding context; `context_lines` widens it.
 search excerpt.** Excerpts are truncated, and their boundaries are chunk
 boundaries, not meaning boundaries.
 
-## 5. Verify by reading the hit — not by re-deriving it
+Bundle spans are the exception, and the only one: they were read from the file
+on disk and mechanically checked, so quoting and editing from a bundle needs no
+expand step.
+
+## 6. Verify by reading the hit — not by re-deriving it
 
 This is where the win usually gets thrown away. The measured failure mode is an
 agent that receives the right hit and then globs the whole tree anyway to
@@ -119,12 +159,12 @@ Go to grep/glob when you have an actual reason:
 - you already know the **exact file**;
 - the hits pointed at a region and you now need neighbouring code the index did
   not chunk together;
-- the index is unavailable or stale (§6).
+- the index is unavailable or stale (§7).
 
 Ranked relevance is not exhaustiveness. For "change every caller", search to
 understand and grep to enumerate.
 
-## 6. When search comes back empty, stale, or lexical-only
+## 7. When search comes back empty, stale, or lexical-only
 
 Call `status`. It reports the daemon, the index generation, this project's
 file/chunk/embedding coverage, and the embedding endpoint's state.
@@ -144,7 +184,7 @@ the meantime rather than stalling.
 Lore is scoped to **this project only**. Other projects on this machine are not
 reachable, so do not ask for them and do not assume a hit came from one.
 
-## 7. Cite what you actually read
+## 8. Cite what you actually read
 
 Cite as `path:line-line`, from the file you opened — not from a search header
 alone. If the only evidence for a claim is a truncated excerpt, expand it or
@@ -157,4 +197,6 @@ is worse than an uncited "not in this repo".
 
 Without the MCP tools the same surface is a CLI: `lore search "<query>"
 [--path-prefix …] [--language …] [--status …] [--limit …]` prints the same
-view, and `lore status` the same health.
+view, and `lore status` the same health. There is no `lore bundle` — the
+one-call evidence bundle is an MCP tool only, so on the CLI the loop is
+search → read the file.

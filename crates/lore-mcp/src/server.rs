@@ -296,14 +296,17 @@ impl LoreServer {
 #[tool_router]
 impl LoreServer {
     #[tool(
-        description = "Your first tool for any \"where is X / how does Y work / what was \
-                       decided about Z\" question in an indexed project: one query replaces a \
-                       chain of exploratory greps and directory reads, and also surfaces \
-                       design-doc and decision context that grep cannot see. Prefer it \
-                       whenever you do not already know the exact file; fall back to grep only \
-                       for exhaustive literal sweeps (every occurrence of an exact string) - \
-                       and note that inconsistently-named concepts defeat literal grep but not \
-                       this search. \
+        description = "Ranked pointers, for when you want to steer the retrieval yourself. If you \
+                       simply want the question answered, call `bundle` instead: it runs this \
+                       same retrieval and hands back verified, quotable source spans in one call, \
+                       where a search hit still costs you an `expand` before you may use it. \
+                       Reach for `search` when you need what bundle does not expose - \
+                       path/language/status filters, a deliberately wide net, several narrowing \
+                       passes, or a survey of how many places mention something. Either way \
+                       prefer Lore over exploratory greps and directory reads whenever you do not \
+                       already know the exact file; fall back to grep only for exhaustive literal \
+                       sweeps (every occurrence of an exact string) - and note that \
+                       inconsistently-named concepts defeat literal grep but not this search. \
                        Hybrid lexical+semantic search over this session's project - the code and \
                        design vault of the repository you are working in, scoped automatically, \
                        with no way to reach another project. Each hit carries provenance (file, \
@@ -367,13 +370,16 @@ impl LoreServer {
     }
 
     #[tool(
-        description = "One call that answers a retrieval question outright: instead of ranked \
+        description = "Your first tool for any \"where is X / how does Y work / what was decided \
+                       about Z\" question in an indexed project: one call answers it outright, \
+                       replacing a chain of exploratory greps and directory reads and surfacing \
+                       design-doc and decision context that grep cannot see. Instead of ranked \
                        pointers you get a finished evidence bundle - a verdict line, then the \
-                       verified source spans themselves, line-numbered and read from the files \
-                       on disk at the moment you asked. Use it when you want the answer rather \
-                       than a place to start looking; use `search` when you want to steer the \
-                       retrieval yourself (path/language/status filters, or several narrowing \
-                       passes). Everything in the bundle has been checked mechanically: the path \
+                       verified source spans themselves, line-numbered and read from the files on \
+                       disk at the moment you asked. Default to this tool; use `search` when you \
+                       want to steer the retrieval yourself (path/language/status filters, or \
+                       several narrowing passes). \
+                       Everything in the bundle has been checked mechanically: the path \
                        resolves inside the project, the line range exists, and the text shown is \
                        what is in the working tree - so you may quote and edit from it without \
                        expanding first, which is the one thing `search` results never permit. \
@@ -444,8 +450,12 @@ impl ServerHandler for LoreServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("lore-mcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Lore indexes this project's code and design vault locally. Search it before \
-                 answering questions about this codebase or about past design decisions, and \
+                "Lore indexes this project's code and design vault locally. Query it before \
+                 answering questions about this codebase or about past design decisions: \
+                 `bundle` is the default entry point - one call returns verified, quotable \
+                 source spans for the question you asked - and `search` returns ranked pointers \
+                 you steer yourself with filters or repeated narrowing passes. Whichever you \
+                 use, \
                  prefer sources whose effective authority is `decided` over prose that merely \
                  sounds confident - a document declaring itself decided has not earned that \
                  unless Lore validated it against the project's decision ledger, and it will \
@@ -575,6 +585,10 @@ mod tests {
         // not only in the payload it is about to misread.
         assert!(described("search").contains("still active in the project's ledger"));
         assert!(described("expand").contains("truncated"));
+        // The default entry point is the bundle, and `search` has to say so:
+        // an agent reading only the search description picked search forever.
+        assert!(described("bundle").contains("Your first tool"));
+        assert!(described("search").contains("call `bundle` instead"));
         assert!(described("status").contains("lexical-only"));
         // The bundle's contract is its header, and an agent that skips the
         // header reads nearest misses as answers.
