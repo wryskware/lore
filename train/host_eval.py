@@ -451,6 +451,21 @@ def main() -> int:
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     args.repos_root = os.path.expanduser(args.repos_root)
 
+    # The glm-run-01 lesson, applied to eval: a dead daemon makes every lore
+    # call error and the host quietly falls back to grep -- the arm then
+    # measures nothing. Refuse to start unless a real bundle call answers.
+    if args.arm in ("direct", "scout"):
+        probe = scout_eval.LoreMcp(os.path.expanduser(args.mcp_bin),
+                                   tasks[0]["project"],
+                                   os.path.expanduser(args.data_dir))
+        try:
+            probe.call("bundle", {"query": "preflight", "limit": 1})
+        except Exception as exc:  # noqa: BLE001
+            raise SystemExit(f"preflight bundle call failed -- daemon down? "
+                             f"{str(exc)[:200]}")
+        finally:
+            probe.close()
+
     api_key = load_api_key()
     reasoning = probe_reasoning(api_key, args.host_model)
     print(f"arm={args.arm} host={args.host_model} reasoning={reasoning} "
